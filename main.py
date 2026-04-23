@@ -6,6 +6,7 @@ GUI principal con canvas drag-and-drop, PyQt6
 import sys
 import math
 import json
+import os
 from typing import Optional, List, Dict, Tuple
 
 from PyQt6.QtWidgets import (
@@ -16,7 +17,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QSplitter, QDialog, QFormLayout,
     QLineEdit, QDialogButtonBox, QMessageBox, QStatusBar, QFrame,
     QGraphicsPathItem, QPushButton, QComboBox, QDoubleSpinBox,
-    QScrollArea, QGroupBox, QTextEdit
+    QScrollArea, QGroupBox, QTextEdit, QFileDialog
 )
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPainterPath,
@@ -82,12 +83,24 @@ class ComponentItem(QGraphicsItem):
         self.unit = unit
         self.node1 = node1
         self.node2 = node2
-        self.result_voltage: Optional[float] = None  # para mostrar tras simulación
+        self.result_voltage: Optional[float] = None
+        self._angle = 0  # rotación en grados (0, 90, 180, 270)
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+
+    def rotate_90(self):
+        """Rota el componente 90° en sentido horario."""
+        self._angle = (self._angle + 90) % 360
+        self.setRotation(self._angle)
+        self.update()
+
+    def pin_positions_scene(self) -> Tuple[QPointF, QPointF]:
+        """Retorna posición de los pines en coordenadas de ESCENA (considera rotación)."""
+        p1_local, p2_local = self.pin_positions()
+        return self.mapToScene(p1_local), self.mapToScene(p2_local)
 
     # ── Geometría ──────────────────────────────
     def boundingRect(self) -> QRectF:
@@ -408,6 +421,11 @@ class CircuitScene(QGraphicsScene):
                 elif isinstance(item, WireItem) and item in self.wires:
                     self.wires.remove(item)
                 self.removeItem(item)
+        elif event.key() == Qt.Key.Key_R:
+            for item in self.selectedItems():
+                if isinstance(item, ComponentItem):
+                    item.rotate_90()
+            self.status_message.emit("Componente rotado 90 grados (R para seguir rotando)")
         elif event.key() == Qt.Key.Key_Escape:
             if self._wire_preview:
                 self.removeItem(self._wire_preview)
@@ -415,6 +433,79 @@ class CircuitScene(QGraphicsScene):
             self._wire_start = None
             self.set_mode('select')
         super().keyPressEvent(event)
+
+    # ── Extraccion de netlist por Union-Find ─────
+    def extract_netlist(self) -> Dict[str, str]:
+        """
+        Analiza los cables del canvas y asigna nodos automaticamente.
+        Union-Find: une pines conectados por cables en el mismo nodo.
+        GND se mapea al nodo 0. Retorna {CompNombre__p1: net_X, ...}
+        """
+        SNAP = GRID_SIZE / 2
+
+        pins = {}
+        for comp in self.components:
+            p1, p2 = comp.pin_positions_scene()
+            pins[f"{comp.name}__p1"] = p1
+            pins[f"{comp.name}__p2"] = p2
+
+        parent = {pid: pid for pid in pins}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Unir pines que se tocan directamente
+        pin_ids = list(pins.keys())
+        for i in range(len(pin_ids)):
+            for j in range(i + 1, len(pin_ids)):
+                pa, pb = pins[pin_ids[i]], pins[pin_ids[j]]
+                if abs(pa.x() - pb.x()) < SNAP and abs(pa.y() - pb.y()) < SNAP:
+                    union(pin_ids[i], pin_ids[j])
+
+        # Unir pines conectados por cables
+        for wire in self.wires:
+            line = wire.line()
+            wp1 = wire.mapToScene(line.p1())
+            wp2 = wire.mapToScene(line.p2())
+            touched_p1, touched_p2 = [], []
+            for pid, pos in pins.items():
+                if abs(pos.x() - wp1.x()) < SNAP and abs(pos.y() - wp1.y()) < SNAP:
+                    touched_p1.append(pid)
+                if abs(pos.x() - wp2.x()) < SNAP and abs(pos.y() - wp2.y()) < SNAP:
+                    touched_p2.append(pid)
+            all_touched = touched_p1 + touched_p2
+            for k in range(1, len(all_touched)):
+                union(all_touched[0], all_touched[k])
+
+        # Detectar raices GND
+        gnd_roots = set()
+        for comp in self.components:
+            if comp.comp_type == 'GND':
+                gnd_roots.add(find(f"{comp.name}__p1"))
+
+        # Asignar nombres de nodo
+        groups: Dict[str, list] = {}
+        for pid in pin_ids:
+            groups.setdefault(find(pid), []).append(pid)
+
+        net_counter = 0
+        root_to_name: Dict[str, str] = {}
+        for root in groups:
+            if root in gnd_roots:
+                root_to_name[root] = '0'
+            else:
+                net_counter += 1
+                root_to_name[root] = f'net_{net_counter}'
+
+        return {pid: root_to_name[find(pid)] for pid in pin_ids}
 
     # ── Editar propiedades ───────────────────────
     def _edit_component(self, item: ComponentItem):
@@ -620,17 +711,27 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(16, 16))
 
         actions = [
-            ("Nuevo",   "Ctrl+N", self._new_circuit),
-            ("Limpiar", "Ctrl+L", self._clear_circuit),
-            ("Zoom +",  "Ctrl+=", lambda: self.view.scale(1.2, 1.2)),
-            ("Zoom −",  "Ctrl+-", lambda: self.view.scale(1/1.2, 1/1.2)),
-            ("Restablecer", "Ctrl+0", self._reset_zoom),
+            ("Nuevo",        "Ctrl+N", self._new_circuit),
+            ("Abrir",        "Ctrl+O", self._open_circuit),
+            ("Guardar",      "Ctrl+S", self._save_circuit),
+            ("Exportar SPICE", "Ctrl+E", self._export_spice),
+            ("|", None, None),
+            ("Limpiar",      "Ctrl+L", self._clear_circuit),
+            ("Zoom +",       "Ctrl+=", lambda: self.view.scale(1.2, 1.2)),
+            ("Zoom −",       "Ctrl+-", lambda: self.view.scale(1/1.2, 1/1.2)),
+            ("Restablecer",  "Ctrl+0", self._reset_zoom),
         ]
         for name, shortcut, fn in actions:
+            if name == '|':
+                tb.addSeparator()
+                continue
             act = QAction(name, self)
-            act.setShortcut(shortcut)
+            if shortcut:
+                act.setShortcut(shortcut)
             act.triggered.connect(fn)
             tb.addAction(act)
+
+        self._current_file: Optional[str] = None
 
     # ── Estilo ───────────────────────────────────
     def _apply_style(self):
@@ -718,13 +819,24 @@ class MainWindow(QMainWindow):
 
     # ── Simulación ───────────────────────────────
     def _run_simulation(self):
-        """Construye la lista de componentes MNA y corre DC."""
+        """
+        Extrae la netlist del canvas via Union-Find y corre analisis DC.
+        Los nodos se asignan automaticamente segun los cables conectados.
+        Si el usuario asigno nodos manualmente, estos tienen prioridad.
+        """
         components = []
         errors = []
 
+        # Extraer nodos automaticos desde los cables del canvas
+        pin_node = self.scene.extract_netlist()
+
         for item in self.scene.components:
-            n1 = item.node1.strip() or f'_auto_{item.name}_p'
-            n2 = item.node2.strip() or '0'
+            # Prioridad: nodo manual del usuario > nodo extraido automaticamente
+            auto_n1 = pin_node.get(f"{item.name}__p1", f'iso_{item.name}_p')
+            auto_n2 = pin_node.get(f"{item.name}__p2", '0')
+
+            n1 = item.node1.strip() if item.node1.strip() else auto_n1
+            n2 = item.node2.strip() if item.node2.strip() else auto_n2
 
             try:
                 if item.comp_type == 'R':
@@ -745,8 +857,22 @@ class MainWindow(QMainWindow):
                 errors.append(f"{item.name}: {e}")
 
         if not components:
-            self.results_text.setPlainText("⚠  No hay componentes con nodos asignados.\n\nDoble-click sobre cada componente\npara asignar sus nodos.")
+            self.results_text.setPlainText("⚠  No hay componentes en el canvas.")
             return
+
+        # Mostrar netlist extraida antes de simular
+        out_pre = ["═══ NETLIST EXTRAIDA ═══"]
+        for item in self.scene.components:
+            if item.comp_type in ('GND', 'NODE'):
+                continue
+            auto_n1 = pin_node.get(f"{item.name}__p1", '?')
+            auto_n2 = pin_node.get(f"{item.name}__p2", '?')
+            n1_show = item.node1.strip() if item.node1.strip() else auto_n1
+            n2_show = item.node2.strip() if item.node2.strip() else auto_n2
+            out_pre.append(f"  {item.name}: {n1_show} → {n2_show}  ({item._format_value()})")
+        out_pre.append("")
+        self.results_text.setPlainText('\n'.join(out_pre) + "Simulando...")
+        QApplication.processEvents()
 
         result = self.solver.solve_dc(components)
 
@@ -762,22 +888,29 @@ class MainWindow(QMainWindow):
                 for name, i in result['branch_currents'].items():
                     out.append(f"  I({name}) = {i*1000:+.4f} mA")
 
-            # Potencias
-            out.append("\n── Potencias ──")
+            # Corrientes y potencias
+            out.append("\n── Corrientes y potencias ──")
             for comp in components:
                 if isinstance(comp, VoltageSource):
                     i_branch = result['branch_currents'].get(comp.name, 0)
                     p = comp.V * i_branch
-                    out.append(f"  P({comp.name}) = {p:.4f} W")
+                    out.append(f"  I({comp.name}) = {i_branch*1000:+.4f} mA  |  P = {abs(p):.4f} W")
                 elif isinstance(comp, Resistor):
                     v1 = result['voltages'].get(comp.n1, 0)
                     v2 = result['voltages'].get(comp.n2, 0)
-                    p = (v1 - v2)**2 / comp.R
-                    out.append(f"  P({comp.name}) = {p*1000:.4f} mW")
+                    i_r = (v1 - v2) / comp.R
+                    p   = (v1 - v2)**2 / comp.R
+                    out.append(f"  I({comp.name}) = {i_r*1000:+.4f} mA  |  P = {p*1000:.4f} mW")
+                elif isinstance(comp, CurrentSource):
+                    v1 = result['voltages'].get(comp.n_pos, 0)
+                    v2 = result['voltages'].get(comp.n_neg, 0)
+                    p = comp.I_val * (v1 - v2)
+                    out.append(f"  I({comp.name}) = {comp.I_val*1000:+.4f} mA  |  P = {abs(p):.4f} W")
 
-            # Actualizar canvas con voltajes
+            # Actualizar canvas con voltajes (usando nodos automaticos)
             for item in self.scene.components:
-                n1 = item.node1.strip()
+                auto_n1 = pin_node.get(f"{item.name}__p1", '')
+                n1 = item.node1.strip() if item.node1.strip() else auto_n1
                 if n1 in result['voltages']:
                     item.result_voltage = result['voltages'][n1]
                 else:
@@ -803,12 +936,19 @@ class MainWindow(QMainWindow):
         self.prop_table.setRowCount(0)
         if item is None:
             return
+        # Obtener nodos automaticos para mostrar
+        pin_node = self.scene.extract_netlist()
+        auto_n1 = pin_node.get(f"{item.name}__p1", '—')
+        auto_n2 = pin_node.get(f"{item.name}__p2", '—')
+        n1_display = item.node1.strip() or f"{auto_n1} (auto)"
+        n2_display = item.node2.strip() or f"{auto_n2} (auto)"
         rows = [
-            ("Tipo",   item.comp_type),
-            ("Nombre", item.name),
-            ("Valor",  f"{item.value} {item.unit}"),
-            ("Nodo +", item.node1),
-            ("Nodo −", item.node2),
+            ("Tipo",       item.comp_type),
+            ("Nombre",    item.name),
+            ("Valor",     f"{item.value} {item.unit}"),
+            ("Rotacion",  f"{item._angle}°"),
+            ("Nodo +",    n1_display),
+            ("Nodo −",    n2_display),
         ]
         for label, val in rows:
             r = self.prop_table.rowCount()
@@ -834,8 +974,16 @@ class MainWindow(QMainWindow):
 
     # ── Acciones ─────────────────────────────────
     def _new_circuit(self):
-        self._clear_circuit()
-        self._load_demo_circuit()
+        reply = QMessageBox.question(
+            self, "Nuevo circuito",
+            "¿Descartar el circuito actual?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._clear_circuit()
+            self._current_file = None
+            self.setWindowTitle("CircuitSim — Simulador de Circuitos")
+            self._load_demo_circuit()
 
     def _clear_circuit(self):
         for item in self.scene.components + self.scene.wires:
@@ -844,6 +992,148 @@ class MainWindow(QMainWindow):
         self.scene.wires.clear()
         self.scene._comp_counter.clear()
         self.results_text.clear()
+
+    # ── Guardar (.csin) ──────────────────────────
+    def _save_circuit(self):
+        path = self._current_file
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar circuito", "",
+                "CircuitSim (*.csin);;Todos los archivos (*)"
+            )
+        if not path:
+            return
+        if not path.endswith('.csin'):
+            path += '.csin'
+
+        data = {
+            'version': '1.0',
+            'components': [],
+            'wires': []
+        }
+
+        for item in self.scene.components:
+            data['components'].append({
+                'type':  item.comp_type,
+                'name':  item.name,
+                'value': item.value,
+                'unit':  item.unit,
+                'node1': item.node1,
+                'node2': item.node2,
+                'x':     item.pos().x(),
+                'y':     item.pos().y(),
+                'angle': item._angle,
+            })
+
+        for wire in self.scene.wires:
+            line = wire.line()
+            data['wires'].append({
+                'x1': line.x1(), 'y1': line.y1(),
+                'x2': line.x2(), 'y2': line.y2(),
+            })
+
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        self._current_file = path
+        self.setWindowTitle(f"CircuitSim — {os.path.basename(path)}")
+        self.statusBar().showMessage(f"Guardado: {path}")
+
+    # ── Abrir (.csin) ────────────────────────────
+    def _open_circuit(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Abrir circuito", "",
+            "CircuitSim (*.csin);;Todos los archivos (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo abrir el archivo:\n{e}")
+            return
+
+        self._clear_circuit()
+
+        for c in data.get('components', []):
+            item = self.scene.place_component(
+                c['type'], QPointF(c['x'], c['y']),
+                name=c['name'], value=c['value'],
+                unit=c.get('unit', ''),
+                node1=c.get('node1', ''),
+                node2=c.get('node2', '')
+            )
+            angle = c.get('angle', 0)
+            if angle:
+                item._angle = angle
+                item.setRotation(angle)
+
+        for w in data.get('wires', []):
+            wire = WireItem(QPointF(w['x1'], w['y1']), QPointF(w['x2'], w['y2']))
+            self.scene.addItem(wire)
+            self.scene.wires.append(wire)
+
+        self._current_file = path
+        self.setWindowTitle(f"CircuitSim — {os.path.basename(path)}")
+        self.statusBar().showMessage(f"Abierto: {path}")
+
+    # ── Exportar netlist SPICE (.net) ────────────
+    def _export_spice(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar netlist SPICE", "",
+            "SPICE Netlist (*.net);;Todos los archivos (*)"
+        )
+        if not path:
+            return
+        if not path.endswith('.net'):
+            path += '.net'
+
+        lines = []
+        lines.append(f"* CircuitSim — Netlist exportado")
+        lines.append(f"* Archivo: {os.path.basename(path)}")
+        lines.append("")
+
+        type_map = {'R': 'R', 'C': 'C', 'L': 'L', 'V': 'V', 'I': 'I'}
+
+        for item in self.scene.components:
+            if item.comp_type not in type_map:
+                continue
+            n1 = item.node1.strip() or '?'
+            n2 = item.node2.strip() or '0'
+            val = item.value
+
+            # Formatear valor en notación SPICE
+            if abs(val) >= 1e6:
+                val_str = f"{val/1e6:.6g}Meg"
+            elif abs(val) >= 1e3:
+                val_str = f"{val/1e3:.6g}k"
+            elif abs(val) >= 1:
+                val_str = f"{val:.6g}"
+            elif abs(val) >= 1e-3:
+                val_str = f"{val*1e3:.6g}m"
+            elif abs(val) >= 1e-6:
+                val_str = f"{val*1e6:.6g}u"
+            elif abs(val) >= 1e-9:
+                val_str = f"{val*1e9:.6g}n"
+            else:
+                val_str = f"{val:.6g}"
+
+            lines.append(f"{item.name} {n1} {n2} {val_str}")
+
+        lines.append("")
+        lines.append(".op")
+        lines.append(".end")
+
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+        self.statusBar().showMessage(f"Netlist exportado: {path}")
+        QMessageBox.information(
+            self, "Exportado",
+            f"Netlist SPICE guardado en:\n{path}\n\nCompatible con LTspice y ngspice."
+        )
 
     def _reset_zoom(self):
         self.view.resetTransform()
