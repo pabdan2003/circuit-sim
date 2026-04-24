@@ -30,7 +30,8 @@ from PyQt6.QtCore import (
 # Motor MNA
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from engine import Resistor, VoltageSource, CurrentSource, Capacitor, Inductor, MNASolver
+from engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor
+from engine import Diode, BJT, MOSFET, OpAmp, MNASolver
 
 
 # ══════════════════════════════════════════════════════════════
@@ -72,10 +73,11 @@ class ComponentItem(QGraphicsItem):
     Soporta drag, selección y doble-click para editar propiedades.
     """
 
-    COMP_TYPES = ['R', 'V', 'I', 'C', 'L', 'GND', 'NODE']
+    COMP_TYPES = ['R', 'V', 'VAC', 'I', 'C', 'L', 'GND', 'NODE',
+                  'D', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP']
 
     def __init__(self, comp_type: str, name: str, value: float = 0.0,
-                 unit: str = '', node1: str = '', node2: str = ''):
+                 unit: str = '', node1: str = '', node2: str = '', node3: str = ''):
         super().__init__()
         self.comp_type = comp_type
         self.name = name
@@ -83,6 +85,11 @@ class ComponentItem(QGraphicsItem):
         self.unit = unit
         self.node1 = node1
         self.node2 = node2
+        self.node3 = node3
+        # Atributos extra para fuente AC
+        self.frequency: float = 60.0    # Hz
+        self.phase_deg: float = 0.0     # grados
+        self.ac_mode:   str   = 'rms'   # 'rms' o 'peak'
         self.result_voltage: Optional[float] = None
         self._angle = 0  # rotación en grados (0, 90, 180, 270)
 
@@ -111,10 +118,35 @@ class ComponentItem(QGraphicsItem):
         return QRectF(-COMP_W//2 - 10, -COMP_H//2 - 20, COMP_W + 20, COMP_H + 40)
 
     def pin_positions(self) -> Tuple[QPointF, QPointF]:
-        """Retorna posición de los dos pines (pin1, pin2) en coordenadas locales."""
+        """Retorna posición de los pines principales en coordenadas locales."""
+        hw = COMP_W // 2
+        hh = COMP_H // 2
         if self.comp_type == 'GND':
             return QPointF(0, -5), QPointF(0, -5)
-        return QPointF(-COMP_W//2 - 10, 0), QPointF(COMP_W//2 + 10, 0)
+        if self.comp_type in ('BJT_NPN', 'BJT_PNP'):
+            # p1=Colector (der-arriba), p2=Emisor (der-abajo)
+            return QPointF(hw + 10, -hh - 6), QPointF(hw + 10, hh + 6)
+        if self.comp_type in ('NMOS', 'PMOS'):
+            # p1=Drain (der-arriba), p2=Source (der-abajo)
+            return QPointF(hw + 10, -hh - 6), QPointF(hw + 10, hh + 6)
+        if self.comp_type == 'OPAMP':
+            # p1=Salida (der), p2=Entrada− (izq-abajo)
+            hh_op = hh + 6
+            return QPointF(hw + 10, 0), QPointF(-hw - 10, hh_op // 2)
+        return QPointF(-hw - 10, 0), QPointF(hw + 10, 0)
+
+    def pin3_position(self) -> QPointF:
+        """Pin de control: Base (BJT), Gate (MOSFET), Entrada+ (OpAmp)."""
+        hw = COMP_W // 2
+        hh = COMP_H // 2 + 6
+        if self.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS'):
+            return QPointF(-hw - 10, 0)
+        if self.comp_type == 'OPAMP':
+            return QPointF(-hw - 10, -hh // 2)
+        return QPointF(0, 0)
+
+    def pin3_position_scene(self) -> QPointF:
+        return self.mapToScene(self.pin3_position())
 
     # ── Dibujo ──────────────────────────────────
     def paint(self, painter: QPainter, option, widget):
@@ -139,17 +171,28 @@ class ComponentItem(QGraphicsItem):
             self._draw_capacitor(painter, pen_body, pen_wire)
         elif self.comp_type == 'L':
             self._draw_inductor(painter, pen_body, pen_wire)
-        elif self.comp_type in ('V', 'I'):
+        elif self.comp_type in ('V', 'I', 'VAC'):
             self._draw_source(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'D':
+            self._draw_diode(painter, pen_body, pen_wire)
+        elif self.comp_type in ('BJT_NPN', 'BJT_PNP'):
+            self._draw_bjt(painter, pen_body, pen_wire)
+        elif self.comp_type in ('NMOS', 'PMOS'):
+            self._draw_mosfet(painter, pen_body, pen_wire)
+        elif self.comp_type == 'OPAMP':
+            self._draw_opamp(painter, pen_body, pen_wire, body_color)
 
         # Nombre y valor
         self._draw_labels(painter, text_color)
 
-        # Pines
-        for pin in self.pin_positions():
-            painter.setPen(pen_pin)
-            painter.setBrush(QBrush(QColor(COLORS['pin'])))
-            painter.drawEllipse(pin, PIN_RADIUS, PIN_RADIUS)
+        # Pines — los dispositivos de 3 terminales dibujan sus propios pines
+        # internamente con etiquetas; solo dibujar pines genéricos para el resto
+        three_terminal = ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP')
+        if self.comp_type not in three_terminal:
+            for pin in self.pin_positions():
+                painter.setPen(pen_pin)
+                painter.setBrush(QBrush(QColor(COLORS['pin'])))
+                painter.drawEllipse(pin, PIN_RADIUS, PIN_RADIUS)
 
     def _draw_resistor(self, painter, pen_body, pen_wire, body_color):
         hw = COMP_W // 2
@@ -222,6 +265,196 @@ class ComponentItem(QGraphicsItem):
         painter.setPen(QPen(color, 1))
         painter.setBrush(QBrush(color))
         painter.drawEllipse(QPointF(0, 0), 5, 5)
+
+    def _draw_diode(self, painter, pen_body, pen_wire):
+        hw = COMP_W // 2
+        # Cables
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-hw + 8, 0))
+        painter.drawLine(QPointF(hw - 8, 0), QPointF(hw + 10, 0))
+        # Triángulo (ánodo → cátodo)
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(QColor(COLORS['comp_body'])))
+        triangle = [QPointF(-hw + 8, -12), QPointF(-hw + 8, 12), QPointF(hw - 8, 0)]
+        from PyQt6.QtGui import QPolygonF
+        painter.drawPolygon(QPolygonF(triangle))
+        # Línea del cátodo
+        painter.drawLine(QPointF(hw - 8, -12), QPointF(hw - 8, 12))
+
+    def _draw_bjt(self, painter, pen_body, pen_wire):
+        hw = COMP_W // 2
+        hh = COMP_H // 2
+        is_npn = (self.comp_type == 'BJT_NPN')
+
+        # Círculo del cuerpo
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(QColor(COLORS['comp_body'])))
+        painter.drawEllipse(QPointF(0, 0), hh + 4, hh + 4)
+
+        # Base (izquierda): pin3 = (-hw-10, 0)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-8, 0))
+        # Barra vertical de base
+        painter.drawLine(QPointF(-8, -hh + 2), QPointF(-8, hh - 2))
+
+        # Colector (der-arriba): p1 = (hw+10, -hh-6)
+        painter.drawLine(QPointF(-8, -(hh - 2) // 2), QPointF(hw + 10, -hh - 6))
+        # Emisor (der-abajo): p2 = (hw+10, hh+6)
+        painter.drawLine(QPointF(-8,  (hh - 2) // 2), QPointF(hw + 10,  hh + 6))
+
+        # Flecha en el emisor
+        painter.setPen(pen_body)
+        ex1 = hw + 10
+        ey1 = hh + 6
+        # Punto medio del cable del emisor para colocar la flecha
+        mx = (-8 + ex1) // 2
+        my = ((hh - 2) // 2 + ey1) // 2
+        dx = ex1 - (-8)
+        dy = ey1 - (hh - 2) // 2
+        length = (dx**2 + dy**2) ** 0.5
+        if length > 0:
+            ux, uy = dx / length, dy / length   # vector unitario
+            perp_x, perp_y = -uy, ux            # perpendicular
+            tip_x = mx + ux * 6
+            tip_y = my + uy * 6
+            if is_npn:
+                # Flecha apuntando hacia afuera (salida del emisor)
+                painter.drawLine(QPointF(tip_x - ux*8 + perp_x*4,
+                                         tip_y - uy*8 + perp_y*4),
+                                  QPointF(tip_x, tip_y))
+                painter.drawLine(QPointF(tip_x - ux*8 - perp_x*4,
+                                         tip_y - uy*8 - perp_y*4),
+                                  QPointF(tip_x, tip_y))
+            else:
+                # Flecha apuntando hacia adentro (PNP)
+                base_x = mx - ux * 2
+                base_y = my - uy * 2
+                painter.drawLine(QPointF(base_x + perp_x*4, base_y + perp_y*4),
+                                  QPointF(base_x, base_y))
+                painter.drawLine(QPointF(base_x - perp_x*4, base_y - perp_y*4),
+                                  QPointF(base_x, base_y))
+
+        # Pines con etiquetas B / C / E
+        font = QFont('Consolas', 7, QFont.Weight.Bold)
+        painter.setFont(font)
+        pin_color = QColor(COLORS['pin'])
+
+        pin_data = [
+            (QPointF(hw + 10, -hh - 6), 'C'),   # Colector
+            (QPointF(hw + 10,  hh + 6), 'E'),   # Emisor
+            (QPointF(-hw - 10, 0),      'B'),   # Base
+        ]
+        for pos, label in pin_data:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(pos, PIN_RADIUS, PIN_RADIUS)
+            # Etiqueta al lado del pin
+            painter.setPen(QPen(QColor(COLORS['text']), 1))
+            offset_x = 6 if pos.x() > 0 else -14
+            offset_y = -8 if pos.y() < 0 else 2
+            if abs(pos.x()) < 5:  # pin central
+                offset_x = 6
+                offset_y = -8
+            painter.drawText(QRectF(pos.x() + offset_x, pos.y() + offset_y, 14, 10),
+                             Qt.AlignmentFlag.AlignLeft, label)
+
+    def _draw_mosfet(self, painter, pen_body, pen_wire):
+        hw = COMP_W // 2
+        hh = COMP_H // 2
+        is_nmos = (self.comp_type == 'NMOS')
+
+        # Círculo del cuerpo
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(QColor(COLORS['comp_body'])))
+        painter.drawEllipse(QPointF(0, 0), hh + 4, hh + 4)
+
+        # Gate cable (izquierda → placa)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-10, 0))
+
+        # Placa del gate
+        painter.setPen(pen_body)
+        painter.drawLine(QPointF(-8, -hh + 4), QPointF(-8, hh - 4))
+
+        # Canal con gap de óxido
+        gap = 4
+        painter.drawLine(QPointF(-8 + gap, -hh + 4), QPointF(-8 + gap, -3))
+        painter.drawLine(QPointF(-8 + gap,  3),       QPointF(-8 + gap,  hh - 4))
+
+        # Drain (der-arriba) y Source (der-abajo)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-8 + gap, -(hh - 4) // 2), QPointF(hw + 10, -hh - 6))
+        painter.drawLine(QPointF(-8 + gap,  (hh - 4) // 2), QPointF(hw + 10,  hh + 6))
+
+        # Flecha de canal (N: hacia canal, P: alejándose)
+        painter.setPen(pen_body)
+        ax = -8 + gap + 8
+        if is_nmos:
+            painter.drawLine(QPointF(ax - 6, 0), QPointF(ax, 0))
+            painter.drawLine(QPointF(ax - 4, -3), QPointF(ax, 0))
+            painter.drawLine(QPointF(ax - 4,  3), QPointF(ax, 0))
+        else:
+            painter.drawLine(QPointF(ax, 0), QPointF(ax - 6, 0))
+            painter.drawLine(QPointF(ax - 2, -3), QPointF(ax - 6, 0))
+            painter.drawLine(QPointF(ax - 2,  3), QPointF(ax - 6, 0))
+
+        # Pines con etiquetas G / D / S
+        font = QFont('Consolas', 7, QFont.Weight.Bold)
+        painter.setFont(font)
+        pin_color = QColor(COLORS['pin'])
+
+        pin_data = [
+            (QPointF(hw + 10, -hh - 6), 'D',  6, -8),
+            (QPointF(hw + 10,  hh + 6), 'S',  6,  2),
+            (QPointF(-hw - 10, 0),      'G', -14, -8),
+        ]
+        for pos, label, ox, oy in pin_data:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(pos, PIN_RADIUS, PIN_RADIUS)
+            painter.setPen(QPen(QColor(COLORS['text']), 1))
+            painter.drawText(QRectF(pos.x() + ox, pos.y() + oy, 14, 10),
+                             Qt.AlignmentFlag.AlignLeft, label)
+
+    def _draw_opamp(self, painter, pen_body, pen_wire, body_color):
+        hw = COMP_W // 2
+        hh = COMP_H // 2 + 6
+        from PyQt6.QtGui import QPolygonF
+
+        # Triángulo del op-amp
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        triangle = [QPointF(-hw, -hh), QPointF(-hw, hh), QPointF(hw, 0)]
+        painter.drawPolygon(QPolygonF(triangle))
+
+        # Cables: salida (der), entrada+ (izq-arriba), entrada- (izq-abajo)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(hw, 0),          QPointF(hw + 10, 0))
+        painter.drawLine(QPointF(-hw - 10, -hh // 2), QPointF(-hw, -hh // 2))
+        painter.drawLine(QPointF(-hw - 10,  hh // 2), QPointF(-hw,  hh // 2))
+
+        # Símbolos + y − dentro del triángulo
+        painter.setPen(QPen(QColor(COLORS['component']), 2))
+        painter.drawText(QRectF(-hw + 4, -hh + 4,  12, 12), Qt.AlignmentFlag.AlignCenter, '+')
+        painter.drawText(QRectF(-hw + 4,  hh - 16, 12, 12), Qt.AlignmentFlag.AlignCenter, '−')
+
+        # Pines con etiquetas
+        font = QFont('Consolas', 7, QFont.Weight.Bold)
+        painter.setFont(font)
+        pin_color = QColor(COLORS['pin'])
+
+        pin_data = [
+            (QPointF(hw + 10, 0),          'OUT',  6,  -4),
+            (QPointF(-hw - 10, -hh // 2),  'V+',  -20,  -8),
+            (QPointF(-hw - 10,  hh // 2),  'V−',  -20,   2),
+        ]
+        for pos, label, ox, oy in pin_data:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(pos, PIN_RADIUS, PIN_RADIUS)
+            painter.setPen(QPen(QColor(COLORS['text']), 1))
+            painter.drawText(QRectF(pos.x() + ox, pos.y() + oy, 28, 10),
+                             Qt.AlignmentFlag.AlignLeft, label)
 
     def _draw_labels(self, painter, text_color):
         if self.comp_type in ('GND', 'NODE'):
@@ -342,11 +575,15 @@ class CircuitScene(QGraphicsScene):
                         'GND': 'GND', 'NODE': 'N'}
             name = f"{prefixes.get(comp_type, comp_type)}{count}"
 
-        units = {'R': 'Ω', 'V': 'V', 'I': 'A', 'C': 'F', 'L': 'H'}
+        units = {'R': 'Ω', 'V': 'V', 'VAC': 'V', 'I': 'A', 'C': 'F', 'L': 'H',
+                 'D': 'A', 'BJT_NPN': 'hFE', 'BJT_PNP': 'hFE',
+                 'NMOS': 'A/V²', 'PMOS': 'A/V²', 'OPAMP': 'V/V'}
         if not unit:
             unit = units.get(comp_type, '')
 
-        defaults = {'R': 1000.0, 'V': 5.0, 'I': 0.001, 'C': 1e-6, 'L': 1e-3}
+        defaults = {'R': 1000.0, 'V': 5.0, 'VAC': 120.0, 'I': 0.001, 'C': 1e-6, 'L': 1e-3,
+                    'D': 1e-14, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
+                    'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5}
         if value == 0.0:
             value = defaults.get(comp_type, 1.0)
 
@@ -441,15 +678,30 @@ class CircuitScene(QGraphicsScene):
         Union-Find: une pines conectados por cables en el mismo nodo.
         GND se mapea al nodo 0. Retorna {CompNombre__p1: net_X, ...}
         """
-        SNAP = GRID_SIZE / 2
+        SNAP = GRID_SIZE  # tolerancia = tamaño de celda completo (más robusto)
 
+        # ── 1. Registrar pines de componentes ───────────────────────────
         pins = {}
         for comp in self.components:
             p1, p2 = comp.pin_positions_scene()
             pins[f"{comp.name}__p1"] = p1
             pins[f"{comp.name}__p2"] = p2
+            # Registrar pin3 para dispositivos de 3 terminales
+            if comp.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP'):
+                pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
 
-        parent = {pid: pid for pid in pins}
+        # ── 2. Union-Find sobre pines + extremos de cables ───────────────
+        # Incluimos los extremos de cables como nodos propios del grafo
+        # para propagar correctamente cadenas de cables sin pines en el medio
+        all_nodes: Dict[str, QPointF] = dict(pins)
+        for idx, wire in enumerate(self.wires):
+            line = wire.line()
+            wp1 = wire.mapToScene(line.p1())
+            wp2 = wire.mapToScene(line.p2())
+            all_nodes[f"__wire{idx}__p1"] = wp1
+            all_nodes[f"__wire{idx}__p2"] = wp2
+
+        parent = {nid: nid for nid in all_nodes}
 
         def find(x):
             while parent[x] != x:
@@ -462,36 +714,31 @@ class CircuitScene(QGraphicsScene):
             if ra != rb:
                 parent[ra] = rb
 
-        # Unir pines que se tocan directamente
-        pin_ids = list(pins.keys())
-        for i in range(len(pin_ids)):
-            for j in range(i + 1, len(pin_ids)):
-                pa, pb = pins[pin_ids[i]], pins[pin_ids[j]]
-                if abs(pa.x() - pb.x()) < SNAP and abs(pa.y() - pb.y()) < SNAP:
-                    union(pin_ids[i], pin_ids[j])
+        def pts_near(pa: QPointF, pb: QPointF) -> bool:
+            return abs(pa.x() - pb.x()) < SNAP and abs(pa.y() - pb.y()) < SNAP
 
-        # Unir pines conectados por cables
-        for wire in self.wires:
-            line = wire.line()
-            wp1 = wire.mapToScene(line.p1())
-            wp2 = wire.mapToScene(line.p2())
-            touched_p1, touched_p2 = [], []
-            for pid, pos in pins.items():
-                if abs(pos.x() - wp1.x()) < SNAP and abs(pos.y() - wp1.y()) < SNAP:
-                    touched_p1.append(pid)
-                if abs(pos.x() - wp2.x()) < SNAP and abs(pos.y() - wp2.y()) < SNAP:
-                    touched_p2.append(pid)
-            all_touched = touched_p1 + touched_p2
-            for k in range(1, len(all_touched)):
-                union(all_touched[0], all_touched[k])
+        # Unir nodos (pines y extremos de cable) que se tocan espacialmente
+        node_ids = list(all_nodes.keys())
+        for i in range(len(node_ids)):
+            for j in range(i + 1, len(node_ids)):
+                if pts_near(all_nodes[node_ids[i]], all_nodes[node_ids[j]]):
+                    union(node_ids[i], node_ids[j])
 
-        # Detectar raices GND
-        gnd_roots = set()
+        # Unir los dos extremos de cada cable entre sí (esto propaga
+        # la conectividad a través de cables que no tocan ningún pin)
+        for idx in range(len(self.wires)):
+            union(f"__wire{idx}__p1", f"__wire{idx}__p2")
+
+        # ── 3. Detectar grupos GND ───────────────────────────────────────
+        # Registrar AMBOS pines del componente GND como tierra
+        gnd_roots: set = set()
         for comp in self.components:
             if comp.comp_type == 'GND':
                 gnd_roots.add(find(f"{comp.name}__p1"))
+                gnd_roots.add(find(f"{comp.name}__p2"))
 
-        # Asignar nombres de nodo
+        # ── 4. Asignar nombres de nodo ───────────────────────────────────
+        pin_ids = list(pins.keys())
         groups: Dict[str, list] = {}
         for pid in pin_ids:
             groups.setdefault(find(pid), []).append(pid)
@@ -512,10 +759,15 @@ class CircuitScene(QGraphicsScene):
         dialog = ComponentDialog(item)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             data = dialog.get_data()
-            item.name   = data['name']
-            item.value  = data['value']
-            item.node1  = data['node1']
-            item.node2  = data['node2']
+            item.name      = data['name']
+            item.value     = data['value']
+            item.node1     = data['node1']
+            item.node2     = data['node2']
+            item.node3     = data['node3']
+            if item.comp_type == 'VAC':
+                item.frequency = data['frequency']
+                item.phase_deg = data['phase_deg']
+                item.ac_mode   = data['ac_mode']
             item.update()
 
 
@@ -550,18 +802,73 @@ class ComponentDialog(QDialog):
         self.name_edit = QLineEdit(self.item.name)
         layout.addRow("Nombre:", self.name_edit)
 
+        # Etiqueta y rango del valor según tipo
+        value_labels = {
+            'R': 'Resistencia (Ω)', 'V': 'Voltaje (V)', 'I': 'Corriente (A)',
+            'C': 'Capacitancia (F)', 'L': 'Inductancia (H)',
+            'D': 'Is — Corriente saturación (A)',
+            'BJT_NPN': 'hFE — Ganancia β',
+            'BJT_PNP': 'hFE — Ganancia β',
+            'NMOS': 'Kn — Transconductancia (A/V²)',
+            'PMOS': 'Kp — Transconductancia (A/V²)',
+            'OPAMP': 'A — Ganancia lazo abierto (V/V)',
+        }
         self.value_spin = QDoubleSpinBox()
         self.value_spin.setRange(-1e12, 1e12)
         self.value_spin.setDecimals(6)
         self.value_spin.setValue(self.item.value)
-        labels = {'R': 'Resistencia (Ω)', 'V': 'Voltaje (V)', 'I': 'Corriente (A)',
-                  'C': 'Capacitancia (F)', 'L': 'Inductancia (H)'}
-        layout.addRow(labels.get(self.item.comp_type, 'Valor:'), self.value_spin)
+        layout.addRow(value_labels.get(self.item.comp_type, 'Valor:'), self.value_spin)
+
+        # Etiquetas de nodos según terminales reales del componente
+        node_labels = {
+            'R':       ('Nodo 1',    'Nodo 2',    None),
+            'C':       ('Nodo 1',    'Nodo 2',    None),
+            'L':       ('Nodo 1',    'Nodo 2',    None),
+            'V':       ('Nodo + (ánodo)',  'Nodo − (cátodo)', None),
+            'I':       ('Nodo + (salida)', 'Nodo − (entrada)', None),
+            'D':       ('Ánodo (A)', 'Cátodo (K)', None),
+            'BJT_NPN': ('Colector (C)', 'Emisor (E)', 'Base (B)'),
+            'BJT_PNP': ('Colector (C)', 'Emisor (E)', 'Base (B)'),
+            'NMOS':    ('Drain (D)',    'Source (S)', 'Gate (G)'),
+            'PMOS':    ('Drain (D)',    'Source (S)', 'Gate (G)'),
+            'OPAMP':   ('Salida (OUT)', 'Entrada − (V−)', 'Entrada + (V+)'),
+        }
+        lbl1, lbl2, lbl3 = node_labels.get(self.item.comp_type, ('Nodo +', 'Nodo −', None))
 
         self.node1_edit = QLineEdit(self.item.node1)
         self.node2_edit = QLineEdit(self.item.node2)
-        layout.addRow("Nodo +:  ", self.node1_edit)
-        layout.addRow("Nodo −:  ", self.node2_edit)
+        layout.addRow(lbl1 + ':', self.node1_edit)
+        layout.addRow(lbl2 + ':', self.node2_edit)
+
+        self.node3_edit = None
+        if lbl3 is not None:
+            self.node3_edit = QLineEdit(self.item.node3)
+            layout.addRow(lbl3 + ':', self.node3_edit)
+
+        # Campos extra para fuente AC
+        self._freq_spin  = None
+        self._phase_spin = None
+        self._mode_combo = None
+        if self.item.comp_type == 'VAC':
+            from PyQt6.QtWidgets import QComboBox
+            self._mode_combo = QComboBox()
+            self._mode_combo.addItems(['rms', 'peak'])
+            self._mode_combo.setCurrentText(self.item.ac_mode)
+            layout.addRow('Modo amplitud:', self._mode_combo)
+
+            self._freq_spin = QDoubleSpinBox()
+            self._freq_spin.setRange(0.001, 1e9)
+            self._freq_spin.setDecimals(3)
+            self._freq_spin.setSuffix(' Hz')
+            self._freq_spin.setValue(self.item.frequency)
+            layout.addRow('Frecuencia:', self._freq_spin)
+
+            self._phase_spin = QDoubleSpinBox()
+            self._phase_spin.setRange(-360.0, 360.0)
+            self._phase_spin.setDecimals(2)
+            self._phase_spin.setSuffix(' °')
+            self._phase_spin.setValue(self.item.phase_deg)
+            layout.addRow('Fase:', self._phase_spin)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -571,10 +878,14 @@ class ComponentDialog(QDialog):
 
     def get_data(self):
         return {
-            'name':  self.name_edit.text(),
-            'value': self.value_spin.value(),
-            'node1': self.node1_edit.text(),
-            'node2': self.node2_edit.text(),
+            'name':      self.name_edit.text(),
+            'value':     self.value_spin.value(),
+            'node1':     self.node1_edit.text(),
+            'node2':     self.node2_edit.text(),
+            'node3':     self.node3_edit.text() if self.node3_edit else '',
+            'frequency': self._freq_spin.value()  if self._freq_spin  else 60.0,
+            'phase_deg': self._phase_spin.value() if self._phase_spin else 0.0,
+            'ac_mode':   self._mode_combo.currentText() if self._mode_combo else 'rms',
         }
 
 
@@ -640,13 +951,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
 
         components = [
-            ('R', 'Resistor',        '━┤ZZZ├━'),
-            ('C', 'Capacitor',       '━┤  ├━'),
-            ('L', 'Inductor',        '━⌒⌒⌒━'),
-            ('V', 'Fuente V',        '━(+)━'),
-            ('I', 'Fuente I',        '━(→)━'),
-            ('GND', 'Tierra',        '⏚'),
-            ('NODE','Nodo',          '•'),
+            ('R',       'Resistor',    '━┤ZZZ├━'),
+            ('C',       'Capacitor',   '━┤  ├━'),
+            ('L',       'Inductor',    '━⌒⌒⌒━'),
+            ('V',       'Fuente VDC',  '━(+)━'),
+            ('VAC',     'Fuente VAC',  '━(~)━'),
+            ('I',       'Fuente I',    '━(→)━'),
+            ('GND',     'Tierra',      '⏚'),
+            ('NODE',    'Nodo',        '•'),
+            ('D',       'Diodo',       '━|▷|━'),
+            ('BJT_NPN', 'BJT NPN',     '━(NPN)'),
+            ('BJT_PNP', 'BJT PNP',     '━(PNP)'),
+            ('NMOS',    'MOSFET N',    '━[N]━'),
+            ('PMOS',    'MOSFET P',    '━[P]━'),
+            ('OPAMP',   'Op-Amp',      '━[▷]━'),
         ]
 
         for ctype, label, sym in components:
@@ -673,11 +991,24 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        run_btn = QPushButton("▶  SIMULAR DC")
-        run_btn.setFont(QFont('Consolas', 10, QFont.Weight.Bold))
-        run_btn.setFixedHeight(40)
-        run_btn.clicked.connect(self._run_simulation)
-        layout.addWidget(run_btn)
+        from PyQt6.QtWidgets import QComboBox, QHBoxLayout
+        sim_row = QHBoxLayout()
+
+        self.sim_mode_combo = QComboBox()
+        self.sim_mode_combo.addItems(['DC', 'AC'])
+        self.sim_mode_combo.setFont(QFont('Consolas', 10))
+        self.sim_mode_combo.setFixedHeight(40)
+        self.sim_mode_combo.setFixedWidth(70)
+        self.sim_mode_combo.currentTextChanged.connect(self._on_sim_mode_changed)
+        sim_row.addWidget(self.sim_mode_combo)
+
+        self.run_btn = QPushButton("▶  SIMULAR DC")
+        self.run_btn.setFont(QFont('Consolas', 10, QFont.Weight.Bold))
+        self.run_btn.setFixedHeight(40)
+        self.run_btn.clicked.connect(self._run_simulation)
+        sim_row.addWidget(self.run_btn)
+
+        layout.addLayout(sim_row)
 
     def _build_right_panel(self):
         self.right_panel = QWidget()
@@ -704,6 +1035,14 @@ class MainWindow(QMainWindow):
         self.results_text.setReadOnly(True)
         self.results_text.setFont(QFont('Consolas', 9))
         layout.addWidget(self.results_text)
+
+        # Botón triángulo de potencia (visible solo tras análisis AC)
+        self.btn_power_triangle = QPushButton("📐  Ver Triángulo de Potencia")
+        self.btn_power_triangle.setFont(QFont('Consolas', 9))
+        self.btn_power_triangle.setVisible(False)
+        self.btn_power_triangle.clicked.connect(self._show_power_triangle)
+        layout.addWidget(self.btn_power_triangle)
+        self._last_ac_result = None   # guardamos el resultado AC para el popup
 
     def _build_toolbar(self):
         tb = self.addToolBar("Principal")
@@ -811,19 +1150,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Modo selección")
 
     def _deselect_all_mode_buttons(self):
-        for t in ['R', 'C', 'L', 'V', 'I', 'GND', 'NODE']:
+        for t in ['R', 'C', 'L', 'V', 'VAC', 'I', 'GND', 'NODE',
+                  'D', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP']:
             btn = getattr(self, f'btn_{t}', None)
             if btn:
                 btn.setChecked(False)
         self.btn_wire.setChecked(False)
 
+    def _on_sim_mode_changed(self, mode: str):
+        self.run_btn.setText(f"▶  SIMULAR {mode}")
+
     # ── Simulación ───────────────────────────────
     def _run_simulation(self):
         """
-        Extrae la netlist del canvas via Union-Find y corre analisis DC.
-        Los nodos se asignan automaticamente segun los cables conectados.
-        Si el usuario asigno nodos manualmente, estos tienen prioridad.
+        Despachador: corre análisis DC o AC según el selector de modo.
         """
+        mode = self.sim_mode_combo.currentText()
+        if mode == 'AC':
+            self._run_simulation_ac()
+        else:
+            self._run_simulation_dc()
+
+    def _run_simulation_dc(self):
         components = []
         errors = []
 
@@ -834,9 +1182,11 @@ class MainWindow(QMainWindow):
             # Prioridad: nodo manual del usuario > nodo extraido automaticamente
             auto_n1 = pin_node.get(f"{item.name}__p1", f'iso_{item.name}_p')
             auto_n2 = pin_node.get(f"{item.name}__p2", '0')
+            auto_n3 = pin_node.get(f"{item.name}__p3", '')
 
             n1 = item.node1.strip() if item.node1.strip() else auto_n1
             n2 = item.node2.strip() if item.node2.strip() else auto_n2
+            n3 = item.node3.strip() if item.node3.strip() else auto_n3
 
             try:
                 if item.comp_type == 'R':
@@ -846,13 +1196,34 @@ class MainWindow(QMainWindow):
                     components.append(Resistor(item.name, n1, n2, item.value))
                 elif item.comp_type == 'V':
                     components.append(VoltageSource(item.name, n1, n2, item.value))
+                elif item.comp_type == 'VAC':
+                    # En DC la fuente AC vale 0 V (valor medio de senoidal)
+                    components.append(VoltageSource(item.name, n1, n2, 0.0))
                 elif item.comp_type == 'I':
                     components.append(CurrentSource(item.name, n1, n2, item.value))
                 elif item.comp_type == 'C':
                     components.append(Capacitor(item.name, n1, n2, item.value))
                 elif item.comp_type == 'L':
                     components.append(Inductor(item.name, n1, n2, item.value))
-                # GND y NODE son visuales, no eléctricos
+                elif item.comp_type == 'D':
+                    Is = item.value if item.value > 0 else 1e-14
+                    components.append(Diode(item.name, n1, n2, Is=Is))
+                elif item.comp_type in ('BJT_NPN', 'BJT_PNP'):
+                    # n1=Colector, n2=Emisor, n3=Base
+                    type_ = 'NPN' if item.comp_type == 'BJT_NPN' else 'PNP'
+                    Bf = item.value if item.value > 0 else 100.0
+                    components.append(BJT(item.name, n1, n3 or f'b_{item.name}', n2,
+                                          type_=type_, Bf=Bf))
+                elif item.comp_type in ('NMOS', 'PMOS'):
+                    # n1=Drain, n2=Source, n3=Gate
+                    type_ = 'NMOS' if item.comp_type == 'NMOS' else 'PMOS'
+                    Kn = item.value if item.value > 0 else 1e-3
+                    components.append(MOSFET(item.name, n1, n3 or f'g_{item.name}', n2,
+                                             type_=type_, Kn=Kn))
+                elif item.comp_type == 'OPAMP':
+                    # n1=Salida, n2=Entrada−, n3=Entrada+
+                    A = item.value if item.value > 0 else 1e5
+                    components.append(OpAmp(item.name, n1, n3 or f'vp_{item.name}', n2, A=A))
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
@@ -883,10 +1254,27 @@ class MainWindow(QMainWindow):
             out.append("── Tensiones nodales ──")
             for node, v in sorted(result['voltages'].items()):
                 out.append(f"  V({node}) = {v:+.4f} V")
-            if result['branch_currents']:
+            if result.get('branch_currents'):
                 out.append("\n── Corrientes de rama ──")
                 for name, i in result['branch_currents'].items():
                     out.append(f"  I({name}) = {i*1000:+.4f} mA")
+
+            # Iteraciones Newton-Raphson (si aplica)
+            if 'iterations' in result:
+                out.append(f"\n  [NR convergió en {result['iterations']} iteraciones]")
+            if 'warning' in result:
+                out.append(f"\n  ⚠ {result['warning']}")
+
+            # Puntos de operación de componentes no-lineales
+            if result.get('operating_points'):
+                out.append("\n── Puntos de operación ──")
+                for comp_name, op in result['operating_points'].items():
+                    out.append(f"  {comp_name}:")
+                    for k, v in op.items():
+                        if isinstance(v, float):
+                            out.append(f"    {k} = {v:.4g}")
+                        else:
+                            out.append(f"    {k} = {v}")
 
             # Corrientes y potencias
             out.append("\n── Corrientes y potencias ──")
@@ -932,24 +1320,163 @@ class MainWindow(QMainWindow):
         self.scene.update()
 
     # ── Panel de propiedades ─────────────────────
+    def _run_simulation_ac(self):
+        """Análisis AC de frecuencia única con triángulo de potencia."""
+        from PyQt6.QtWidgets import QInputDialog
+
+        # Buscar fuente VAC en el canvas para leer la frecuencia
+        vac_items = [it for it in self.scene.components if it.comp_type == 'VAC']
+        if not vac_items:
+            self.results_text.setPlainText(
+                "⚠  No hay fuentes VAC en el circuito.\n"
+                "Agrega una fuente VAC (paleta izquierda) para el análisis AC.")
+            return
+
+        # Usar la frecuencia de la primera VAC como referencia
+        freq_default = vac_items[0].frequency
+        freq, ok = QInputDialog.getDouble(
+            self, 'Frecuencia de análisis',
+            'Frecuencia (Hz):', freq_default, 0.001, 1e9, 3)
+        if not ok:
+            return
+
+        components = []
+        errors     = []
+        pin_node   = self.scene.extract_netlist()
+
+        for item in self.scene.components:
+            auto_n1 = pin_node.get(f"{item.name}__p1", f'iso_{item.name}_p')
+            auto_n2 = pin_node.get(f"{item.name}__p2", '0')
+            n1 = item.node1.strip() if item.node1.strip() else auto_n1
+            n2 = item.node2.strip() if item.node2.strip() else auto_n2
+
+            try:
+                if item.comp_type == 'R':
+                    if item.value <= 0:
+                        errors.append(f"{item.name}: R debe ser > 0"); continue
+                    components.append(Resistor(item.name, n1, n2, item.value))
+                elif item.comp_type == 'V':
+                    # Fuente DC en análisis AC → contribución 0
+                    components.append(VoltageSource(item.name, n1, n2, 0.0))
+                elif item.comp_type == 'VAC':
+                    components.append(VoltageSourceAC(
+                        item.name, n1, n2,
+                        amplitude=item.value,
+                        frequency=item.frequency,
+                        phase_deg=item.phase_deg,
+                        mode=item.ac_mode))
+                elif item.comp_type == 'I':
+                    components.append(CurrentSource(item.name, n1, n2, item.value))
+                elif item.comp_type == 'C':
+                    if item.value > 0:
+                        components.append(Capacitor(item.name, n1, n2, item.value))
+                elif item.comp_type == 'L':
+                    if item.value > 0:
+                        components.append(Inductor(item.name, n1, n2, item.value))
+            except Exception as e:
+                errors.append(f"{item.name}: {e}")
+
+        if not components:
+            self.results_text.setPlainText("⚠  No hay componentes simulables.")
+            return
+
+        solver = MNASolver()
+        result = solver.solve_ac_single(components, freq)
+
+        out = ["═══ ANÁLISIS AC ═══", f"  Frecuencia: {freq} Hz", ""]
+
+        if errors:
+            out.append("⚠ Advertencias:")
+            out += [f"  {e}" for e in errors]
+            out.append("")
+
+        if not result['success']:
+            out.append(f"✗ Error: {result['error']}")
+            self.results_text.setPlainText('\n'.join(out))
+            self.btn_power_triangle.setVisible(False)
+            return
+
+        # ── Voltajes nodales ──────────────────────────────────────────────
+        out.append("── Voltajes nodales (Vrms / ∠°) ──")
+        for node, V in sorted(result['voltages'].items()):
+            import cmath
+            mag   = abs(V)
+            phase = cmath.phase(V) * 180 / cmath.pi
+            out.append(f"  V({node}) = {mag:.4f} V  ∠{phase:.2f}°")
+
+        # ── Potencias por componente ──────────────────────────────────────
+        out.append("\n── Potencias por componente ──")
+        for name, pw in result['powers'].items():
+            out.append(f"  {name}:")
+            out.append(f"    P = {pw['P']:+.4f} W")
+            out.append(f"    Q = {pw['Q']:+.4f} VAR")
+            out.append(f"    S = {pw['S']:.4f} VA")
+            out.append(f"    fp= {pw['fp']:.4f}")
+
+        # ── Triángulo de potencia total ───────────────────────────────────
+        t = result['total']
+        out.append("\n── Potencia total del circuito ──")
+        out.append(f"  P  = {t['P']:+.4f} W      (potencia real/activa)")
+        out.append(f"  Q  = {t['Q']:+.4f} VAR    (potencia reactiva)")
+        out.append(f"  S  = {t['S']:.4f} VA     (potencia aparente)")
+        out.append(f"  fp = {t['fp']:.4f}  ({t['fp_type']})")
+        out.append("")
+        out.append("  [Haz click en '📐 Ver Triángulo de Potencia']")
+
+        if result.get('warning'):
+            out.append(f"\n⚠ {result['warning']}")
+
+        self.results_text.setPlainText('\n'.join(out))
+        self._last_ac_result = result
+        self.btn_power_triangle.setVisible(True)
+
+    def _show_power_triangle(self):
+        if not self._last_ac_result:
+            return
+        dlg = PowerTriangleDialog(self._last_ac_result, parent=self)
+        dlg.exec()
+
     def _on_component_selected(self, item):
         self.prop_table.setRowCount(0)
         if item is None:
             return
-        # Obtener nodos automaticos para mostrar
-        pin_node = self.scene.extract_netlist()
-        auto_n1 = pin_node.get(f"{item.name}__p1", '—')
-        auto_n2 = pin_node.get(f"{item.name}__p2", '—')
+
+        # Etiquetas de terminales según tipo de componente
+        terminal_labels = {
+            'R':       ('Nodo 1',            'Nodo 2',             None),
+            'C':       ('Nodo 1',            'Nodo 2',             None),
+            'L':       ('Nodo 1',            'Nodo 2',             None),
+            'V':       ('Nodo + (ánodo)',    'Nodo − (cátodo)',    None),
+            'I':       ('Nodo + (salida)',   'Nodo − (entrada)',   None),
+            'D':       ('Ánodo (A)',         'Cátodo (K)',         None),
+            'BJT_NPN': ('Colector (C)',      'Emisor (E)',         'Base (B)'),
+            'BJT_PNP': ('Colector (C)',      'Emisor (E)',         'Base (B)'),
+            'NMOS':    ('Drain (D)',         'Source (S)',         'Gate (G)'),
+            'PMOS':    ('Drain (D)',         'Source (S)',         'Gate (G)'),
+            'OPAMP':   ('Salida (OUT)',      'Entrada − (V−)',     'Entrada + (V+)'),
+        }
+        lbl1, lbl2, lbl3 = terminal_labels.get(item.comp_type, ('Nodo +', 'Nodo −', None))
+
+        # Nodos automáticos desde cables
+        pin_node  = self.scene.extract_netlist()
+        auto_n1   = pin_node.get(f"{item.name}__p1", '—')
+        auto_n2   = pin_node.get(f"{item.name}__p2", '—')
+        auto_n3   = pin_node.get(f"{item.name}__p3", '—')
         n1_display = item.node1.strip() or f"{auto_n1} (auto)"
         n2_display = item.node2.strip() or f"{auto_n2} (auto)"
+        n3_display = item.node3.strip() or f"{auto_n3} (auto)"
+
         rows = [
-            ("Tipo",       item.comp_type),
-            ("Nombre",    item.name),
-            ("Valor",     f"{item.value} {item.unit}"),
-            ("Rotacion",  f"{item._angle}°"),
-            ("Nodo +",    n1_display),
-            ("Nodo −",    n2_display),
+            ("Tipo",     item.comp_type),
+            ("Nombre",   item.name),
+            ("Valor",    f"{item.value} {item.unit}"),
+            ("Rotación", f"{item._angle}°"),
+            (lbl1,       n1_display),
+            (lbl2,       n2_display),
         ]
+        if lbl3 is not None:
+            rows.append((lbl3, n3_display))
+
         for label, val in rows:
             r = self.prop_table.rowCount()
             self.prop_table.insertRow(r)
@@ -1157,3 +1684,229 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# ══════════════════════════════════════════════════════════════
+# DIÁLOGO TRIÁNGULO DE POTENCIA
+# ══════════════════════════════════════════════════════════════
+class PowerTriangleDialog(QDialog):
+    """
+    Ventana emergente con:
+      - Triángulo de potencia dibujado (P, Q, S, ángulo φ)
+      - Tabla de potencias por componente
+      - Corrección de factor de potencia interactiva
+    """
+    def __init__(self, ac_result: dict, parent=None):
+        super().__init__(parent)
+        self.ac_result = ac_result
+        self.setWindowTitle("Triángulo de Potencia")
+        self.setMinimumSize(620, 580)
+        self._build_ui()
+
+    def _build_ui(self):
+        from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox,
+                                      QDoubleSpinBox, QPushButton, QLabel,
+                                      QTextEdit, QSplitter)
+        main = QVBoxLayout(self)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # ── Triángulo ────────────────────────────────────────────────────
+        self.canvas = _PowerTriangleCanvas(self.ac_result['total'])
+        self.canvas.setMinimumHeight(260)
+        splitter.addWidget(self.canvas)
+
+        # ── Corrección de FP ─────────────────────────────────────────────
+        box = QGroupBox("Corrección de Factor de Potencia")
+        box_layout = QHBoxLayout(box)
+
+        box_layout.addWidget(QLabel("FP objetivo:"))
+        self.fp_spin = QDoubleSpinBox()
+        self.fp_spin.setRange(0.01, 1.0)
+        self.fp_spin.setDecimals(3)
+        self.fp_spin.setSingleStep(0.01)
+        self.fp_spin.setValue(1.0)
+        box_layout.addWidget(self.fp_spin)
+
+        self.correct_btn = QPushButton("Calcular corrección")
+        self.correct_btn.clicked.connect(self._on_correct)
+        box_layout.addWidget(self.correct_btn)
+        box_layout.addStretch()
+
+        self.corr_label = QLabel("")
+        self.corr_label.setWordWrap(True)
+        self.corr_label.setFont(QFont('Consolas', 9))
+
+        bottom = QWidget()
+        bl = QVBoxLayout(bottom)
+        bl.addWidget(box)
+        bl.addWidget(self.corr_label)
+        splitter.addWidget(bottom)
+
+        main.addWidget(splitter)
+
+        close_btn = QPushButton("Cerrar")
+        close_btn.clicked.connect(self.accept)
+        main.addWidget(close_btn)
+
+    def _on_correct(self):
+        from engine import MNASolver
+        solver  = MNASolver()
+        total   = self.ac_result['total']
+        freq    = self.ac_result['frequency']
+        fp_tgt  = self.fp_spin.value()
+        res     = solver.correct_power_factor(total, freq, fp_tgt)
+
+        if 'error' in res:
+            self.corr_label.setText(f"⚠ {res['error']}")
+            return
+
+        tipo   = res['type']
+        val    = res['value']
+        Q_corr = res['Q_corr']
+        fp_new = res['fp_new']
+        note   = res.get('note', '')
+        form   = res['formula']
+
+        if tipo == 'capacitor':
+            val_str = f"C = {val*1e6:.4f} µF  (normalizado a 1 Vrms)"
+            emoji   = "⚡ Capacitor"
+        else:
+            val_str = f"L = {val*1e3:.4f} mH  (normalizado a 1 Vrms)"
+            emoji   = "🔄 Inductor"
+
+        text = (
+            f"  Elemento corrector: {emoji} en PARALELO\n"
+            f"  {val_str}\n"
+            f"  Q a compensar:  {Q_corr:.4f} VAR\n"
+            f"  FP resultante:  {fp_new:.4f}\n"
+            f"  Fórmula:        {form}\n"
+            f"  📌 {note}"
+        )
+        self.corr_label.setText(text)
+        # Actualizar triángulo con la corrección
+        self.canvas.set_correction(res)
+        self.canvas.update()
+
+
+class _PowerTriangleCanvas(QWidget):
+    """Widget que dibuja el triángulo de potencia S, P, Q, ángulo φ."""
+
+    def __init__(self, total: dict, parent=None):
+        super().__init__(parent)
+        self.total      = total
+        self._correction = None
+
+    def set_correction(self, corr: dict):
+        self._correction = corr
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QPolygonF
+        import math
+
+        P  = self.total.get('P', 0.0)
+        Q  = self.total.get('Q', 0.0)
+        S  = self.total.get('S', 1.0)
+        fp = self.total.get('fp', 0.0)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor('#1a1a2e'))
+
+        W = self.width()
+        H = self.height()
+
+        # Escala: S ocupa 60% del ancho
+        if S < 1e-12:
+            painter.setPen(QPen(QColor('#aaaaaa'), 1))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "Sin datos de potencia")
+            return
+
+        scale = (W * 0.58) / S
+
+        # Origen en centro-izquierda
+        ox = int(W * 0.12)
+        oy = int(H * 0.65)
+
+        Px = int(P * scale)
+        Qy = int(-Q * scale)   # Q positivo → hacia arriba en pantalla
+
+        # ── Vectores del triángulo ────────────────────────────────────────
+        # P: horizontal (rojo)
+        # Q: vertical   (azul, arriba si inductivo)
+        # S: hipotenusa (verde)
+
+        pen_P = QPen(QColor('#e74c3c'), 3)   # rojo — potencia activa
+        pen_Q = QPen(QColor('#3498db'), 3)   # azul — potencia reactiva
+        pen_S = QPen(QColor('#2ecc71'), 3)   # verde — potencia aparente
+        pen_c = QPen(QColor('#f39c12'), 2, Qt.PenStyle.DashLine)  # naranja corrección
+
+        font_lbl = QFont('Consolas', 9, QFont.Weight.Bold)
+        painter.setFont(font_lbl)
+
+        def arrow(painter, pen, x1, y1, x2, y2, label='', lside='end'):
+            painter.setPen(pen)
+            painter.drawLine(x1, y1, x2, y2)
+            # Punta de flecha
+            dx = x2 - x1; dy = y2 - y1
+            L  = math.sqrt(dx*dx + dy*dy)
+            if L < 1: return
+            ux = dx/L; uy = dy/L
+            px = -uy;  py = ux
+            sz = 8
+            tip = QPolygonF([
+                QPointF(x2, y2),
+                QPointF(x2 - sz*ux + sz*0.4*px, y2 - sz*uy + sz*0.4*py),
+                QPointF(x2 - sz*ux - sz*0.4*px, y2 - sz*uy - sz*0.4*py),
+            ])
+            painter.setBrush(QColor(pen.color()))
+            painter.drawPolygon(tip)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if label:
+                painter.setPen(QPen(pen.color(), 1))
+                if lside == 'end':
+                    painter.drawText(int(x2)+6, int(y2)+5, label)
+                else:
+                    mx = (x1+x2)//2; my = (y1+y2)//2
+                    painter.drawText(mx+6, my-4, label)
+
+        # P (horizontal)
+        arrow(painter, pen_P, ox, oy, ox + Px, oy,
+              f"P = {P:.2f} W", 'end')
+
+        # Q (vertical desde punta de P)
+        arrow(painter, pen_Q, ox + Px, oy, ox + Px, oy + Qy,
+              f"Q = {Q:.2f} VAR", 'end')
+
+        # S (hipotenusa desde origen)
+        arrow(painter, pen_S, ox, oy, ox + Px, oy + Qy,
+              f"S = {S:.2f} VA", 'mid')
+
+        # Ángulo φ
+        phi = math.acos(min(abs(fp), 1.0)) * 180 / math.pi
+        painter.setPen(QPen(QColor('#f1c40f'), 1))
+        r_arc = 40
+        start_angle = 0
+        span_angle  = int(-math.degrees(math.atan2(Q, P)) * 16) if S > 1e-12 else 0
+        painter.drawArc(ox - r_arc, oy - r_arc, 2*r_arc, 2*r_arc,
+                        start_angle * 16, span_angle)
+        painter.setPen(QPen(QColor('#f1c40f'), 1))
+        painter.drawText(ox + r_arc + 4, oy - 6,
+                         f"φ = {phi:.1f}°  fp={fp:.3f}  ({self.total.get('fp_type','')})")
+
+        # Corrección de FP (si existe)
+        if self._correction:
+            Q_new = self._correction.get('Q_new', Q)
+            Qy_new = int(-Q_new * scale)
+            arrow(painter, pen_c, ox, oy, ox + Px, oy + Qy_new,
+                  f"S' (fp={self._correction['fp_new']:.3f})", 'mid')
+            painter.setPen(QPen(QColor('#f39c12'), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(ox + Px, oy + Qy, ox + Px, oy + Qy_new)
+            painter.setPen(QPen(QColor('#f39c12'), 1))
+            painter.drawText(ox + Px + 8, (oy + Qy + oy + Qy_new)//2,
+                             f"ΔQ={abs(Q-Q_new):.2f} VAR")
+
+if __name__ == '__main__':
+    main()
+
