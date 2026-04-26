@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
-from engine import Resistor, VoltageSource, CurrentSource, Capacitor, MNASolver
+from engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Impedance, MNASolver
 
 solver = MNASolver()
 
@@ -125,6 +125,37 @@ else:
     print(f"  {FAIL}  AC solver error: {r.get('error')}")
     results.append(False)
 
+
+
+# ──────────────────────────────────────────────
+# TEST 6: Impedancia genérica en AC
+# Z = 100 + j100 Ω en divisor con Rload=100Ω
+# Vrms = 1V → |Z_total| = |(100+j100)||100| ... 
+# Verificamos que el solver maneje complejos
+# ──────────────────────────────────────────────
+print("\n[6] AC — Impedancia Z=100+j100 Ω (divisor con R=100Ω)")
+comps = [
+    VoltageSourceAC("Vin", "in", "0", amplitude=1.0, frequency=1000.0, mode='rms'),
+    Impedance("Z1", "in", "out", 100+100j),
+    Resistor("Rload", "out", "0", 100.0),
+]
+r = solver.solve_ac_single(comps, 1000.0)
+print(f"    success={r['success']}, f=1000 Hz")
+if r['success'] and 'out' in r['voltages']:
+    v_out = r['voltages']['out']
+    # Divisor: Vout = Vin * R / (Z + R) = 1∠0 * 100 / (200+100j)
+    # |200+100j| = 223.6, ang = -26.56°
+    # |Vout| = 100/223.6 = 0.4472
+    expected_mag = 100.0 / abs(200+100j)
+    check("|Vout|", abs(v_out), expected_mag, tol=1e-3)
+    # Potencia en Z debe tener P>0 y Q>0 (inductivo)
+    if 'Z1' in r['powers']:
+        pz = r['powers']['Z1']
+        check("P(Z1)", pz['P'], 0.001, tol=1e-4)  # aprox
+        check("Q(Z1)>0", 1 if pz['Q'] > 0 else 0, 1, tol=0.1)
+else:
+    print(f"  {FAIL}  AC solver error: {r.get('error')}")
+    results.append(False)
 
 # ──────────────────────────────────────────────
 # Resumen

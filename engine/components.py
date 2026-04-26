@@ -205,8 +205,55 @@ class Inductor(Component):
 
 
 # ──────────────────────────────────────────────
-# Fuente de voltaje AC independiente
+# Impedancia genérica (para AC y DC)
 # ──────────────────────────────────────────────
+class Impedance(Component):
+    """
+    Impedancia genérica Z = R + jX entre n1 y n2.
+    En AC: estampa admitancia Y = 1/Z (compleja).
+    En DC: estampa solo la parte real como conductancia.
+    """
+    def __init__(self, name: str, n1: str, n2: str, Z: complex):
+        super().__init__(name)
+        self.n1 = n1
+        self.n2 = n2
+        self.Z = Z
+
+    def stamp(self, G, I, node_map, branch_idx=None):
+        """En DC solo la parte real importa."""
+        R = self.Z.real
+        if abs(R) < 1e-12:
+            return  # circuito abierto en DC
+        g = 1.0 / R
+        n1 = node_map.get(self.n1)
+        n2 = node_map.get(self.n2)
+        if n1 is not None:
+            G[n1, n1] += g
+        if n2 is not None:
+            G[n2, n2] += g
+        if n1 is not None and n2 is not None:
+            G[n1, n2] -= g
+            G[n2, n1] -= g
+
+    def stamp_ac(self, G, I, node_map, omega: float, branch_idx=None):
+        """En AC estampa la admitancia compleja Y = 1/Z."""
+        if abs(self.Z) < 1e-12:
+            return
+        Y = 1.0 / self.Z
+        n1 = node_map.get(self.n1)
+        n2 = node_map.get(self.n2)
+        if n1 is not None:
+            G[n1, n1] += Y
+        if n2 is not None:
+            G[n2, n2] += Y
+        if n1 is not None and n2 is not None:
+            G[n1, n2] -= Y
+            G[n2, n1] -= Y
+
+
+# ──────────────────────────────────────────────
+# Fuente de voltaje AC independiente
+
 class VoltageSourceAC(Component):
     """
     Fuente de voltaje senoidal: v(t) = Vpeak * sin(2π·f·t + φ)

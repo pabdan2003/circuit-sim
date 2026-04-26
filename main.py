@@ -17,7 +17,8 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QSplitter, QDialog, QFormLayout,
     QLineEdit, QDialogButtonBox, QMessageBox, QStatusBar, QFrame,
     QGraphicsPathItem, QPushButton, QComboBox, QDoubleSpinBox,
-    QScrollArea, QGroupBox, QTextEdit, QFileDialog
+    QScrollArea, QGroupBox, QTextEdit, QFileDialog,
+    QListWidget, QListWidgetItem
 )
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPainterPath,
@@ -31,7 +32,7 @@ from PyQt6.QtCore import (
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor
-from engine import Diode, BJT, MOSFET, OpAmp, MNASolver
+from engine import Diode, BJT, MOSFET, OpAmp, Impedance, MNASolver
 
 
 # ══════════════════════════════════════════════════════════════
@@ -73,7 +74,7 @@ class ComponentItem(QGraphicsItem):
     Soporta drag, selección y doble-click para editar propiedades.
     """
 
-    COMP_TYPES = ['R', 'V', 'VAC', 'I', 'C', 'L', 'GND', 'NODE',
+    COMP_TYPES = ['R', 'V', 'VAC', 'I', 'C', 'L', 'Z', 'GND', 'NODE',
                   'D', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP']
 
     def __init__(self, comp_type: str, name: str, value: float = 0.0,
@@ -92,6 +93,12 @@ class ComponentItem(QGraphicsItem):
         self.ac_mode:   str   = 'rms'   # 'rms' o 'peak'
         self.result_voltage: Optional[float] = None
         self._angle = 0  # rotación en grados (0, 90, 180, 270)
+        # Atributos para impedancia genérica
+        self.z_mode:   str   = 'rect'   # 'rect' o 'phasor'
+        self.z_real:   float = 100.0    # Ω (parte real)
+        self.z_imag:   float = 0.0      # Ω (parte imag)
+        self.z_mag:    float = 100.0    # Ω (magnitud fasorial)
+        self.z_phase:  float = 0.0      # ° (fase fasorial)
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
@@ -181,6 +188,8 @@ class ComponentItem(QGraphicsItem):
             self._draw_mosfet(painter, pen_body, pen_wire)
         elif self.comp_type == 'OPAMP':
             self._draw_opamp(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'Z':
+            self._draw_impedance(painter, pen_body, pen_wire, body_color)
 
         # Nombre y valor
         self._draw_labels(painter, text_color)
@@ -244,15 +253,37 @@ class ComponentItem(QGraphicsItem):
         painter.setPen(pen_body)
         painter.setBrush(QBrush(body_color))
         painter.drawEllipse(QPointF(0, 0), r, r)
-        # Símbolo + / −  o flecha
+        # Símbolo + / − / ~  o flecha
         painter.setPen(QPen(QColor(COLORS['component']), 2))
         if self.comp_type == 'V':
             painter.drawText(QRectF(-r+4, -r+4, r-4, r*2-8), Qt.AlignmentFlag.AlignCenter, '+')
+        elif self.comp_type == 'VAC':
+            # Onda sinusoidal dentro del círculo
+            path = QPainterPath()
+            path.moveTo(-r*0.5, 0)
+            for i in range(1, 21):
+                t = i / 20.0
+                x = -r*0.5 + t * r
+                y = -r*0.35 * math.sin(t * 2 * math.pi)
+                path.lineTo(x, y)
+            painter.drawPath(path)
         else:
             # Flecha de corriente
             painter.drawLine(QPointF(-8, 0), QPointF(8, 0))
             painter.drawLine(QPointF(4, -5), QPointF(8, 0))
             painter.drawLine(QPointF(4, 5), QPointF(8, 0))
+
+    def _draw_impedance(self, painter, pen_body, pen_wire, body_color):
+        hw = COMP_W // 2
+        hh = COMP_H // 2
+        # Cables
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-hw, 0))
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        # Cuerpo: rectángulo vacío (solo borde)
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRect(QRectF(-hw, -hh, COMP_W, COMP_H))
 
     def _draw_gnd(self, painter, pen_body):
         painter.setPen(pen_body)
@@ -405,6 +436,7 @@ class ComponentItem(QGraphicsItem):
 
         pin_data = [
             (QPointF(hw + 10, -hh - 6), 'D',  6, -8),
+            (QPointF(hw + 10, -hh - 6), 'D',  6, -8),
             (QPointF(hw + 10,  hh + 6), 'S',  6,  2),
             (QPointF(-hw - 10, 0),      'G', -14, -8),
         ]
@@ -482,6 +514,16 @@ class ComponentItem(QGraphicsItem):
             painter.drawText(res_rect, Qt.AlignmentFlag.AlignCenter, res_str)
 
     def _format_value(self) -> str:
+        if self.comp_type == 'Z':
+            if self.z_mode == 'rect':
+                real = self.z_real
+                imag = self.z_imag
+                if abs(imag) < 1e-12:
+                    return f"{real:.3g}Ω"
+                sign = '+' if imag >= 0 else '-'
+                return f"{real:.3g}{sign}{abs(imag):.3g}jΩ"
+            else:
+                return f"{self.z_mag:.3g}∠{self.z_phase:.1f}°Ω"
         v = self.value
         if abs(v) >= 1e6:
             return f"{v/1e6:.2g}M{self.unit}"
@@ -521,6 +563,144 @@ class WireItem(QGraphicsLineItem):
             self.setPen(QPen(QColor(COLORS['wire']), 2, Qt.PenStyle.SolidLine,
                              Qt.PenCapStyle.RoundCap))
         super().paint(painter, option, widget)
+
+
+# ══════════════════════════════════════════════════════════════
+# DIÁLOGO DE SELECCIÓN DE COMPONENTES (con preview)
+# ══════════════════════════════════════════════════════════════
+class ComponentPickerDialog(QDialog):
+    """
+    Ventana emergente que muestra una lista de componentes de una categoría
+    y una preview gráfica del componente seleccionado.
+    """
+    def __init__(self, category_name: str, components: List[tuple], parent=None):
+        """
+        components: lista de tuplas (comp_type, label, symbol_ascii)
+        """
+        super().__init__(parent)
+        self.setWindowTitle(f"Seleccionar componente — {category_name}")
+        self._components = components
+        self._selected_type = None
+        self._build_ui()
+        self._apply_style()
+
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setSpacing(12)
+
+        # ── Lista de componentes ─────────────────────────────────────────
+        left = QVBoxLayout()
+        self.list_widget = QListWidget()
+        self.list_widget.setFont(QFont('Consolas', 10))
+        for ctype, label, sym in self._components:
+            item = QListWidgetItem(f"{sym}   {label}")
+            item.setData(Qt.ItemDataRole.UserRole, ctype)
+            self.list_widget.addItem(item)
+        self.list_widget.currentRowChanged.connect(self._update_preview)
+        self.list_widget.itemDoubleClicked.connect(self.accept)
+        left.addWidget(self.list_widget)
+
+        btn_row = QHBoxLayout()
+        self.place_btn = QPushButton("Colocar")
+        self.place_btn.setDefault(True)
+        self.place_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(self.place_btn)
+        btn_row.addWidget(cancel_btn)
+        left.addLayout(btn_row)
+        layout.addLayout(left, 1)
+
+        # ── Preview gráfica ──────────────────────────────────────────────
+        right = QVBoxLayout()
+        preview_title = QLabel("Vista previa")
+        preview_title.setFont(QFont('Consolas', 9, QFont.Weight.Bold))
+        preview_title.setStyleSheet(f"color: {COLORS['component']};")
+        right.addWidget(preview_title)
+
+        self.preview_scene = QGraphicsScene()
+        self.preview_view = QGraphicsView(self.preview_scene)
+        self.preview_view.setFixedSize(280, 220)
+        self.preview_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.preview_view.setBackgroundBrush(QBrush(QColor(COLORS['bg'])))
+        self.preview_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.preview_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.preview_view.setFrameShape(QFrame.Shape.StyledPanel)
+        right.addWidget(self.preview_view)
+        right.addStretch()
+        layout.addLayout(right, 2)
+
+        self.list_widget.setCurrentRow(0)
+
+    def _update_preview(self, row: int):
+        self.preview_scene.clear()
+        if row < 0 or row >= self.list_widget.count():
+            return
+        ctype = self.list_widget.item(row).data(Qt.ItemDataRole.UserRole)
+        self._selected_type = ctype
+
+        # Valores por defecto para que la preview se vea bien
+        defaults = {
+            'R': 1000.0, 'V': 5.0, 'VAC': 120.0, 'I': 0.001,
+            'C': 1e-6, 'L': 1e-3, 'Z': 0.0,
+            'D': 1e-14, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
+            'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5,
+            'GND': 0.0, 'NODE': 0.0
+        }
+        val = defaults.get(ctype, 1.0)
+        item = ComponentItem(ctype, f"{ctype}1", val, '', '', '')
+        if ctype == 'Z':
+            item.z_real = 100.0
+            item.z_imag = 50.0
+
+        # Deshabilitar interacción en la preview
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, False)
+
+        self.preview_scene.addItem(item)
+        br = item.boundingRect()
+        self.preview_scene.setSceneRect(br.adjusted(-30, -30, 30, 30))
+        self.preview_view.centerOn(item)
+
+    def _apply_style(self):
+        self.setStyleSheet(f"""
+            QDialog {{
+                background: {COLORS['panel']};
+                color: {COLORS['text']};
+            }}
+            QLabel {{
+                color: {COLORS['text']};
+            }}
+            QListWidget {{
+                background: {COLORS['comp_body']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['panel_brd']};
+                border-radius: 4px;
+                padding: 4px;
+            }}
+            QListWidget::item {{
+                padding: 6px;
+                border-bottom: 1px solid {COLORS['panel_brd']};
+            }}
+            QListWidget::item:selected {{
+                background: {COLORS['component']};
+                color: white;
+            }}
+            QPushButton {{
+                background: {COLORS['component']};
+                color: white;
+                border-radius: 4px;
+                padding: 6px 16px;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['comp_sel']};
+            }}
+        """)
+
+    def get_selected_type(self) -> Optional[str]:
+        return self._selected_type
 
 
 # ══════════════════════════════════════════════════════════════
@@ -567,7 +747,7 @@ class CircuitScene(QGraphicsScene):
     # ── Colocar componente ───────────────────────
     def place_component(self, comp_type: str, pos: QPointF,
                         name: str = '', value: float = 0.0, unit: str = '',
-                        node1: str = '', node2: str = '') -> ComponentItem:
+                        node1: str = '', node2: str = '', node3: str = '') -> ComponentItem:
         if not name:
             count = self._comp_counter.get(comp_type, 0) + 1
             self._comp_counter[comp_type] = count
@@ -587,7 +767,7 @@ class CircuitScene(QGraphicsScene):
         if value == 0.0:
             value = defaults.get(comp_type, 1.0)
 
-        item = ComponentItem(comp_type, name, value, unit, node1, node2)
+        item = ComponentItem(comp_type, name, value, unit, node1, node2, node3)
         snap_x = round(pos.x() / GRID_SIZE) * GRID_SIZE
         snap_y = round(pos.y() / GRID_SIZE) * GRID_SIZE
         item.setPos(snap_x, snap_y)
@@ -768,6 +948,12 @@ class CircuitScene(QGraphicsScene):
                 item.frequency = data['frequency']
                 item.phase_deg = data['phase_deg']
                 item.ac_mode   = data['ac_mode']
+            if item.comp_type == 'Z':
+                item.z_mode   = data.get('z_mode', 'rect')
+                item.z_real   = data.get('z_real', 100.0)
+                item.z_imag   = data.get('z_imag', 0.0)
+                item.z_mag    = data.get('z_mag', 100.0)
+                item.z_phase  = data.get('z_phase', 0.0)
             item.update()
 
 
@@ -870,6 +1056,58 @@ class ComponentDialog(QDialog):
             self._phase_spin.setValue(self.item.phase_deg)
             layout.addRow('Fase:', self._phase_spin)
 
+        # ── Campos extra para Impedancia ────────────────────────────────
+        self._z_mode_combo = None
+        self._z_real = self._z_imag = self._z_mag = self._z_phase = None
+        if self.item.comp_type == 'Z':
+            from PyQt6.QtWidgets import QComboBox, QStackedWidget, QWidget, QHBoxLayout
+            self._z_mode_combo = QComboBox()
+            self._z_mode_combo.addItems(['Rectangular (R + jX)', 'Fasorial |Z|∠θ'])
+            self._z_mode_combo.setCurrentIndex(0 if self.item.z_mode == 'rect' else 1)
+            layout.addRow("Modo entrada:", self._z_mode_combo)
+
+            # Página rectangular
+            w_rect = QWidget()
+            l_rect = QHBoxLayout(w_rect)
+            self._z_real = QDoubleSpinBox()
+            self._z_real.setRange(-1e12, 1e12)
+            self._z_real.setDecimals(6)
+            self._z_real.setSuffix(" Ω")
+            self._z_real.setValue(self.item.z_real)
+            self._z_imag = QDoubleSpinBox()
+            self._z_imag.setRange(-1e12, 1e12)
+            self._z_imag.setDecimals(6)
+            self._z_imag.setSuffix(" jΩ")
+            self._z_imag.setValue(self.item.z_imag)
+            l_rect.addWidget(QLabel("Real:"))
+            l_rect.addWidget(self._z_real)
+            l_rect.addWidget(QLabel("Imag:"))
+            l_rect.addWidget(self._z_imag)
+
+            # Página fasorial
+            w_phas = QWidget()
+            l_phas = QHBoxLayout(w_phas)
+            self._z_mag = QDoubleSpinBox()
+            self._z_mag.setRange(0, 1e12)
+            self._z_mag.setDecimals(6)
+            self._z_mag.setSuffix(" Ω")
+            self._z_mag.setValue(self.item.z_mag)
+            self._z_phase = QDoubleSpinBox()
+            self._z_phase.setRange(-360, 360)
+            self._z_phase.setDecimals(2)
+            self._z_phase.setSuffix(" °")
+            self._z_phase.setValue(self.item.z_phase)
+            l_phas.addWidget(QLabel("|Z|:"))
+            l_phas.addWidget(self._z_mag)
+            l_phas.addWidget(QLabel("∠:"))
+            l_phas.addWidget(self._z_phase)
+
+            self._z_stack = QStackedWidget()
+            self._z_stack.addWidget(w_rect)
+            self._z_stack.addWidget(w_phas)
+            layout.addRow(self._z_stack)
+            self._z_mode_combo.currentIndexChanged.connect(self._z_stack.setCurrentIndex)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -877,7 +1115,7 @@ class ComponentDialog(QDialog):
         layout.addRow(buttons)
 
     def get_data(self):
-        return {
+        data = {
             'name':      self.name_edit.text(),
             'value':     self.value_spin.value(),
             'node1':     self.node1_edit.text(),
@@ -887,6 +1125,13 @@ class ComponentDialog(QDialog):
             'phase_deg': self._phase_spin.value() if self._phase_spin else 0.0,
             'ac_mode':   self._mode_combo.currentText() if self._mode_combo else 'rms',
         }
+        if self.item.comp_type == 'Z' and self._z_mode_combo is not None:
+            data['z_mode']  = 'rect' if self._z_mode_combo.currentIndex() == 0 else 'phasor'
+            data['z_real']  = self._z_real.value()
+            data['z_imag']  = self._z_imag.value()
+            data['z_mag']   = self._z_mag.value()
+            data['z_phase'] = self._z_phase.value()
+        return data
 
 
 # ══════════════════════════════════════════════════════════════
@@ -918,100 +1163,29 @@ class MainWindow(QMainWindow):
         # Zoom con rueda
         self.view.wheelEvent = self._wheel_zoom
 
-        # Toolbar izquierda (paleta de componentes)
-        self._build_left_panel()
-
         # Panel derecho (propiedades + resultados)
         self._build_right_panel()
 
-        # Layout central
+        # Layout central: canvas + panel derecho
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.left_panel)
         splitter.addWidget(self.view)
         splitter.addWidget(self.right_panel)
-        splitter.setSizes([180, 860, 240])
+        splitter.setSizes([1000, 280])
 
         self.setCentralWidget(splitter)
 
-        # Toolbar superior
-        self._build_toolbar()
+        # ── Toolbar PRINCIPAL (fila 1: archivo, zoom, etc.) ──────────────
+        self._build_main_toolbar()
+
+        # ── Toolbar SECUNDARIA (fila 2: categorías, herramientas, simulación)
+        self._build_component_toolbar()
 
         # Status bar
-        self.statusBar().showMessage("Listo — Doble-click sobre un componente para editar")
-
-    def _build_left_panel(self):
-        self.left_panel = QWidget()
-        self.left_panel.setFixedWidth(175)
-        layout = QVBoxLayout(self.left_panel)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        title = QLabel("COMPONENTES")
-        title.setFont(QFont('Consolas', 9, QFont.Weight.Bold))
-        layout.addWidget(title)
-
-        components = [
-            ('R',       'Resistor',    '━┤ZZZ├━'),
-            ('C',       'Capacitor',   '━┤  ├━'),
-            ('L',       'Inductor',    '━⌒⌒⌒━'),
-            ('V',       'Fuente VDC',  '━(+)━'),
-            ('VAC',     'Fuente VAC',  '━(~)━'),
-            ('I',       'Fuente I',    '━(→)━'),
-            ('GND',     'Tierra',      '⏚'),
-            ('NODE',    'Nodo',        '•'),
-            ('D',       'Diodo',       '━|▷|━'),
-            ('BJT_NPN', 'BJT NPN',     '━(NPN)'),
-            ('BJT_PNP', 'BJT PNP',     '━(PNP)'),
-            ('NMOS',    'MOSFET N',    '━[N]━'),
-            ('PMOS',    'MOSFET P',    '━[P]━'),
-            ('OPAMP',   'Op-Amp',      '━[▷]━'),
-        ]
-
-        for ctype, label, sym in components:
-            btn = QPushButton(f"  {sym}  {label}")
-            btn.setCheckable(True)
-            btn.setFont(QFont('Consolas', 9))
-            btn.clicked.connect(lambda checked, t=ctype: self._set_place_mode(t))
-            layout.addWidget(btn)
-            setattr(self, f'btn_{ctype}', btn)
-
-        layout.addSpacing(10)
-
-        wire_btn = QPushButton("✏  Cable (Wire)")
-        wire_btn.setCheckable(True)
-        wire_btn.setFont(QFont('Consolas', 9))
-        wire_btn.clicked.connect(lambda: self._set_wire_mode())
-        self.btn_wire = wire_btn
-        layout.addWidget(wire_btn)
-
-        select_btn = QPushButton("↖  Seleccionar")
-        select_btn.setFont(QFont('Consolas', 9))
-        select_btn.clicked.connect(lambda: self._set_select_mode())
-        layout.addWidget(select_btn)
-
-        layout.addStretch()
-
-        from PyQt6.QtWidgets import QComboBox, QHBoxLayout
-        sim_row = QHBoxLayout()
-
-        self.sim_mode_combo = QComboBox()
-        self.sim_mode_combo.addItems(['DC', 'AC'])
-        self.sim_mode_combo.setFont(QFont('Consolas', 10))
-        self.sim_mode_combo.setFixedHeight(40)
-        self.sim_mode_combo.setFixedWidth(70)
-        self.sim_mode_combo.currentTextChanged.connect(self._on_sim_mode_changed)
-        sim_row.addWidget(self.sim_mode_combo)
-
-        self.run_btn = QPushButton("▶  SIMULAR DC")
-        self.run_btn.setFont(QFont('Consolas', 10, QFont.Weight.Bold))
-        self.run_btn.setFixedHeight(40)
-        self.run_btn.clicked.connect(self._run_simulation)
-        sim_row.addWidget(self.run_btn)
-
-        layout.addLayout(sim_row)
+        self.statusBar().showMessage("Listo — Selecciona una categoría para colocar componentes")
 
     def _build_right_panel(self):
         self.right_panel = QWidget()
+        self.right_panel.setFixedWidth(260)
         layout = QVBoxLayout(self.right_panel)
         layout.setContentsMargins(8, 8, 8, 8)
 
@@ -1044,16 +1218,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_power_triangle)
         self._last_ac_result = None   # guardamos el resultado AC para el popup
 
-    def _build_toolbar(self):
+    def _build_main_toolbar(self):
+        """Barra superior (fila 1): archivo, zoom, etc."""
         tb = self.addToolBar("Principal")
         tb.setMovable(False)
-        tb.setIconSize(QSize(16, 16))
+        tb.setObjectName("main_toolbar")
 
         actions = [
-            ("Nuevo",        "Ctrl+N", self._new_circuit),
-            ("Abrir",        "Ctrl+O", self._open_circuit),
-            ("Guardar",      "Ctrl+S", self._save_circuit),
-            ("Exportar SPICE", "Ctrl+E", self._export_spice),
+            ("Nuevo",           "Ctrl+N",          self._new_circuit),
+            ("Abrir",           "Ctrl+O",          self._open_circuit),
+            ("Guardar",         "Ctrl+S",          self._save_circuit),
+            ("Guardar como…",   "Ctrl+Shift+S",    self._save_circuit_as),
+            ("Exportar SPICE",  "Ctrl+E",          self._export_spice),
             ("|", None, None),
             ("Limpiar",      "Ctrl+L", self._clear_circuit),
             ("Zoom +",       "Ctrl+=", lambda: self.view.scale(1.2, 1.2)),
@@ -1072,6 +1248,85 @@ class MainWindow(QMainWindow):
 
         self._current_file: Optional[str] = None
 
+    def _build_component_toolbar(self):
+        """Barra secundaria (fila 2): categorías de componentes, herramientas y simulación."""
+        # ── FORZAR SALTO DE LÍNEA antes de esta toolbar ──────────────────
+        self.addToolBarBreak()
+
+        tb = QToolBar("Componentes", self)
+        tb.setMovable(False)
+        tb.setObjectName("component_toolbar")
+        self.addToolBar(tb)
+
+        # ── Categorías de componentes ────────────────────────────────────
+        categories = [
+            ("Pasivos", [
+                ('R', 'Resistor',    '━┤ZZZ├━'),
+                ('C', 'Capacitor',   '━┤  ├━'),
+                ('L', 'Inductor',    '━⌒⌒⌒━'),
+                ('Z', 'Impedancia',  '━┤▭├━'),
+            ]),
+            ("Fuentes", [
+                ('V',   'Fuente VDC',  '━(+)━'),
+                ('VAC', 'Fuente VAC',  '━(~)━'),
+                ('I',   'Fuente I',    '━(→)━'),
+            ]),
+            ("Semiconductores", [
+                ('D',       'Diodo',       '━|▷|━'),
+                ('BJT_NPN', 'BJT NPN',     '━(NPN)'),
+                ('BJT_PNP', 'BJT PNP',     '━(PNP)'),
+                ('NMOS',    'MOSFET N',    '━[N]━'),
+                ('PMOS',    'MOSFET P',    '━[P]━'),
+                ('OPAMP',   'Op-Amp',      '━[▷]━'),
+            ]),
+            ("Referencia", [
+                ('GND',  'Tierra',   '⏚'),
+                ('NODE', 'Nodo',     '•'),
+            ]),
+        ]
+
+        for cat_name, items in categories:
+            btn = QPushButton(cat_name)
+            btn.setFont(QFont('Consolas', 9))
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked, c=cat_name, it=items: self._show_picker(c, it))
+            tb.addWidget(btn)
+
+        tb.addSeparator()
+
+        # ── Herramientas ─────────────────────────────────────────────────
+        btn_select = QPushButton("↖ Seleccionar")
+        btn_select.setFont(QFont('Consolas', 9))
+        btn_select.setFixedHeight(28)
+        btn_select.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_select.clicked.connect(self._set_select_mode)
+        tb.addWidget(btn_select)
+
+        btn_wire = QPushButton("✏ Cable")
+        btn_wire.setFont(QFont('Consolas', 9))
+        btn_wire.setFixedHeight(28)
+        btn_wire.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_wire.clicked.connect(self._set_wire_mode)
+        tb.addWidget(btn_wire)
+
+        tb.addSeparator()
+
+        # ── Simulación ─────────────────────────────────────────────────────
+        self.sim_mode_combo = QComboBox()
+        self.sim_mode_combo.addItems(['DC', 'AC'])
+        self.sim_mode_combo.setFont(QFont('Consolas', 10))
+        self.sim_mode_combo.setFixedWidth(60)
+        self.sim_mode_combo.setFixedHeight(28)
+        self.sim_mode_combo.currentTextChanged.connect(self._on_sim_mode_changed)
+        tb.addWidget(self.sim_mode_combo)
+
+        self.run_btn = QPushButton("▶  SIMULAR DC")
+        self.run_btn.setFont(QFont('Consolas', 10, QFont.Weight.Bold))
+        self.run_btn.setFixedHeight(28)
+        self.run_btn.clicked.connect(self._run_simulation)
+        tb.addWidget(self.run_btn)
+
     # ── Estilo ───────────────────────────────────
     def _apply_style(self):
         self.setStyleSheet(f"""
@@ -1086,16 +1341,21 @@ class MainWindow(QMainWindow):
                 padding: 4px;
                 spacing: 6px;
             }}
-            QToolBar QToolButton, QToolBar::separator {{
+            QToolBar#component_toolbar {{
+                background: {COLORS['panel']};
+                border-bottom: 2px solid {COLORS['panel_brd']};
+            }}
+            QToolBar QToolButton {{
                 color: {COLORS['text']};
-                padding: 4px 8px;
+                padding: 4px 10px;
+                font-family: 'Consolas';
             }}
             QPushButton {{
                 background: {COLORS['comp_body']};
                 color: {COLORS['text']};
                 border: 1px solid {COLORS['panel_brd']};
                 border-radius: 4px;
-                padding: 5px 8px;
+                padding: 5px 12px;
                 text-align: left;
             }}
             QPushButton:hover  {{ background: {COLORS['toolbar']}; }}
@@ -1124,38 +1384,40 @@ class MainWindow(QMainWindow):
             QScrollBar::handle {{ background: {COLORS['panel_brd']}; border-radius: 4px; }}
             QStatusBar {{ background: {COLORS['toolbar']}; color: {COLORS['text_dim']}; }}
             QSplitter::handle {{ background: {COLORS['panel_brd']}; width: 1px; }}
+            QGroupBox {{
+                font-family: 'Consolas', monospace;
+                margin-top: 6px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 6px;
+                padding: 0 4px;
+            }}
         """)
 
     # ── Modos ────────────────────────────────────
+    def _show_picker(self, category_name: str, items: List[tuple]):
+        """Abre el diálogo de selección y, si se acepta, activa el modo colocación."""
+        dialog = ComponentPickerDialog(category_name, items, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            ctype = dialog.get_selected_type()
+            if ctype:
+                self._set_place_mode(ctype)
+
     def _set_place_mode(self, comp_type: str):
-        self._deselect_all_mode_buttons()
-        btn = getattr(self, f'btn_{comp_type}', None)
-        if btn:
-            btn.setChecked(True)
         self.scene.set_mode(f'place_{comp_type}')
         self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.statusBar().showMessage(f"Click en el canvas para colocar: {comp_type}")
 
     def _set_wire_mode(self):
-        self._deselect_all_mode_buttons()
-        self.btn_wire.setChecked(True)
         self.scene.set_mode('wire')
         self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.statusBar().showMessage("Wire: click para iniciar, click para terminar, ESC para cancelar")
 
     def _set_select_mode(self):
-        self._deselect_all_mode_buttons()
         self.scene.set_mode('select')
         self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.statusBar().showMessage("Modo selección")
-
-    def _deselect_all_mode_buttons(self):
-        for t in ['R', 'C', 'L', 'V', 'VAC', 'I', 'GND', 'NODE',
-                  'D', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP']:
-            btn = getattr(self, f'btn_{t}', None)
-            if btn:
-                btn.setChecked(False)
-        self.btn_wire.setChecked(False)
 
     def _on_sim_mode_changed(self, mode: str):
         self.run_btn.setText(f"▶  SIMULAR {mode}")
@@ -1224,6 +1486,15 @@ class MainWindow(QMainWindow):
                     # n1=Salida, n2=Entrada−, n3=Entrada+
                     A = item.value if item.value > 0 else 1e5
                     components.append(OpAmp(item.name, n1, n3 or f'vp_{item.name}', n2, A=A))
+                elif item.comp_type == 'Z':
+                    if item.z_mode == 'rect':
+                        Z_val = complex(item.z_real, item.z_imag)
+                    else:
+                        mag = item.z_mag
+                        ph_rad = math.radians(item.z_phase)
+                        Z_val = complex(mag * math.cos(ph_rad), mag * math.sin(ph_rad))
+                    if abs(Z_val.real) > 1e-12 or abs(Z_val.imag) > 1e-12:
+                        components.append(Impedance(item.name, n1, n2, Z_val))
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
@@ -1329,7 +1600,7 @@ class MainWindow(QMainWindow):
         if not vac_items:
             self.results_text.setPlainText(
                 "⚠  No hay fuentes VAC en el circuito.\n"
-                "Agrega una fuente VAC (paleta izquierda) para el análisis AC.")
+                "Agrega una fuente VAC (barra de componentes → Fuentes) para el análisis AC.")
             return
 
         # Usar la frecuencia de la primera VAC como referencia
@@ -1373,6 +1644,15 @@ class MainWindow(QMainWindow):
                 elif item.comp_type == 'L':
                     if item.value > 0:
                         components.append(Inductor(item.name, n1, n2, item.value))
+                elif item.comp_type == 'Z':
+                    if item.z_mode == 'rect':
+                        Z_val = complex(item.z_real, item.z_imag)
+                    else:
+                        mag = item.z_mag
+                        ph_rad = math.radians(item.z_phase)
+                        Z_val = complex(mag * math.cos(ph_rad), mag * math.sin(ph_rad))
+                    if abs(Z_val) > 1e-12:
+                        components.append(Impedance(item.name, n1, n2, Z_val))
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
@@ -1476,6 +1756,12 @@ class MainWindow(QMainWindow):
         ]
         if lbl3 is not None:
             rows.append((lbl3, n3_display))
+        if item.comp_type == 'Z':
+            rows.append(("Modo Z", item.z_mode))
+            if item.z_mode == 'rect':
+                rows.append(("Z", f"{item.z_real:.4g} {item.z_imag:+.4g}j Ω"))
+            else:
+                rows.append(("Z", f"{item.z_mag:.4g} ∠{item.z_phase:.2f}° Ω"))
 
         for label, val in rows:
             r = self.prop_table.rowCount()
@@ -1519,10 +1805,14 @@ class MainWindow(QMainWindow):
         self.scene.wires.clear()
         self.scene._comp_counter.clear()
         self.results_text.clear()
+        # Limpiar también el archivo actual para no sobreescribir accidentalmente
+        self._current_file = None
+        self.setWindowTitle("CircuitSim — Simulador de Circuitos")
 
     # ── Guardar (.csin) ──────────────────────────
     def _save_circuit(self):
         path = self._current_file
+        # Si ya hay un archivo guardado, sobreescribir directamente sin diálogo
         if not path:
             path, _ = QFileDialog.getSaveFileName(
                 self, "Guardar circuito", "",
@@ -1540,17 +1830,29 @@ class MainWindow(QMainWindow):
         }
 
         for item in self.scene.components:
-            data['components'].append({
+            entry = {
                 'type':  item.comp_type,
                 'name':  item.name,
                 'value': item.value,
                 'unit':  item.unit,
                 'node1': item.node1,
                 'node2': item.node2,
+                'node3': item.node3,
                 'x':     item.pos().x(),
                 'y':     item.pos().y(),
                 'angle': item._angle,
-            })
+            }
+            if item.comp_type == 'VAC':
+                entry['frequency'] = item.frequency
+                entry['phase_deg'] = item.phase_deg
+                entry['ac_mode']   = item.ac_mode
+            if item.comp_type == 'Z':
+                entry['z_real']  = item.z_real
+                entry['z_imag']  = item.z_imag
+                entry['z_mag']   = item.z_mag
+                entry['z_phase'] = item.z_phase
+                entry['z_mode']  = item.z_mode
+            data['components'].append(entry)
 
         for wire in self.scene.wires:
             line = wire.line()
@@ -1565,6 +1867,21 @@ class MainWindow(QMainWindow):
         self._current_file = path
         self.setWindowTitle(f"CircuitSim — {os.path.basename(path)}")
         self.statusBar().showMessage(f"Guardado: {path}")
+
+    # ── Guardar como (.csin) ─────────────────────
+    def _save_circuit_as(self):
+        """Siempre abre el diálogo, permite elegir nuevo nombre/ubicación."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Guardar circuito como", "",
+            "CircuitSim (*.csin);;Todos los archivos (*)"
+        )
+        if not path:
+            return
+        if not path.endswith('.csin'):
+            path += '.csin'
+        # Reusar la lógica de guardado apuntando al nuevo path
+        self._current_file = path
+        self._save_circuit()
 
     # ── Abrir (.csin) ────────────────────────────
     def _open_circuit(self):
@@ -1590,12 +1907,25 @@ class MainWindow(QMainWindow):
                 name=c['name'], value=c['value'],
                 unit=c.get('unit', ''),
                 node1=c.get('node1', ''),
-                node2=c.get('node2', '')
+                node2=c.get('node2', ''),
+                node3=c.get('node3', '')
             )
             angle = c.get('angle', 0)
             if angle:
                 item._angle = angle
                 item.setRotation(angle)
+            # Restaurar atributos de fuente AC
+            if c['type'] == 'VAC':
+                item.frequency = c.get('frequency', 60.0)
+                item.phase_deg = c.get('phase_deg', 0.0)
+                item.ac_mode   = c.get('ac_mode', 'rms')
+            # Restaurar atributos de impedancia
+            if c['type'] == 'Z':
+                item.z_real  = c.get('z_real',  100.0)
+                item.z_imag  = c.get('z_imag',  0.0)
+                item.z_mag   = c.get('z_mag',   100.0)
+                item.z_phase = c.get('z_phase', 0.0)
+                item.z_mode  = c.get('z_mode',  'rect')
 
         for w in data.get('wires', []):
             wire = WireItem(QPointF(w['x1'], w['y1']), QPointF(w['x2'], w['y2']))
@@ -1622,7 +1952,7 @@ class MainWindow(QMainWindow):
         lines.append(f"* Archivo: {os.path.basename(path)}")
         lines.append("")
 
-        type_map = {'R': 'R', 'C': 'C', 'L': 'L', 'V': 'V', 'I': 'I'}
+        type_map = {'R': 'R', 'C': 'C', 'L': 'L', 'V': 'V', 'I': 'I', 'Z': 'Z'}
 
         for item in self.scene.components:
             if item.comp_type not in type_map:
@@ -1647,6 +1977,22 @@ class MainWindow(QMainWindow):
             else:
                 val_str = f"{val:.6g}"
 
+            # Para impedancias, exportar como R + jX
+            if item.comp_type == 'Z':
+                if item.z_mode == 'rect':
+                    val_str = f"{item.z_real:.6g}"
+                    if abs(item.z_imag) > 1e-12:
+                        sign = '+' if item.z_imag >= 0 else ''
+                        val_str += f"{sign}{item.z_imag:.6g}j"
+                else:
+                    ph_rad = math.radians(item.z_phase)
+                    zr = item.z_mag * math.cos(ph_rad)
+                    zx = item.z_mag * math.sin(ph_rad)
+                    val_str = f"{zr:.6g}"
+                    if abs(zx) > 1e-12:
+                        sign = '+' if zx >= 0 else ''
+                        val_str += f"{sign}{zx:.6g}j"
+
             lines.append(f"{item.name} {n1} {n2} {val_str}")
 
         lines.append("")
@@ -1669,21 +2015,6 @@ class MainWindow(QMainWindow):
     def _wheel_zoom(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.view.scale(factor, factor)
-
-
-# ══════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("CircuitSim")
-    app.setStyle("Fusion")
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
-
-if __name__ == '__main__':
-    main()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1745,9 +2076,15 @@ class PowerTriangleDialog(QDialog):
 
         main.addWidget(splitter)
 
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("🔍 Restablecer vista")
+        reset_btn.clicked.connect(self.canvas.reset_view)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
         close_btn = QPushButton("Cerrar")
         close_btn.clicked.connect(self.accept)
-        main.addWidget(close_btn)
+        btn_row.addWidget(close_btn)
+        main.addLayout(btn_row)
 
     def _on_correct(self):
         from engine import MNASolver
@@ -1790,15 +2127,61 @@ class PowerTriangleDialog(QDialog):
 
 
 class _PowerTriangleCanvas(QWidget):
-    """Widget que dibuja el triángulo de potencia S, P, Q, ángulo φ."""
+    """Widget que dibuja el triángulo de potencia S, P, Q, ángulo φ.
+    Soporta zoom con rueda del ratón y pan con click+arrastre."""
 
     def __init__(self, total: dict, parent=None):
         super().__init__(parent)
-        self.total      = total
+        self.total       = total
         self._correction = None
+        self._zoom       = 1.0
+        self._pan_x      = 0.0
+        self._pan_y      = 0.0
+        self._dragging   = False
+        self._last_pos   = None
 
     def set_correction(self, corr: dict):
         self._correction = corr
+        self.update()
+
+    def wheelEvent(self, event):
+        """Zoom con rueda del ratón centrado en el cursor."""
+        delta = event.angleDelta().y()
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        old_zoom = self._zoom
+        self._zoom *= factor
+        self._zoom = max(0.2, min(self._zoom, 10.0))
+        # Zoom centrado en el cursor
+        mx = event.position().x()
+        my = event.position().y()
+        self._pan_x = mx - (mx - self._pan_x) * (self._zoom / old_zoom)
+        self._pan_y = my - (my - self._pan_y) * (self._zoom / old_zoom)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._last_pos = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._last_pos is not None:
+            dx = event.pos().x() - self._last_pos.x()
+            dy = event.pos().y() - self._last_pos.y()
+            self._pan_x += dx
+            self._pan_y += dy
+            self._last_pos = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self._last_pos = None
+
+    def reset_view(self):
+        self._zoom  = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self.update()
 
     def paintEvent(self, event):
         from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QPolygonF
@@ -1816,18 +2199,25 @@ class _PowerTriangleCanvas(QWidget):
         W = self.width()
         H = self.height()
 
-        # Escala: S ocupa 60% del ancho
+        # Escala: S ocupa ~55% del ancho disponible
         if S < 1e-12:
             painter.setPen(QPen(QColor('#aaaaaa'), 1))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                              "Sin datos de potencia")
             return
 
-        scale = (W * 0.58) / S
+        base_scale = (W * 0.55) / S
+        scale = base_scale * self._zoom
 
-        # Origen en centro-izquierda
-        ox = int(W * 0.12)
-        oy = int(H * 0.65)
+        # Origen centrado en el widget, ajustado por pan
+        ox = int(W * 0.15) + int(self._pan_x)
+        oy = int(H * 0.55) + int(self._pan_y)
+        # Si Q es negativo (capacitivo), el triángulo apunta hacia abajo;
+        # desplazamos el origen hacia arriba para dejar espacio
+        if Q < 0:
+            oy = int(H * 0.35) + int(self._pan_y)
+        else:
+            oy = int(H * 0.65) + int(self._pan_y)
 
         Px = int(P * scale)
         Qy = int(-Q * scale)   # Q positivo → hacia arriba en pantalla
@@ -1881,7 +2271,7 @@ class _PowerTriangleCanvas(QWidget):
 
         # S (hipotenusa desde origen)
         arrow(painter, pen_S, ox, oy, ox + Px, oy + Qy,
-              f"S = {S:.2f} VA", 'mid')
+              f"S = {S:.4f} VA", 'mid')
 
         # Ángulo φ
         phi = math.acos(min(abs(fp), 1.0)) * 180 / math.pi
@@ -1907,6 +2297,18 @@ class _PowerTriangleCanvas(QWidget):
             painter.drawText(ox + Px + 8, (oy + Qy + oy + Qy_new)//2,
                              f"ΔQ={abs(Q-Q_new):.2f} VAR")
 
+
+# ══════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("CircuitSim")
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
 if __name__ == '__main__':
     main()
-

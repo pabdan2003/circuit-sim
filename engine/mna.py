@@ -14,7 +14,7 @@ Referencia: Vlach & Singhal, "Computer Methods for Circuit Analysis and Design"
 
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from .components import Component, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor, Diode, BJT, MOSFET, OpAmp
+from .components import Component, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor, Diode, BJT, MOSFET, OpAmp, Impedance
 from .components import Resistor as Resistor_cls
 
 
@@ -302,6 +302,8 @@ class MNASolver:
                 elif isinstance(c, Inductor):
                     Y = 1.0 / (1j * omega * c.L) if omega != 0 else 0.0
                     Icomp = Vcomp * Y
+                elif isinstance(c, Impedance):
+                    Icomp = Vcomp / c.Z if abs(c.Z) > 1e-12 else 0.0
                 else:
                     continue
 
