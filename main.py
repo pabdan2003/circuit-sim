@@ -75,7 +75,7 @@ class ComponentItem(QGraphicsItem):
     """
 
     COMP_TYPES = ['R', 'V', 'VAC', 'I', 'C', 'L', 'Z', 'GND', 'NODE',
-                  'D', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP']
+                  'D', 'LED', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP']
 
     def __init__(self, comp_type: str, name: str, value: float = 0.0,
                  unit: str = '', node1: str = '', node2: str = '', node3: str = ''):
@@ -93,6 +93,9 @@ class ComponentItem(QGraphicsItem):
         self.ac_mode:   str   = 'rms'   # 'rms' o 'peak'
         self.result_voltage: Optional[float] = None
         self._angle = 0  # rotación en grados (0, 90, 180, 270)
+        # Estado LED
+        self.led_color: str  = 'red'   # color del LED
+        self.led_on:    bool = False    # encendido si conduce suficiente corriente
         # Atributos para impedancia genérica
         self.z_mode:   str   = 'rect'   # 'rect' o 'phasor'
         self.z_real:   float = 100.0    # Ω (parte real)
@@ -103,7 +106,7 @@ class ComponentItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
-        self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
 
     def rotate_90(self):
         """Rota el componente 90° en sentido horario."""
@@ -182,6 +185,8 @@ class ComponentItem(QGraphicsItem):
             self._draw_source(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'D':
             self._draw_diode(painter, pen_body, pen_wire)
+        elif self.comp_type == 'LED':
+            self._draw_led(painter, pen_body, pen_wire)
         elif self.comp_type in ('BJT_NPN', 'BJT_PNP'):
             self._draw_bjt(painter, pen_body, pen_wire)
         elif self.comp_type in ('NMOS', 'PMOS'):
@@ -311,6 +316,116 @@ class ComponentItem(QGraphicsItem):
         painter.drawPolygon(QPolygonF(triangle))
         # Línea del cátodo
         painter.drawLine(QPointF(hw - 8, -12), QPointF(hw - 8, 12))
+
+    def _draw_led(self, painter, pen_body, pen_wire):
+        """Dibuja LED: apagado=gris oscuro con tinte, encendido=color sólido brillante + glow + rayos."""
+        from PyQt6.QtGui import QPolygonF, QRadialGradient
+        hw = COMP_W // 2
+
+        selected       = self.isSelected()
+        led_on         = getattr(self, 'led_on', False)
+        led_color_name = getattr(self, 'led_color', 'red')
+
+        # Color sólido encendido / color apagado (gris con tinte)
+        color_on = {
+            'red':    QColor(255,  60,  60),
+            'green':  QColor( 80, 255,  80),
+            'blue':   QColor( 80, 160, 255),
+            'yellow': QColor(255, 240,  60),
+            'white':  QColor(255, 255, 255),
+            'orange': QColor(255, 170,  30),
+        }
+        color_off = {
+            'red':    QColor( 80,  30,  30),
+            'green':  QColor( 25,  70,  25),
+            'blue':   QColor( 25,  35,  90),
+            'yellow': QColor( 80,  75,  20),
+            'white':  QColor( 70,  70,  80),
+            'orange': QColor( 80,  50,  20),
+        }
+        on_col  = color_on.get(led_color_name, QColor(255, 40, 40))
+        off_col = color_off.get(led_color_name, QColor(60, 30, 30))
+        body_col = on_col if led_on else off_col
+
+        # ── Cables ───────────────────────────────────────────────────────
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-hw + 8, 0))
+        painter.drawLine(QPointF(hw - 8,   0), QPointF(hw + 10, 0))
+
+        # ── Glow halo cuando encendido ───────────────────────────────────
+        if led_on:
+            painter.setPen(Qt.PenStyle.NoPen)
+            for radius, alpha in [(30, 30), (24, 55), (18, 90), (13, 130)]:
+                gc = QColor(on_col)
+                gc.setAlpha(alpha)
+                painter.setBrush(QBrush(gc))
+                painter.drawEllipse(QPointF(0, 0), radius, radius)
+
+        # ── Cuerpo (triángulo relleno) ───────────────────────────────────
+        # Borde: naranja si seleccionado, claro si encendido, normal si apagado
+        if selected:
+            outline_col = QColor(COLORS['comp_sel'])
+        elif led_on:
+            outline_col = on_col.lighter(160)
+        else:
+            outline_col = off_col.lighter(170)
+        outline_pen = QPen(outline_col, 2)
+        painter.setPen(outline_pen)
+
+        triangle = [QPointF(-hw + 8, -12), QPointF(-hw + 8, 12), QPointF(hw - 8, 0)]
+        if led_on:
+            # Relleno con gradiente radial centrado en la punta (ánodo) para efecto brillante
+            grad = QRadialGradient(QPointF(0, 0), hw)
+            bright = QColor(on_col)
+            bright.setAlpha(255)
+            center_col = bright.lighter(180)   # núcleo casi blanco
+            center_col.setAlpha(255)
+            grad.setColorAt(0.0, center_col)
+            grad.setColorAt(0.6, bright)
+            edge_col = QColor(on_col)
+            edge_col.setAlpha(200)
+            grad.setColorAt(1.0, edge_col)
+            painter.setBrush(QBrush(grad))
+        else:
+            painter.setBrush(QBrush(body_col))
+        painter.drawPolygon(QPolygonF(triangle))
+
+        # Línea del cátodo
+        cathode_col = outline_col.lighter(120) if led_on else outline_col
+        painter.setPen(QPen(cathode_col, 2))
+        painter.drawLine(QPointF(hw - 8, -12), QPointF(hw - 8, 12))
+
+        # ── Flechas de emisión de luz (siempre visibles) ──────────────────
+        tip_x = hw - 8
+        if led_on:
+            arrow_col = on_col.lighter(150)
+            arrow_alpha = 255
+            arrow_width = 2.0
+        elif selected:
+            arrow_col = QColor(COLORS['comp_sel'])
+            arrow_alpha = 200
+            arrow_width = 1.5
+        else:
+            # Apagado: flechas tenues para indicar que ES un LED
+            arrow_col = off_col.lighter(200)
+            arrow_alpha = 120
+            arrow_width = 1.2
+        arrow_col.setAlpha(arrow_alpha)
+        ray_pen = QPen(arrow_col, arrow_width, Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap)
+        painter.setPen(ray_pen)
+
+        # Rayo 1 — diagonal hacia arriba-derecha
+        painter.drawLine(QPointF(tip_x + 2,  -8), QPointF(tip_x + 14, -20))
+        # Punta de flecha rayo 1
+        painter.drawLine(QPointF(tip_x + 14, -20), QPointF(tip_x + 9, -18))
+        painter.drawLine(QPointF(tip_x + 14, -20), QPointF(tip_x + 12, -14))
+
+        # Rayo 2 — más vertical
+        painter.drawLine(QPointF(tip_x + 6,  -6), QPointF(tip_x + 10, -20))
+        # Punta de flecha rayo 2
+        painter.drawLine(QPointF(tip_x + 10, -20), QPointF(tip_x + 6,  -17))
+        painter.drawLine(QPointF(tip_x + 10, -20), QPointF(tip_x + 13, -16))
 
     def _draw_bjt(self, painter, pen_body, pen_wire):
         hw = COMP_W // 2
@@ -756,13 +871,13 @@ class CircuitScene(QGraphicsScene):
             name = f"{prefixes.get(comp_type, comp_type)}{count}"
 
         units = {'R': 'Ω', 'V': 'V', 'VAC': 'V', 'I': 'A', 'C': 'F', 'L': 'H',
-                 'D': 'A', 'BJT_NPN': 'hFE', 'BJT_PNP': 'hFE',
+                 'D': 'A', 'LED': 'A', 'BJT_NPN': 'hFE', 'BJT_PNP': 'hFE',
                  'NMOS': 'A/V²', 'PMOS': 'A/V²', 'OPAMP': 'V/V'}
         if not unit:
             unit = units.get(comp_type, '')
 
         defaults = {'R': 1000.0, 'V': 5.0, 'VAC': 120.0, 'I': 0.001, 'C': 1e-6, 'L': 1e-3,
-                    'D': 1e-14, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
+                    'D': 1e-14, 'LED': 1e-14, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
                     'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5}
         if value == 0.0:
             value = defaults.get(comp_type, 1.0)
@@ -954,6 +1069,8 @@ class CircuitScene(QGraphicsScene):
                 item.z_imag   = data.get('z_imag', 0.0)
                 item.z_mag    = data.get('z_mag', 100.0)
                 item.z_phase  = data.get('z_phase', 0.0)
+            if item.comp_type == 'LED':
+                item.led_color = data.get('led_color', 'red')
             item.update()
 
 
@@ -993,6 +1110,7 @@ class ComponentDialog(QDialog):
             'R': 'Resistencia (Ω)', 'V': 'Voltaje (V)', 'I': 'Corriente (A)',
             'C': 'Capacitancia (F)', 'L': 'Inductancia (H)',
             'D': 'Is — Corriente saturación (A)',
+            'LED': 'Is — Corriente saturación (A)',
             'BJT_NPN': 'hFE — Ganancia β',
             'BJT_PNP': 'hFE — Ganancia β',
             'NMOS': 'Kn — Transconductancia (A/V²)',
@@ -1013,6 +1131,7 @@ class ComponentDialog(QDialog):
             'V':       ('Nodo + (ánodo)',  'Nodo − (cátodo)', None),
             'I':       ('Nodo + (salida)', 'Nodo − (entrada)', None),
             'D':       ('Ánodo (A)', 'Cátodo (K)', None),
+            'LED':     ('Ánodo (A)', 'Cátodo (K)', None),
             'BJT_NPN': ('Colector (C)', 'Emisor (E)', 'Base (B)'),
             'BJT_PNP': ('Colector (C)', 'Emisor (E)', 'Base (B)'),
             'NMOS':    ('Drain (D)',    'Source (S)', 'Gate (G)'),
@@ -1030,6 +1149,15 @@ class ComponentDialog(QDialog):
         if lbl3 is not None:
             self.node3_edit = QLineEdit(self.item.node3)
             layout.addRow(lbl3 + ':', self.node3_edit)
+
+        # Selector de color para LED
+        self._led_color_combo = None
+        if self.item.comp_type == 'LED':
+            from PyQt6.QtWidgets import QComboBox
+            self._led_color_combo = QComboBox()
+            self._led_color_combo.addItems(['red', 'green', 'blue', 'yellow', 'white', 'orange'])
+            self._led_color_combo.setCurrentText(getattr(self.item, 'led_color', 'red'))
+            layout.addRow('Color del LED:', self._led_color_combo)
 
         # Campos extra para fuente AC
         self._freq_spin  = None
@@ -1124,6 +1252,7 @@ class ComponentDialog(QDialog):
             'frequency': self._freq_spin.value()  if self._freq_spin  else 60.0,
             'phase_deg': self._phase_spin.value() if self._phase_spin else 0.0,
             'ac_mode':   self._mode_combo.currentText() if self._mode_combo else 'rms',
+            'led_color': self._led_color_combo.currentText() if self._led_color_combo else 'red',
         }
         if self.item.comp_type == 'Z' and self._z_mode_combo is not None:
             data['z_mode']  = 'rect' if self._z_mode_combo.currentIndex() == 0 else 'phasor'
@@ -1143,6 +1272,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CircuitSim — Simulador de Circuitos")
         self.resize(1280, 800)
         self.solver = MNASolver()
+        self._sim_running = False
+        # Timer para simulación continua (actualiza LEDs y canvas en vivo)
+        from PyQt6.QtCore import QTimer
+        self._sim_timer = QTimer(self)
+        self._sim_timer.setInterval(200)   # ms entre actualizaciones
+        self._sim_timer.timeout.connect(self._tick_simulation)
         self._build_ui()
         self._apply_style()
         self._load_demo_circuit()
@@ -1273,6 +1408,7 @@ class MainWindow(QMainWindow):
             ]),
             ("Semiconductores", [
                 ('D',       'Diodo',       '━|▷|━'),
+                ('LED',     'LED',         '━|▷|★'),
                 ('BJT_NPN', 'BJT NPN',     '━(NPN)'),
                 ('BJT_PNP', 'BJT PNP',     '━(PNP)'),
                 ('NMOS',    'MOSFET N',    '━[N]━'),
@@ -1324,7 +1460,8 @@ class MainWindow(QMainWindow):
         self.run_btn = QPushButton("▶  SIMULAR DC")
         self.run_btn.setFont(QFont('Consolas', 10, QFont.Weight.Bold))
         self.run_btn.setFixedHeight(28)
-        self.run_btn.clicked.connect(self._run_simulation)
+        self.run_btn.setCheckable(True)
+        self.run_btn.clicked.connect(self._toggle_simulation)
         tb.addWidget(self.run_btn)
 
     # ── Estilo ───────────────────────────────────
@@ -1423,17 +1560,43 @@ class MainWindow(QMainWindow):
         self.run_btn.setText(f"▶  SIMULAR {mode}")
 
     # ── Simulación ───────────────────────────────
-    def _run_simulation(self):
-        """
-        Despachador: corre análisis DC o AC según el selector de modo.
-        """
+    def _toggle_simulation(self, checked: bool):
+        """Inicia o detiene la simulación continua."""
         mode = self.sim_mode_combo.currentText()
         if mode == 'AC':
+            # AC es un disparo único, no necesita loop
+            self.run_btn.setChecked(False)
             self._run_simulation_ac()
+            return
+        if checked:
+            self._sim_running = True
+            self.run_btn.setText("■  DETENER")
+            self._sim_timer.start()
+            self._run_simulation_dc()          # primer disparo inmediato
         else:
-            self._run_simulation_dc()
+            self._stop_simulation()
 
-    def _run_simulation_dc(self):
+    def _stop_simulation(self):
+        """Detiene la simulación y apaga todos los LEDs."""
+        self._sim_running = False
+        self._sim_timer.stop()
+        self.run_btn.setChecked(False)
+        self.run_btn.setText("▶  SIMULAR DC")
+        for item in self.scene.components:
+            if item.comp_type == 'LED':
+                item.led_on = False
+                item.update()
+
+    def _tick_simulation(self):
+        """Llamado por QTimer: re-corre DC silenciosamente para actualizar LEDs."""
+        if self._sim_running:
+            self._run_simulation_dc(silent=True)
+
+    def _run_simulation(self):
+        """Compatibilidad: despacha al toggle."""
+        self._toggle_simulation(True)
+
+    def _run_simulation_dc(self, silent: bool = False):
         components = []
         errors = []
 
@@ -1467,7 +1630,7 @@ class MainWindow(QMainWindow):
                     components.append(Capacitor(item.name, n1, n2, item.value))
                 elif item.comp_type == 'L':
                     components.append(Inductor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'D':
+                elif item.comp_type in ('D', 'LED'):
                     Is = item.value if item.value > 0 else 1e-14
                     components.append(Diode(item.name, n1, n2, Is=Is))
                 elif item.comp_type in ('BJT_NPN', 'BJT_PNP'):
@@ -1503,18 +1666,19 @@ class MainWindow(QMainWindow):
             return
 
         # Mostrar netlist extraida antes de simular
-        out_pre = ["═══ NETLIST EXTRAIDA ═══"]
-        for item in self.scene.components:
-            if item.comp_type in ('GND', 'NODE'):
-                continue
-            auto_n1 = pin_node.get(f"{item.name}__p1", '?')
-            auto_n2 = pin_node.get(f"{item.name}__p2", '?')
-            n1_show = item.node1.strip() if item.node1.strip() else auto_n1
-            n2_show = item.node2.strip() if item.node2.strip() else auto_n2
-            out_pre.append(f"  {item.name}: {n1_show} → {n2_show}  ({item._format_value()})")
-        out_pre.append("")
-        self.results_text.setPlainText('\n'.join(out_pre) + "Simulando...")
-        QApplication.processEvents()
+        if not silent:
+            out_pre = ["═══ NETLIST EXTRAIDA ═══"]
+            for item in self.scene.components:
+                if item.comp_type in ('GND', 'NODE'):
+                    continue
+                auto_n1 = pin_node.get(f"{item.name}__p1", '?')
+                auto_n2 = pin_node.get(f"{item.name}__p2", '?')
+                n1_show = item.node1.strip() if item.node1.strip() else auto_n1
+                n2_show = item.node2.strip() if item.node2.strip() else auto_n2
+                out_pre.append(f"  {item.name}: {n1_show} → {n2_show}  ({item._format_value()})")
+            out_pre.append("")
+            self.results_text.setPlainText('\n'.join(out_pre) + "Simulando...")
+            QApplication.processEvents()
 
         result = self.solver.solve_dc(components)
 
@@ -1566,28 +1730,68 @@ class MainWindow(QMainWindow):
                     p = comp.I_val * (v1 - v2)
                     out.append(f"  I({comp.name}) = {comp.I_val*1000:+.4f} mA  |  P = {abs(p):.4f} W")
 
-            # Actualizar canvas con voltajes (usando nodos automaticos)
+            # Actualizar canvas con voltajes y estado LED
             for item in self.scene.components:
                 auto_n1 = pin_node.get(f"{item.name}__p1", '')
+                auto_n2 = pin_node.get(f"{item.name}__p2", '0')
                 n1 = item.node1.strip() if item.node1.strip() else auto_n1
+                n2 = item.node2.strip() if item.node2.strip() else auto_n2
                 if n1 in result['voltages']:
                     item.result_voltage = result['voltages'][n1]
                 else:
                     item.result_voltage = None
+                # Encender/apagar LED según corriente que atraviesa el diodo
+                if item.comp_type == 'LED':
+                    led_on = False
+                    # Método 1: usar operating_points del solver (más confiable)
+                    op = result.get('operating_points', {}).get(item.name, {})
+                    if op:
+                        vd = op.get('Vd', op.get('vd', op.get('V', None)))
+                        id_ = op.get('Id', op.get('id', op.get('I', None)))
+                        if vd is not None:
+                            led_on = float(vd) > 0.3
+                        elif id_ is not None:
+                            led_on = float(id_) > 1e-6
+                    # Método 2: diferencia de voltaje entre nodos
+                    if not led_on:
+                        v_a = result['voltages'].get(n1, None)
+                        v_k = result['voltages'].get(n2, None)
+                        if v_a is not None and v_k is not None:
+                            led_on = (v_a - v_k) > 0.3
+                    item.led_on = led_on
                 item.update()
+                if hasattr(item, 'scene') and item.scene():
+                    item.scene().update(item.mapToScene(item.boundingRect()).boundingRect())
+
+            # Debug LED — mostrar info de nodos y voltajes del LED
+            led_items = [it for it in self.scene.components if it.comp_type == 'LED']
+            if led_items:
+                out.append("\n── Debug LED ──")
+                for it in led_items:
+                    auto_n1 = pin_node.get(f"{it.name}__p1", '?')
+                    auto_n2 = pin_node.get(f"{it.name}__p2", '?')
+                    n1d = it.node1.strip() if it.node1.strip() else auto_n1
+                    n2d = it.node2.strip() if it.node2.strip() else auto_n2
+                    va  = result['voltages'].get(n1d, 'N/A')
+                    vk  = result['voltages'].get(n2d, 'N/A')
+                    op  = result.get('operating_points', {}).get(it.name, {})
+                    out.append(f"  {it.name}: ánodo={n1d}({va}) cátodo={n2d}({vk})")
+                    out.append(f"    op={op}  led_on={it.led_on}")
 
         else:
-            out.append(f"✗ Error de simulación:\n{result['error']}")
-            out.append("\nVerifica que el circuito tenga:")
-            out.append("  • Al menos una fuente de voltaje")
-            out.append("  • Nodo de tierra (nodo '0')")
-            out.append("  • Nodos asignados a cada componente")
+            if not silent:
+                out.append(f"\u2717 Error de simulaci\u00f3n:\n{result['error']}")
+                out.append("\nVerifica que el circuito tenga:")
+                out.append("  \u2022 Al menos una fuente de voltaje")
+                out.append("  \u2022 Nodo de tierra (nodo '0')")
+                out.append("  \u2022 Nodos asignados a cada componente")
 
-        if errors:
+        if errors and not silent:
             out.append("\n── Advertencias ──")
             out.extend([f"  ⚠ {e}" for e in errors])
 
-        self.results_text.setPlainText('\n'.join(out))
+        if not silent:
+            self.results_text.setPlainText('\n'.join(out))
         self.scene.update()
 
     # ── Panel de propiedades ─────────────────────
@@ -1729,6 +1933,7 @@ class MainWindow(QMainWindow):
             'V':       ('Nodo + (ánodo)',    'Nodo − (cátodo)',    None),
             'I':       ('Nodo + (salida)',   'Nodo − (entrada)',   None),
             'D':       ('Ánodo (A)',         'Cátodo (K)',         None),
+            'LED':     ('Ánodo (A)',         'Cátodo (K)',         None),
             'BJT_NPN': ('Colector (C)',      'Emisor (E)',         'Base (B)'),
             'BJT_PNP': ('Colector (C)',      'Emisor (E)',         'Base (B)'),
             'NMOS':    ('Drain (D)',         'Source (S)',         'Gate (G)'),
@@ -1846,6 +2051,8 @@ class MainWindow(QMainWindow):
                 entry['frequency'] = item.frequency
                 entry['phase_deg'] = item.phase_deg
                 entry['ac_mode']   = item.ac_mode
+            if item.comp_type == 'LED':
+                entry['led_color'] = item.led_color
             if item.comp_type == 'Z':
                 entry['z_real']  = item.z_real
                 entry['z_imag']  = item.z_imag
@@ -1919,6 +2126,8 @@ class MainWindow(QMainWindow):
                 item.frequency = c.get('frequency', 60.0)
                 item.phase_deg = c.get('phase_deg', 0.0)
                 item.ac_mode   = c.get('ac_mode', 'rms')
+            if c['type'] == 'LED':
+                item.led_color = c.get('led_color', 'red')
             # Restaurar atributos de impedancia
             if c['type'] == 'Z':
                 item.z_real  = c.get('z_real',  100.0)
