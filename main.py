@@ -33,6 +33,11 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor
 from engine import Diode, BJT, MOSFET, OpAmp, Impedance, MNASolver
+from circuit_analyzer import (
+    CircuitAnalyzer, ImplicitBridgeDetector,
+    LOGIC_STANDARDS, DEFAULT_STANDARD, AnalysisFlags,
+)
+from themes import ThemeManager, BUILTIN_THEMES, DEFAULT_THEME_ID
 
 
 # ══════════════════════════════════════════════════════════════
@@ -43,26 +48,39 @@ COMP_W      = 60
 COMP_H      = 30
 PIN_RADIUS  = 4
 
-COLORS = {
-    'bg':         '#1a1a2e',
-    'grid':       '#16213e',
-    'grid_line':  '#0f3460',
-    'component':  '#e94560',
-    'comp_body':  '#16213e',
-    'comp_sel':   '#f5a623',
-    'wire':       '#4ecca3',
-    'wire_sel':   '#f5a623',
-    'node_dot':   '#4ecca3',
-    'text':       '#e0e0e0',
-    'text_dim':   '#7f8c8d',
-    'pin':        '#4ecca3',
-    'gnd':        '#a0a0ff',
-    'toolbar':    '#0f3460',
-    'panel':      '#16213e',
-    'panel_brd':  '#0f3460',
-    'voltage':    '#f5a623',
-    'current':    '#4ecca3',
-}
+# Estándar lógico digital usado en TODA la app (no es configurable por UI).
+DEFAULT_LOGIC_STANDARD = 'CMOS_5V'
+
+# Diccionario MUTABLE de colores de la app — se mantiene como un objeto
+# único para que todos los módulos (paint events, stylesheets) lean
+# siempre los valores actuales tras un cambio de tema en vivo.
+COLORS: Dict[str, str] = {}
+
+# Manager global de temas — carga la selección guardada y aplica al iniciar.
+THEME_MANAGER = ThemeManager()
+THEME_MANAGER.refresh()
+
+
+def apply_theme_to_colors(theme_id: str) -> str:
+    """
+    Reemplaza in-place el contenido de COLORS con la paleta del tema.
+    Si el id no existe, cae al tema por defecto.
+
+    Returns:
+        El id del tema realmente aplicado.
+    """
+    meta   = THEME_MANAGER.get_theme_meta(theme_id)
+    if meta is None:
+        theme_id = DEFAULT_THEME_ID
+    palette = THEME_MANAGER.load_theme(theme_id)
+    COLORS.clear()
+    COLORS.update(palette)
+    return theme_id
+
+
+# Carga inicial: lee la selección persistida (o 'dark' por defecto) y
+# rellena COLORS antes de que cualquier widget se construya.
+_INITIAL_THEME_ID = apply_theme_to_colors(THEME_MANAGER.load_selection())
 
 
 # ══════════════════════════════════════════════════════════════
@@ -75,7 +93,21 @@ class ComponentItem(QGraphicsItem):
     """
 
     COMP_TYPES = ['R', 'V', 'VAC', 'I', 'C', 'L', 'Z', 'GND', 'NODE',
-                  'D', 'LED', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP']
+                  'D', 'LED', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP',
+                  # ── Digital ──
+                  'AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
+                  'DFF', 'JKFF', 'TFF', 'SRFF',
+                  'MUX2', 'COUNTER',
+                  'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM']
+
+    # Tipos que pertenecen al dominio digital (no se pasan al MNA)
+    DIGITAL_TYPES = {
+        'AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
+        'DFF', 'JKFF', 'TFF', 'SRFF',
+        'MUX2', 'COUNTER',
+        'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM',
+        'LOGIC_STATE',
+    }
 
     def __init__(self, comp_type: str, name: str, value: float = 0.0,
                  unit: str = '', node1: str = '', node2: str = '', node3: str = ''):
@@ -103,6 +135,23 @@ class ComponentItem(QGraphicsItem):
         self.z_mag:    float = 100.0    # Ω (magnitud fasorial)
         self.z_phase:  float = 0.0      # ° (fase fasorial)
 
+        # ── Atributos para componentes digitales ────────────────────────────
+        # Puerta: número de entradas (AND/OR/etc.)
+        self.dig_inputs:   int   = 2
+        # Flip-flop / contador: bits de salida
+        self.dig_bits:     int   = 1
+        # ADC/DAC: resolución y Vref
+        self.dig_bits_adc: int   = 8
+        self.dig_vref:     float = 3.3
+        # Señal de reloj (nombre de net digital)
+        self.dig_clk:      str   = 'CLK'
+        # Retardo de propagación (ns)
+        self.dig_tpd_ns:   float = 1.0
+        # Nodo analógico que conecta al MNA (ADC/DAC/Comparador)
+        self.dig_analog_node: str = ''
+        # Nodos de entradas extra (entrada 3, 4, ... N) para puertas multi-entrada
+        self.dig_input_nodes: list = []   # ['net_A', 'net_B', ...]
+
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -125,6 +174,13 @@ class ComponentItem(QGraphicsItem):
             return QRectF(-20, -5, 40, 30)
         if self.comp_type == 'NODE':
             return QRectF(-8, -8, 16, 16)
+        # Puertas: bounding rect dinámico según altura real
+        if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
+                               'COMPARATOR', 'PWM', 'MUX2'):
+            gw, gh, step, n = self._gate_geometry()
+            margin = 20
+            return QRectF(-gw - 10 - margin, -gh - margin,
+                          (gw + 10) * 2 + margin * 2, gh * 2 + margin * 2)
         return QRectF(-COMP_W//2 - 10, -COMP_H//2 - 20, COMP_W + 20, COMP_H + 40)
 
     def pin_positions(self) -> Tuple[QPointF, QPointF]:
@@ -134,29 +190,91 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'GND':
             return QPointF(0, -5), QPointF(0, -5)
         if self.comp_type in ('BJT_NPN', 'BJT_PNP'):
-            # p1=Colector (der-arriba), p2=Emisor (der-abajo)
             return QPointF(hw + 10, -hh - 6), QPointF(hw + 10, hh + 6)
         if self.comp_type in ('NMOS', 'PMOS'):
-            # p1=Drain (der-arriba), p2=Source (der-abajo)
             return QPointF(hw + 10, -hh - 6), QPointF(hw + 10, hh + 6)
         if self.comp_type == 'OPAMP':
-            # p1=Salida (der), p2=Entrada− (izq-abajo)
             hh_op = hh + 6
             return QPointF(hw + 10, 0), QPointF(-hw - 10, hh_op // 2)
+        # ── Puertas lógicas: usar _gate_geometry para coincidir exactamente ──
+        if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
+                               'COMPARATOR', 'PWM'):
+            gw, gh, step, n = self._gate_geometry()
+            y0 = self._gate_pin_ys()[0]  # posición exacta del primer pin
+            return QPointF(gw + 10, 0), QPointF(-gw - 10, y0)
+        # ── Flip-flops ───────────────────────────────────────────────────
+        if self.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF'):
+            hw_f = COMP_W // 2
+            hh_f = COMP_H // 2 + 8
+            return QPointF(hw_f + 10, -(hh_f // 2)), QPointF(-hw_f - 10, -(hh_f // 2))
+        # ── Contador: p1=Q0 (der-arriba), p2=CLK (izq-centro) ───────────
+        if self.comp_type == 'COUNTER':
+            hw_f = COMP_W // 2
+            hh_f = COMP_H // 2 + 8
+            return QPointF(hw_f + 10, -(hh_f // 2)), QPointF(-hw_f - 10, 0)
+        # ── MUX2: p1=salida (der), p2=I0 (izq-arriba) ───────────────────
+        if self.comp_type == 'MUX2':
+            gw, gh, step, _ = self._gate_geometry()
+            ys = self._gate_pin_ys()
+            return QPointF(gw + 10, 0), QPointF(-gw - 10, ys[0])
+        if self.comp_type == 'LOGIC_STATE':
+            hw2 = COMP_W // 2
+            return QPointF(hw2 + 10, 0), QPointF(hw2 + 10, 0)  # p1=salida, p2=dummy
         return QPointF(-hw - 10, 0), QPointF(hw + 10, 0)
 
     def pin3_position(self) -> QPointF:
-        """Pin de control: Base (BJT), Gate (MOSFET), Entrada+ (OpAmp)."""
+        """
+        Tercer pin:
+          BJT/MOSFET  → Base/Gate   (izq-centro)
+          OpAmp       → Entrada+    (izq-arriba)
+          Puertas 2+  → segunda entrada (izq, segundo cable)
+          Flip-flops  → CLK         (izq-abajo)
+          MUX2        → I1          (izq-centro)
+        """
         hw = COMP_W // 2
-        hh = COMP_H // 2 + 6
+        hh = COMP_H // 2
         if self.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS'):
             return QPointF(-hw - 10, 0)
         if self.comp_type == 'OPAMP':
-            return QPointF(-hw - 10, -hh // 2)
+            hh_op = hh + 6
+            return QPointF(-hw - 10, -(hh_op // 2))
+        # Puertas con 2+ entradas: segundo cable de entrada
+        if self.comp_type in ('AND', 'OR', 'NAND', 'NOR', 'XOR', 'COMPARATOR'):
+            gw, gh, step, n = self._gate_geometry()
+            ys = self._gate_pin_ys()
+            if n >= 2:
+                return QPointF(-gw - 10, ys[1])  # posición exacta del segundo pin
+            return QPointF(0, 0)
+        # Flip-flops: CLK (izq-abajo)
+        if self.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF'):
+            hw_f = COMP_W // 2
+            hh_f = COMP_H // 2 + 8
+            return QPointF(-hw_f - 10, hh_f // 2)
+        # MUX2: I1 (izq, segundo cable)
+        if self.comp_type == 'MUX2':
+            gw, gh, step, _ = self._gate_geometry()
+            ys = self._gate_pin_ys()
+            return QPointF(-gw - 10, ys[1] if len(ys) > 1 else 0)
         return QPointF(0, 0)
 
     def pin3_position_scene(self) -> QPointF:
         return self.mapToScene(self.pin3_position())
+
+    def all_pin_positions_scene(self) -> list:
+        """Retorna todos los pines activos del componente en coordenadas de escena."""
+        p1, p2 = self.pin_positions_scene()
+        pins = [p1, p2]
+        # Pines adicionales según tipo
+        if self.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP'):
+            pins.append(self.pin3_position_scene())
+        elif self.comp_type in ('AND', 'OR', 'NAND', 'NOR', 'XOR', 'COMPARATOR'):
+            gw, gh, step, n = self._gate_geometry()
+            ys = self._gate_pin_ys()
+            for y in ys[1:]:   # primer pin ya incluido como p2
+                pins.append(self.mapToScene(QPointF(-gw - 10, y)))
+        elif self.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF', 'MUX2'):
+            pins.append(self.pin3_position_scene())
+        return pins
 
     # ── Dibujo ──────────────────────────────────
     def paint(self, painter: QPainter, option, widget):
@@ -195,6 +313,26 @@ class ComponentItem(QGraphicsItem):
             self._draw_opamp(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'Z':
             self._draw_impedance(painter, pen_body, pen_wire, body_color)
+        # ── Digital ──────────────────────────────────────────────────────
+        elif self.comp_type in ('AND', 'NAND', 'OR', 'NOR', 'XOR', 'NOT'):
+            self._draw_ansi_gate(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF'):
+            lbl = {'DFF':'D-FF','JKFF':'JK-FF','TFF':'T-FF','SRFF':'SR-FF'}[self.comp_type]
+            self._draw_digital_ff(painter, pen_body, pen_wire, body_color, lbl)
+        elif self.comp_type == 'ADC_BRIDGE':
+            self._draw_adc_dac(painter, pen_body, pen_wire, body_color, is_adc=True)
+        elif self.comp_type == 'DAC_BRIDGE':
+            self._draw_adc_dac(painter, pen_body, pen_wire, body_color, is_adc=False)
+        elif self.comp_type == 'COMPARATOR':
+            self._draw_digital_gate(painter, pen_body, pen_wire, body_color, 'CMP')
+        elif self.comp_type == 'PWM':
+            self._draw_digital_gate(painter, pen_body, pen_wire, body_color, 'PWM')
+        elif self.comp_type == 'COUNTER':
+            self._draw_counter(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'MUX2':
+            self._draw_mux(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'LOGIC_STATE':
+            self._draw_logic_state(painter, pen_body, pen_wire, body_color)
 
         # Nombre y valor
         self._draw_labels(painter, text_color)
@@ -603,6 +741,342 @@ class ComponentItem(QGraphicsItem):
             painter.drawText(QRectF(pos.x() + ox, pos.y() + oy, 28, 10),
                              Qt.AlignmentFlag.AlignLeft, label)
 
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Dibujo de componentes digitales
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _gate_geometry(self):
+        """
+        Retorna (hw, hh, step, n).
+        step = GRID_SIZE = 20px siempre.
+        Pines centrados en y=0: y_i = -(n-1)*step//2 + i*step
+        hh = max(|y_i|) + step
+        """
+        n    = max(self.dig_inputs, 1)
+        hw   = COMP_W // 2                     # 30 → salida en x=40
+        step = GRID_SIZE                        # 20px entre pines
+        hh   = (n - 1) * step // 2 + step      # altura mínima para contener pines
+        return hw, hh, step, n
+
+    def _gate_pin_ys(self):
+        """Posiciones y de los pines de entrada, centradas en 0."""
+        _, _, step, n = self._gate_geometry()
+        return [-(n - 1) * step // 2 + i * step for i in range(n)]
+
+    def _draw_digital_gate(self, painter, pen_body, pen_wire, body_color, label: str):
+        """Cuerpo rectangular de puerta lógica con etiqueta central.
+
+        Se usa para COMPARATOR y PWM (no tienen símbolo ANSI clásico).
+        Las puertas booleanas (AND/OR/NOT/NAND/NOR/XOR) usan _draw_ansi_gate.
+        """
+        hw, hh, step, n = self._gate_geometry()
+        # Cuerpo
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRoundedRect(QRectF(-hw, -hh, hw * 2, hh * 2), 4, 4)
+        # Etiqueta
+        painter.setPen(QPen(QColor(COLORS['component']), 2))
+        font = QFont('Consolas', 8, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(QRectF(-hw, -hh, hw * 2, hh * 2),
+                         Qt.AlignmentFlag.AlignCenter, label)
+        # Cables: entradas izquierda, salida derecha
+        painter.setPen(pen_wire)
+        pin_ys = self._gate_pin_ys()
+        for y in pin_ys:
+            painter.drawLine(QPointF(-hw - 10, y), QPointF(-hw, y))
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        # Pines
+        pin_color = QColor(COLORS['pin'])
+        for y in pin_ys:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(QPointF(-hw - 10, y), PIN_RADIUS, PIN_RADIUS)
+        painter.drawEllipse(QPointF(hw + 10, 0), PIN_RADIUS, PIN_RADIUS)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Puertas con simbología ANSI/IEEE estándar
+    # ──────────────────────────────────────────────────────────────────────
+    def _draw_ansi_gate(self, painter, pen_body, pen_wire, body_color):
+        """
+        Dibuja la puerta lógica usando la simbología distintiva ANSI/IEEE
+        (la "tradicional" americana):
+
+            AND  / NAND  → forma de D (rect + semielipse a la derecha)
+            OR   / NOR   → forma de escudo (back cóncavo + curvas frontales
+                           que confluyen en una punta)
+            XOR          → como OR + curva paralela cóncava extra a la entrada
+            NOT          → triángulo apuntando a la derecha
+
+        Las versiones invertidas (NAND, NOR, NOT) llevan un círculo de
+        inversión (bubble) en la salida.
+
+        El bounding [-hw,hw] × [-hh,hh] coincide con _gate_geometry() para
+        que las posiciones de los pines (y por tanto de los cables y la
+        bounding-rect del componente) sigan siendo válidas.
+        """
+        hw, hh, step, n = self._gate_geometry()
+        ct          = self.comp_type
+        bubble_d    = 7                       # diámetro del bubble de inversión
+        has_bubble  = ct in ('NAND', 'NOR', 'NOT')
+        # Si lleva bubble, el cuerpo termina antes para dejarle hueco;
+        # el bubble queda entre body_right y x=hw (donde nace el cable de salida).
+        body_right  = hw - bubble_d if has_bubble else hw
+        body_w      = body_right - (-hw)      # ancho del cuerpo
+
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+
+        # ── Cuerpo según el tipo ──────────────────────────────────────────
+        if ct in ('AND', 'NAND'):
+            # Forma de D: mitad izquierda rectangular + semielipse derecha.
+            path = QPainterPath()
+            flat_w     = body_w * 0.5
+            flat_x_end = -hw + flat_w
+            arc_a      = body_w - flat_w     # = body_w * 0.5
+            path.moveTo(-hw, -hh)
+            path.lineTo(flat_x_end, -hh)
+            # Semi-elipse: 90° (12 o'clock) sweeping -180° (clockwise) → derecha
+            path.arcTo(flat_x_end - arc_a, -hh,
+                       2 * arc_a, 2 * hh,
+                       90, -180)
+            path.lineTo(-hw, hh)
+            path.closeSubpath()
+            painter.drawPath(path)
+
+        elif ct in ('OR', 'NOR', 'XOR'):
+            # Forma de escudo OR: back cóncavo + dos curvas que confluyen
+            # en una punta a la derecha.
+            back_bulge  = body_w * 0.25      # cuán adentro entra la curva trasera
+            front_pull  = body_w * 0.55      # control de las curvas frontales
+            path = QPainterPath()
+            path.moveTo(-hw, -hh)            # esquina superior trasera
+            # Curva superior hasta la punta
+            path.quadTo(-hw + front_pull, -hh,
+                        body_right, 0)
+            # Curva inferior desde la punta
+            path.quadTo(-hw + front_pull,  hh,
+                        -hw, hh)
+            # Curva trasera cóncava (bulge a la derecha)
+            path.quadTo(-hw + back_bulge, 0,
+                        -hw, -hh)
+            path.closeSubpath()
+            painter.drawPath(path)
+
+            if ct == 'XOR':
+                # Curva extra paralela al back, desplazada hacia la izquierda.
+                xor_offset = 5
+                xor_path   = QPainterPath()
+                xor_path.moveTo(-hw - xor_offset, -hh)
+                xor_path.quadTo(-hw - xor_offset + back_bulge, 0,
+                                -hw - xor_offset,  hh)
+                # Sólo trazo, sin relleno
+                painter.strokePath(xor_path, pen_body)
+
+        elif ct == 'NOT':
+            # Triángulo equilátero apuntando a la derecha
+            path = QPainterPath()
+            path.moveTo(-hw, -hh)
+            path.lineTo(-hw,  hh)
+            path.lineTo(body_right, 0)
+            path.closeSubpath()
+            painter.drawPath(path)
+
+        # ── Bubble de inversión (NAND / NOR / NOT) ────────────────────────
+        if has_bubble:
+            # El borde derecho del bubble toca x=hw (donde sale el cable).
+            bubble_cx = body_right + bubble_d / 2
+            painter.drawEllipse(QPointF(bubble_cx, 0),
+                                bubble_d / 2, bubble_d / 2)
+
+        # ── Cables de conexión ────────────────────────────────────────────
+        painter.setPen(pen_wire)
+        pin_ys = self._gate_pin_ys()
+
+        # Para AND/NAND/NOT el lateral es vertical → cable termina en x=-hw.
+        # Para OR/NOR/XOR el back es cóncavo (curva Bezier cuadrática), por
+        # lo que x varía según y. Cada cable debe terminar EXACTAMENTE sobre
+        # la curva — si se queda corto deja un hueco; si se pasa, "atraviesa"
+        # el cuerpo y se ve mal.
+        #
+        # Bezier cuadrático con extremos (-hw, ±hh) y control (-hw+back_bulge, 0):
+        #   y(t) = hh·(2t − 1)        →  t = (y + hh)/(2hh)
+        #   x(t) = -hw + 2t(1−t)·back_bulge
+        if ct in ('OR', 'NOR', 'XOR'):
+            # Para XOR los cables conectan a la curva EXTERIOR (más a la izq).
+            outer_offset = 5 if ct == 'XOR' else 0
+            back_bulge_eff = body_w * 0.25     # mismo back_bulge que el path
+            for y in pin_ys:
+                t      = (y + hh) / (2 * hh) if hh > 0 else 0.5
+                back_x = -hw - outer_offset + 2 * t * (1 - t) * back_bulge_eff
+                painter.drawLine(QPointF(-hw - 10, y), QPointF(back_x, y))
+        else:
+            for y in pin_ys:
+                painter.drawLine(QPointF(-hw - 10, y), QPointF(-hw, y))
+
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+
+        # ── Pines (puntos de conexión) ────────────────────────────────────
+        pin_color = QColor(COLORS['pin'])
+        painter.setPen(QPen(pin_color, 2))
+        painter.setBrush(QBrush(pin_color))
+        for y in pin_ys:
+            painter.drawEllipse(QPointF(-hw - 10, y), PIN_RADIUS, PIN_RADIUS)
+        painter.drawEllipse(QPointF(hw + 10, 0), PIN_RADIUS, PIN_RADIUS)
+
+    def _draw_digital_ff(self, painter, pen_body, pen_wire, body_color, label: str):
+        """Flip-flop: caja con D/CLK a la izquierda, Q/Qn a la derecha."""
+        hw, hh = COMP_W // 2, COMP_H // 2 + 8
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
+        # Etiqueta
+        painter.setPen(QPen(QColor(COLORS['component']), 2))
+        font = QFont('Consolas', 7, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(QRectF(-hw, -hh, hw * 2, 14),
+                         Qt.AlignmentFlag.AlignCenter, label)
+        # Pines izquierda: D (arriba), CLK (abajo)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, -hh // 2), QPointF(-hw, -hh // 2))
+        painter.drawLine(QPointF(-hw - 10,  hh // 2), QPointF(-hw,  hh // 2))
+        # Pines derecha: Q (arriba), Qn (abajo)
+        painter.drawLine(QPointF(hw, -hh // 2), QPointF(hw + 10, -hh // 2))
+        painter.drawLine(QPointF(hw,  hh // 2), QPointF(hw + 10,  hh // 2))
+        # Símbolo de reloj (triángulo)
+        painter.setPen(QPen(QColor(COLORS['component']), 1))
+        cy = hh // 2
+        painter.drawLine(QPointF(-hw, cy - 5), QPointF(-hw + 6, cy))
+        painter.drawLine(QPointF(-hw + 6, cy), QPointF(-hw, cy + 5))
+        # Etiquetas de pines
+        font2 = QFont('Consolas', 6)
+        painter.setFont(font2)
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.drawText(QRectF(-hw + 2, -hh // 2 - 8, 14, 10), Qt.AlignmentFlag.AlignLeft, 'D')
+        painter.drawText(QRectF(-hw + 8, hh // 2 - 8, 20, 10), Qt.AlignmentFlag.AlignLeft, 'CLK')
+        painter.drawText(QRectF(hw - 14, -hh // 2 - 8, 14, 10), Qt.AlignmentFlag.AlignRight, 'Q')
+        painter.drawText(QRectF(hw - 14, hh // 2 - 8, 18, 10), Qt.AlignmentFlag.AlignRight, 'Q̄')
+        # Puntos de pin
+        pin_color = QColor(COLORS['pin'])
+        for px, py in [(-hw - 10, -hh // 2), (-hw - 10, hh // 2),
+                       (hw + 10, -hh // 2), (hw + 10, hh // 2)]:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(QPointF(px, py), PIN_RADIUS, PIN_RADIUS)
+
+    def _draw_adc_dac(self, painter, pen_body, pen_wire, body_color, is_adc: bool):
+        """Bloque ADC o DAC con flecha de conversión y datos de configuración."""
+        hw, hh = COMP_W // 2, COMP_H // 2 + 6
+        # Cuerpo
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
+        # Etiqueta principal
+        lbl = 'ADC' if is_adc else 'DAC'
+        font = QFont('Consolas', 9, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QPen(QColor(COLORS['component']), 2))
+        painter.drawText(QRectF(-hw, -hh, hw * 2, hh * 2),
+                         Qt.AlignmentFlag.AlignCenter, lbl)
+        # Flecha de conversión
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        font2 = QFont('Consolas', 6)
+        painter.setFont(font2)
+        if is_adc:
+            painter.drawText(QRectF(-hw + 2, 4, hw * 2 - 4, 12),
+                             Qt.AlignmentFlag.AlignCenter,
+                             f'{self.dig_bits_adc}b {self.dig_vref:.1f}V')
+        else:
+            painter.drawText(QRectF(-hw + 2, 4, hw * 2 - 4, 12),
+                             Qt.AlignmentFlag.AlignCenter,
+                             f'{self.dig_bits_adc}b {self.dig_vref:.1f}V')
+        # Pins: izquierda=analógico, derecha=digital
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-hw, 0))  # analógico
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))    # digital
+        pin_color = QColor(COLORS['pin'])
+        for px in [-hw - 10, hw + 10]:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(QPointF(px, 0), PIN_RADIUS, PIN_RADIUS)
+        # Etiquetas de pin
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.setFont(font2)
+        painter.drawText(QRectF(-hw - 24, -6, 20, 10), Qt.AlignmentFlag.AlignRight, 'A')
+        painter.drawText(QRectF(hw + 4, -6, 20, 10), Qt.AlignmentFlag.AlignLeft, 'D')
+
+    def _draw_logic_state(self, painter, pen_body, pen_wire, body_color):
+        """Botón de estado lógico: cuadrado con 1/0 grande, un pin de salida."""
+        hw = COMP_W // 2
+        hh = COMP_H // 2
+        state = int(self.value)   # 0 o 1
+        # Cuerpo — color según estado
+        col_on  = QColor('#27ae60')   # verde = HIGH
+        col_off = QColor('#c0392b')   # rojo  = LOW
+        fill = col_on if state else col_off
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(fill))
+        painter.drawRoundedRect(QRectF(-hw, -hh, hw * 2, hh * 2), 6, 6)
+        # Dígito grande
+        font_big = QFont('Consolas', 22, QFont.Weight.Bold)
+        painter.setFont(font_big)
+        painter.setPen(QPen(QColor('white'), 2))
+        painter.drawText(QRectF(-hw, -hh, hw * 2, hh * 2),
+                         Qt.AlignmentFlag.AlignCenter, str(state))
+        # Pin de salida (derecha)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        pin_color = QColor(COLORS['pin'])
+        painter.setPen(QPen(pin_color, 2))
+        painter.setBrush(QBrush(pin_color))
+        painter.drawEllipse(QPointF(hw + 10, 0), PIN_RADIUS, PIN_RADIUS)
+
+    def _draw_counter(self, painter, pen_body, pen_wire, body_color):
+        """Contador binario N-bit."""
+        hw, hh = COMP_W // 2, COMP_H // 2 + 6
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
+        font = QFont('Consolas', 7, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QPen(QColor(COLORS['component']), 2))
+        bits_lbl = f'CNT {self.dig_bits}b'
+        painter.drawText(QRectF(-hw, -hh, hw * 2, hh * 2),
+                         Qt.AlignmentFlag.AlignCenter, bits_lbl)
+        # CLK pin izquierda, salidas derecha
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-hw, 0))
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        pin_color = QColor(COLORS['pin'])
+        for px in [-hw - 10, hw + 10]:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(QPointF(px, 0), PIN_RADIUS, PIN_RADIUS)
+
+    def _draw_mux(self, painter, pen_body, pen_wire, body_color):
+        """MUX 2:1."""
+        hw, hh = COMP_W // 2, COMP_H // 2 + 4
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
+        font = QFont('Consolas', 7, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QPen(QColor(COLORS['component']), 2))
+        painter.drawText(QRectF(-hw, -hh, hw * 2, hh * 2),
+                         Qt.AlignmentFlag.AlignCenter, 'MUX 2:1')
+        painter.setPen(pen_wire)
+        for y in [-hh // 2, hh // 2]:
+            painter.drawLine(QPointF(-hw - 10, y), QPointF(-hw, y))
+        painter.drawLine(QPointF(-hw // 2, hh + 4), QPointF(-hw // 2, hh + 10))  # sel
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        pin_color = QColor(COLORS['pin'])
+        for px, py in [(-hw - 10, -hh // 2), (-hw - 10, hh // 2),
+                       (-hw // 2, hh + 10), (hw + 10, 0)]:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(QPointF(px, py), PIN_RADIUS, PIN_RADIUS)
+
     def _draw_labels(self, painter, text_color):
         if self.comp_type in ('GND', 'NODE'):
             return
@@ -822,8 +1296,9 @@ class ComponentPickerDialog(QDialog):
 # ESCENA DEL CIRCUITO
 # ══════════════════════════════════════════════════════════════
 class CircuitScene(QGraphicsScene):
-    component_selected = pyqtSignal(object)
-    status_message     = pyqtSignal(str)
+    component_selected   = pyqtSignal(object)
+    status_message       = pyqtSignal(str)
+    logic_state_toggled  = pyqtSignal(object)   # emitido cuando LOGIC_STATE cambia
 
     def __init__(self):
         super().__init__()
@@ -867,7 +1342,10 @@ class CircuitScene(QGraphicsScene):
             count = self._comp_counter.get(comp_type, 0) + 1
             self._comp_counter[comp_type] = count
             prefixes = {'R': 'R', 'V': 'V', 'I': 'I', 'C': 'C', 'L': 'L',
-                        'GND': 'GND', 'NODE': 'N'}
+                        'GND': 'GND', 'NODE': 'N', 'LOGIC_STATE': 'LS',
+                        'AND': 'AND', 'OR': 'OR', 'NOT': 'NOT', 'NAND': 'NAND',
+                        'NOR': 'NOR', 'XOR': 'XOR', 'DFF': 'FF', 'JKFF': 'FF',
+                        'TFF': 'FF', 'SRFF': 'FF', 'COUNTER': 'CNT', 'MUX2': 'MUX'}
             name = f"{prefixes.get(comp_type, comp_type)}{count}"
 
         units = {'R': 'Ω', 'V': 'V', 'VAC': 'V', 'I': 'A', 'C': 'F', 'L': 'H',
@@ -878,11 +1356,16 @@ class CircuitScene(QGraphicsScene):
 
         defaults = {'R': 1000.0, 'V': 5.0, 'VAC': 120.0, 'I': 0.001, 'C': 1e-6, 'L': 1e-3,
                     'D': 1e-14, 'LED': 1e-14, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
-                    'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5}
-        if value == 0.0:
+                    'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5,
+                    'LOGIC_STATE': 0.0}  # 0=LOW, 1=HIGH
+        if value == 0.0 and comp_type != 'LOGIC_STATE':
             value = defaults.get(comp_type, 1.0)
+        elif comp_type == 'LOGIC_STATE':
+            value = defaults.get(comp_type, 0.0)
 
         item = ComponentItem(comp_type, name, value, unit, node1, node2, node3)
+        if comp_type == 'NOT':
+            item.dig_inputs = 1
         snap_x = round(pos.x() / GRID_SIZE) * GRID_SIZE
         snap_y = round(pos.y() / GRID_SIZE) * GRID_SIZE
         item.setPos(snap_x, snap_y)
@@ -891,6 +1374,27 @@ class CircuitScene(QGraphicsScene):
         return item
 
     # ── Eventos de mouse ────────────────────────
+
+    def _snap_to_pin_or_grid(self, pos: QPointF, threshold: float = 16.0) -> QPointF:
+        """
+        Si el cursor está a menos de `threshold` px de cualquier pin,
+        retorna la posición exacta del pin. Si no, snapea a grilla.
+        """
+        best_dist = threshold
+        best_pt   = None
+        for comp in self.components:
+            for pt in comp.all_pin_positions_scene():
+                dx = pos.x() - pt.x()
+                dy = pos.y() - pt.y()
+                d  = (dx*dx + dy*dy) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best_pt   = pt
+        if best_pt is not None:
+            return best_pt
+        return QPointF(round(pos.x()/GRID_SIZE)*GRID_SIZE,
+                       round(pos.y()/GRID_SIZE)*GRID_SIZE)
+
     def mousePressEvent(self, event):
         pos = event.scenePos()
 
@@ -901,8 +1405,7 @@ class CircuitScene(QGraphicsScene):
             return
 
         if self._mode == 'wire':
-            snap = QPointF(round(pos.x()/GRID_SIZE)*GRID_SIZE,
-                           round(pos.y()/GRID_SIZE)*GRID_SIZE)
+            snap = self._snap_to_pin_or_grid(pos)
             if self._wire_start is None:
                 self._wire_start = snap
                 self._wire_preview = WireItem(snap, snap)
@@ -931,9 +1434,8 @@ class CircuitScene(QGraphicsScene):
 
     def mouseMoveEvent(self, event):
         if self._mode == 'wire' and self._wire_start and self._wire_preview:
-            pos = event.scenePos()
-            snap = QPointF(round(pos.x()/GRID_SIZE)*GRID_SIZE,
-                           round(pos.y()/GRID_SIZE)*GRID_SIZE)
+            pos  = event.scenePos()
+            snap = self._snap_to_pin_or_grid(pos)
             self._wire_preview.setLine(QLineF(self._wire_start, snap))
         super().mouseMoveEvent(event)
 
@@ -941,6 +1443,12 @@ class CircuitScene(QGraphicsScene):
         items = self.items(event.scenePos())
         for item in items:
             if isinstance(item, ComponentItem):
+                if item.comp_type == 'LOGIC_STATE':
+                    # Toggle 0↔1 con doble-click
+                    item.value = 0.0 if item.value else 1.0
+                    item.update()
+                    self.logic_state_toggled.emit(item)
+                    return
                 self._edit_component(item)
                 return
         super().mouseDoubleClickEvent(event)
@@ -973,7 +1481,8 @@ class CircuitScene(QGraphicsScene):
         Union-Find: une pines conectados por cables en el mismo nodo.
         GND se mapea al nodo 0. Retorna {CompNombre__p1: net_X, ...}
         """
-        SNAP = GRID_SIZE  # tolerancia = tamaño de celda completo (más robusto)
+        # Cambia esto de GRID_SIZE a un valor pequeño
+        SNAP = 5
 
         # ── 1. Registrar pines de componentes ───────────────────────────
         pins = {}
@@ -984,6 +1493,17 @@ class CircuitScene(QGraphicsScene):
             # Registrar pin3 para dispositivos de 3 terminales
             if comp.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP'):
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+            elif comp.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF', 'MUX2'):
+                pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+            elif comp.comp_type in ('AND', 'OR', 'NAND', 'NOR', 'XOR', 'COMPARATOR'):
+                # Registrar TODOS los pines de entrada de la puerta:
+                # p1 = salida (ya registrado), p2 = entrada 1 (ya registrado),
+                # p3 = entrada 2, p4 = entrada 3, ...
+                gw, gh, step, n_in = comp._gate_geometry()
+                ys = comp._gate_pin_ys()
+                for i, y in enumerate(ys):
+                    pin_key = f"{comp.name}__p{i + 2}"  # p2, p3, p4, ...
+                    pins[pin_key] = comp.mapToScene(QPointF(-gw - 10, y))
 
         # ── 2. Union-Find sobre pines + extremos de cables ───────────────
         # Incluimos los extremos de cables como nodos propios del grafo
@@ -1044,8 +1564,12 @@ class CircuitScene(QGraphicsScene):
             if root in gnd_roots:
                 root_to_name[root] = '0'
             else:
-                net_counter += 1
-                root_to_name[root] = f'net_{net_counter}'
+                # Usar el primer pin del grupo como nombre canónico del net.
+                # Esto hace que el nombre sea estable y único por componente,
+                # evitando que circuitos independientes compartan nombres de red
+                # entre llamadas sucesivas a extract_netlist().
+                canonical = min(groups[root])  # orden lexicográfico → determinista
+                root_to_name[root] = f'net_{canonical}'
 
         return {pid: root_to_name[find(pid)] for pid in pin_ids}
 
@@ -1071,6 +1595,17 @@ class CircuitScene(QGraphicsScene):
                 item.z_phase  = data.get('z_phase', 0.0)
             if item.comp_type == 'LED':
                 item.led_color = data.get('led_color', 'red')
+            # Campos digitales
+            if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                if 'dig_inputs'  in data: item.dig_inputs      = data['dig_inputs']
+                if item.comp_type == 'NOT': item.dig_inputs = 1
+                if 'dig_bits'    in data: item.dig_bits         = data['dig_bits']
+                if 'dig_bits_adc'in data: item.dig_bits_adc    = data['dig_bits_adc']
+                if 'dig_vref'    in data: item.dig_vref         = data['dig_vref']
+                if 'dig_tpd_ns'  in data: item.dig_tpd_ns      = data['dig_tpd_ns']
+                if 'dig_clk'     in data: item.dig_clk          = data['dig_clk']
+                if 'dig_analog_node' in data: item.dig_analog_node = data['dig_analog_node']
+                if 'dig_input_nodes' in data: item.dig_input_nodes  = data['dig_input_nodes']
             item.update()
 
 
@@ -1138,17 +1673,51 @@ class ComponentDialog(QDialog):
             'PMOS':    ('Drain (D)',    'Source (S)', 'Gate (G)'),
             'OPAMP':   ('Salida (OUT)', 'Entrada − (V−)', 'Entrada + (V+)'),
         }
-        lbl1, lbl2, lbl3 = node_labels.get(self.item.comp_type, ('Nodo +', 'Nodo −', None))
+        _dig_gate_types_prop = {'AND','OR','NOT','NAND','NOR','XOR'}
+        _dig_ff_types_prop   = {'DFF','JKFF','TFF','SRFF'}
 
-        self.node1_edit = QLineEdit(self.item.node1)
-        self.node2_edit = QLineEdit(self.item.node2)
-        layout.addRow(lbl1 + ':', self.node1_edit)
-        layout.addRow(lbl2 + ':', self.node2_edit)
-
-        self.node3_edit = None
-        if lbl3 is not None:
-            self.node3_edit = QLineEdit(self.item.node3)
+        if self.item.comp_type in _dig_gate_types_prop:
+            # Puertas: Salida (p1) + N entradas (p2..pN+1)
+            n_in = self.item.dig_inputs if self.item.comp_type != 'NOT' else 1
+            # Nodo salida
+            self.node1_edit = QLineEdit(self.item.node1)
+            layout.addRow('Salida (Y):', self.node1_edit)
+            self.node2_edit = QLineEdit(self.item.node2)
+            layout.addRow('Entrada 1 (A):', self.node2_edit)
+            self.node3_edit = None
+            # Entradas extra — guardadas en item.dig_input_nodes[]
+            self._extra_node_edits = []   # list of QLineEdit, index 0 = Entrada 2
+            if n_in >= 2:
+                # Entrada 2 usa node3
+                _n3_val = self.item.node3 if hasattr(self.item, 'node3') else ''
+                self.node3_edit = QLineEdit(_n3_val)
+                layout.addRow('Entrada 2 (B):', self.node3_edit)
+            for i in range(2, n_in):   # Entradas 3..N usan dig_input_nodes
+                _extra_nodes = getattr(self.item, 'dig_input_nodes', [])
+                _val = _extra_nodes[i-2] if len(_extra_nodes) > i-2 else ''
+                _edit = QLineEdit(_val)
+                layout.addRow(f'Entrada {i+1}:', _edit)
+                self._extra_node_edits.append(_edit)
+        elif self.item.comp_type in _dig_ff_types_prop:
+            lbl1, lbl2, lbl3 = ('Salida Q', 'Dato D / J', 'CLK')
+            self.node1_edit = QLineEdit(self.item.node1)
+            self.node2_edit = QLineEdit(self.item.node2)
+            layout.addRow(lbl1 + ':', self.node1_edit)
+            layout.addRow(lbl2 + ':', self.node2_edit)
+            self.node3_edit = QLineEdit(self.item.node3 if hasattr(self.item,'node3') else '')
             layout.addRow(lbl3 + ':', self.node3_edit)
+            self._extra_node_edits = []
+        else:
+            lbl1, lbl2, lbl3 = node_labels.get(self.item.comp_type, ('Nodo +', 'Nodo −', None))
+            self.node1_edit = QLineEdit(self.item.node1)
+            self.node2_edit = QLineEdit(self.item.node2)
+            layout.addRow(lbl1 + ':', self.node1_edit)
+            layout.addRow(lbl2 + ':', self.node2_edit)
+            self.node3_edit = None
+            if lbl3 is not None:
+                self.node3_edit = QLineEdit(self.item.node3)
+                layout.addRow(lbl3 + ':', self.node3_edit)
+            self._extra_node_edits = []
 
         # Selector de color para LED
         self._led_color_combo = None
@@ -1236,6 +1805,75 @@ class ComponentDialog(QDialog):
             layout.addRow(self._z_stack)
             self._z_mode_combo.currentIndexChanged.connect(self._z_stack.setCurrentIndex)
 
+        # ── Campos para componentes digitales ────────────────────────────
+        self._dig_inputs_spin = None
+        self._dig_bits_spin   = None
+        self._dig_vref_spin   = None
+        self._dig_tpd_spin    = None
+        self._dig_clk_edit    = None
+        self._dig_anode_edit  = None
+
+        dig_gate_types  = {'AND','OR','NOT','NAND','NOR','XOR'}
+        dig_ff_types    = {'DFF','JKFF','TFF','SRFF'}
+        dig_bridge_types= {'ADC_BRIDGE','DAC_BRIDGE','COMPARATOR'}
+        dig_count_types = {'COUNTER','MUX2'}
+
+        if self.item.comp_type in dig_gate_types:
+            if self.item.comp_type != 'NOT':
+                self._dig_inputs_spin = QDoubleSpinBox()
+                self._dig_inputs_spin.setRange(2, 8)
+                self._dig_inputs_spin.setDecimals(0)
+                self._dig_inputs_spin.setValue(self.item.dig_inputs)
+                layout.addRow('Nº entradas:', self._dig_inputs_spin)
+
+            self._dig_tpd_spin = QDoubleSpinBox()
+            self._dig_tpd_spin.setRange(0.001, 1000)
+            self._dig_tpd_spin.setDecimals(3)
+            self._dig_tpd_spin.setSuffix(' ns')
+            self._dig_tpd_spin.setValue(self.item.dig_tpd_ns)
+            layout.addRow('Retardo tpd:', self._dig_tpd_spin)
+
+        elif self.item.comp_type in dig_ff_types:
+            self._dig_clk_edit = QLineEdit(self.item.dig_clk)
+            layout.addRow('Net CLK:', self._dig_clk_edit)
+
+            self._dig_tpd_spin = QDoubleSpinBox()
+            self._dig_tpd_spin.setRange(0.001, 1000)
+            self._dig_tpd_spin.setDecimals(3)
+            self._dig_tpd_spin.setSuffix(' ns')
+            self._dig_tpd_spin.setValue(self.item.dig_tpd_ns)
+            layout.addRow('Retardo tpd:', self._dig_tpd_spin)
+
+        elif self.item.comp_type in dig_bridge_types:
+            self._dig_bits_spin = QDoubleSpinBox()
+            self._dig_bits_spin.setRange(1, 24)
+            self._dig_bits_spin.setDecimals(0)
+            self._dig_bits_spin.setValue(self.item.dig_bits_adc)
+            layout.addRow('Resolución (bits):', self._dig_bits_spin)
+
+            self._dig_vref_spin = QDoubleSpinBox()
+            self._dig_vref_spin.setRange(0.1, 100.0)
+            self._dig_vref_spin.setDecimals(3)
+            self._dig_vref_spin.setSuffix(' V')
+            self._dig_vref_spin.setValue(self.item.dig_vref)
+            layout.addRow('Vref:', self._dig_vref_spin)
+
+            self._dig_anode_edit = QLineEdit(self.item.dig_analog_node)
+            layout.addRow('Nodo analógico MNA:', self._dig_anode_edit)
+
+            self._dig_clk_edit = QLineEdit(self.item.dig_clk)
+            layout.addRow('Net CLK (opcional):', self._dig_clk_edit)
+
+        elif self.item.comp_type in dig_count_types:
+            self._dig_bits_spin = QDoubleSpinBox()
+            self._dig_bits_spin.setRange(1, 32)
+            self._dig_bits_spin.setDecimals(0)
+            self._dig_bits_spin.setValue(self.item.dig_bits)
+            layout.addRow('Bits:', self._dig_bits_spin)
+
+            self._dig_clk_edit = QLineEdit(self.item.dig_clk)
+            layout.addRow('Net CLK:', self._dig_clk_edit)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -1260,6 +1898,23 @@ class ComponentDialog(QDialog):
             data['z_imag']  = self._z_imag.value()
             data['z_mag']   = self._z_mag.value()
             data['z_phase'] = self._z_phase.value()
+        # Campos digitales
+        if self._dig_inputs_spin is not None:
+            data['dig_inputs']  = int(self._dig_inputs_spin.value())
+        if self._dig_bits_spin is not None:
+            data['dig_bits']    = int(self._dig_bits_spin.value())
+            data['dig_bits_adc']= int(self._dig_bits_spin.value())
+        if self._dig_vref_spin is not None:
+            data['dig_vref']    = self._dig_vref_spin.value()
+        if self._dig_tpd_spin is not None:
+            data['dig_tpd_ns']  = self._dig_tpd_spin.value()
+        if self._dig_clk_edit is not None:
+            data['dig_clk']     = self._dig_clk_edit.text()
+        if self._dig_anode_edit is not None:
+            data['dig_analog_node'] = self._dig_anode_edit.text()
+        # Nodos de entradas extra para puertas con más de 2 entradas
+        if hasattr(self, '_extra_node_edits') and self._extra_node_edits:
+            data['dig_input_nodes'] = [e.text() for e in self._extra_node_edits]
         return data
 
 
@@ -1288,6 +1943,7 @@ class MainWindow(QMainWindow):
         self.scene = CircuitScene()
         self.scene.component_selected.connect(self._on_component_selected)
         self.scene.status_message.connect(self.statusBar().showMessage)
+        self.scene.logic_state_toggled.connect(self._on_logic_state_toggled)
 
         self.view = QGraphicsView(self.scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1381,7 +2037,49 @@ class MainWindow(QMainWindow):
             act.triggered.connect(fn)
             tb.addAction(act)
 
+        # ── Botón Configuración (alineado a la derecha) ──────────────────
+        tb.addSeparator()
+        from PyQt6.QtWidgets import QSizePolicy
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding,
+                             QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        act_settings = QAction("⚙ Configuración", self)
+        act_settings.setShortcut("Ctrl+,")
+        act_settings.setToolTip(
+            "Abrir ventana de configuración (temas, preferencias…)")
+        act_settings.triggered.connect(self._open_settings_dialog)
+        tb.addAction(act_settings)
+
         self._current_file: Optional[str] = None
+
+    # ── Configuración / Tema ──────────────────────────────────────────────
+    def _open_settings_dialog(self):
+        """Abre el diálogo de configuración."""
+        dlg = SettingsDialog(parent=self,
+                             current_theme_id=THEME_MANAGER.load_selection(),
+                             on_theme_change=self._apply_theme_change)
+        dlg.exec()
+
+    def _apply_theme_change(self, theme_id: str):
+        """Callback que el SettingsDialog invoca al elegir un tema."""
+        applied = apply_theme_to_colors(theme_id)
+        THEME_MANAGER.save_selection(applied)
+        self._refresh_theme_in_ui()
+        meta = THEME_MANAGER.get_theme_meta(applied)
+        if meta:
+            self.statusBar().showMessage(f"Tema aplicado: {meta['name']}", 3000)
+
+    def _refresh_theme_in_ui(self):
+        """Re-aplica stylesheet y fuerza redibujo del canvas tras cambiar tema."""
+        # 1) Re-aplicar stylesheet global (lee COLORS al vuelo)
+        self._apply_style()
+        # 2) Fondo de la escena
+        self.scene.setBackgroundBrush(QBrush(QColor(COLORS['bg'])))
+        # 3) Forzar repintado de items y viewport
+        self.scene.update()
+        self.view.viewport().update()
 
     def _build_component_toolbar(self):
         """Barra secundaria (fila 2): categorías de componentes, herramientas y simulación."""
@@ -1419,6 +2117,25 @@ class MainWindow(QMainWindow):
                 ('GND',  'Tierra',   '⏚'),
                 ('NODE', 'Nodo',     '•'),
             ]),
+            ("Digital", [
+                ('AND',       'Puerta AND',     '&'),
+                ('OR',        'Puerta OR',      '≥1'),
+                ('NOT',       'Inversor NOT',   '○'),
+                ('NAND',      'Puerta NAND',    '&̄'),
+                ('NOR',       'Puerta NOR',     '≥1̄'),
+                ('XOR',       'Puerta XOR',     '=1'),
+                ('DFF',       'Flip-flop D',    '▣D'),
+                ('JKFF',      'Flip-flop JK',   '▣JK'),
+                ('TFF',       'Flip-flop T',    '▣T'),
+                ('SRFF',      'Flip-flop SR',   '▣SR'),
+                ('COUNTER',   'Contador binario','#'),
+                ('MUX2',      'Multiplexor 2:1','⊞'),
+                ('ADC_BRIDGE','Puente ADC',     'A→D'),
+                ('DAC_BRIDGE','Puente DAC',     'D→A'),
+                ('COMPARATOR','Comparador',     'CMP'),
+                ('PWM',       'Salida PWM',     '⊓⊓'),
+                ('LOGIC_STATE','Estado Lógico',  '0/1'),
+            ]),
         ]
 
         for cat_name, items in categories:
@@ -1449,18 +2166,12 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         # ── Simulación ─────────────────────────────────────────────────────
-        self.sim_mode_combo = QComboBox()
-        self.sim_mode_combo.addItems(['DC', 'AC'])
-        self.sim_mode_combo.setFont(QFont('Consolas', 10))
-        self.sim_mode_combo.setFixedWidth(60)
-        self.sim_mode_combo.setFixedHeight(28)
-        self.sim_mode_combo.currentTextChanged.connect(self._on_sim_mode_changed)
-        tb.addWidget(self.sim_mode_combo)
-
-        self.run_btn = QPushButton("▶  SIMULAR DC")
+        # Estándar lógico fijo: CMOS 5 V (no expuesto en la UI)
+        self.run_btn = QPushButton("▶  SIMULAR AUTO")
         self.run_btn.setFont(QFont('Consolas', 10, QFont.Weight.Bold))
         self.run_btn.setFixedHeight(28)
         self.run_btn.setCheckable(True)
+        self.run_btn.setToolTip("Detecta automáticamente: DC · AC · Digital · Mixto")
         self.run_btn.clicked.connect(self._toggle_simulation)
         tb.addWidget(self.run_btn)
 
@@ -1557,31 +2268,58 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Modo selección")
 
     def _on_sim_mode_changed(self, mode: str):
-        self.run_btn.setText(f"▶  SIMULAR {mode}")
+        pass  # modo automático — no se usa
 
-    # ── Simulación ───────────────────────────────
+    # ── Simulación automática ─────────────────────────────────────────────
     def _toggle_simulation(self, checked: bool):
-        """Inicia o detiene la simulación continua."""
-        mode = self.sim_mode_combo.currentText()
-        if mode == 'AC':
-            # AC es un disparo único, no necesita loop
-            self.run_btn.setChecked(False)
-            self._run_simulation_ac()
+        """Analiza el circuito y despacha automáticamente al solver correcto."""
+        if not checked:
+            self._stop_simulation()
             return
-        if checked:
+
+        pin_node = self.scene.extract_netlist()
+        std_name = DEFAULT_LOGIC_STANDARD
+        analyzer = CircuitAnalyzer(logic_standard=std_name)
+        flags = analyzer.analyze(self.scene.components, pin_node)
+
+        self.results_text.setPlainText(flags.summary() + "\n\nAnalizando...")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        # Circuitos con puentes ADC/DAC explícitos o fronteras implícitas reales
+        # → co-simulación transitoria (one-shot)
+        _needs_transient = (
+            flags.has_bridges
+            or bool(flags.implicit_boundary_nodes)
+            or (flags.has_dc and flags.has_ac)
+        )
+        if _needs_transient:
+            self.run_btn.setChecked(False)
+            self.run_btn.setText("▶  SIMULAR AUTO")
+            self._run_simulation_auto(flags, pin_node)
+        elif flags.has_ac and not flags.has_dc:
+            self.run_btn.setChecked(False)
+            self.run_btn.setText("▶  SIMULAR AUTO")
+            self._run_simulation_ac()
+        elif flags.has_dc or flags.has_digital:
+            # DC puro, digital puro, o digital+DC sin fronteras → simulación continua
             self._sim_running = True
             self.run_btn.setText("■  DETENER")
             self._sim_timer.start()
-            self._run_simulation_dc()          # primer disparo inmediato
+            self._run_simulation_dc()
         else:
-            self._stop_simulation()
+            self.run_btn.setChecked(False)
+            self.run_btn.setText("▶  SIMULAR AUTO")
+            self.results_text.setPlainText(
+                "⚠  No se encontraron componentes para simular.\n"
+                "Añade componentes al canvas y conéctalos a tierra.")
 
     def _stop_simulation(self):
         """Detiene la simulación y apaga todos los LEDs."""
         self._sim_running = False
         self._sim_timer.stop()
         self.run_btn.setChecked(False)
-        self.run_btn.setText("▶  SIMULAR DC")
+        self.run_btn.setText("▶  SIMULAR AUTO")
         for item in self.scene.components:
             if item.comp_type == 'LED':
                 item.led_on = False
@@ -1595,6 +2333,209 @@ class MainWindow(QMainWindow):
     def _run_simulation(self):
         """Compatibilidad: despacha al toggle."""
         self._toggle_simulation(True)
+
+    def _run_simulation_auto(self, flags=None, pin_node=None):
+        """Corre DC + AC + mixto según flags y muestra todo en un panel."""
+        from PyQt6.QtWidgets import QApplication
+        from engine.digital_engine import (
+            DigitalSimulator, Gate, DFF, JKFF, TFF, SRFF, BinaryCounter, MUX,
+        )
+        from engine.bridges import ADC, DAC, ComparatorBridge, PWMBridge
+        from engine.mixed_signal import MixedSignalInterface
+        import cmath as _cmath
+
+        if pin_node is None:
+            pin_node = self.scene.extract_netlist()
+        if flags is None:
+            std_name = DEFAULT_LOGIC_STANDARD
+            analyzer = CircuitAnalyzer(logic_standard=std_name)
+            flags = analyzer.analyze(self.scene.components, pin_node)
+
+        std_name = DEFAULT_LOGIC_STANDARD
+        out = ["═══ SIMULACIÓN AUTOMÁTICA ═══", f"  {flags.summary()}", ""]
+        if flags.warnings:
+            out.extend([f"  ⚠ {w}" for w in flags.warnings]); out.append("")
+
+        # ── Construir componentes analógicos ─────────────────────────────
+        analog_comps, build_errors = [], []
+        for item in self.scene.components:
+            if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                continue
+            n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", f"iso_{item.name}")
+            n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
+            n3 = (item.node3.strip() if hasattr(item, "node3") and item.node3.strip()
+                  else pin_node.get(f"{item.name}__p3", ""))
+            try:
+                ct = item.comp_type
+                if ct == "R" and item.value > 0:
+                    analog_comps.append(Resistor(item.name, n1, n2, item.value))
+                elif ct == "V":
+                    analog_comps.append(VoltageSource(item.name, n1, n2, item.value))
+                elif ct == "VAC":
+                    analog_comps.append(VoltageSourceAC(
+                        item.name, n1, n2, amplitude=item.value,
+                        frequency=item.frequency, phase_deg=item.phase_deg, mode=item.ac_mode))
+                elif ct == "I":
+                    analog_comps.append(CurrentSource(item.name, n1, n2, item.value))
+                elif ct == "C" and item.value > 0:
+                    analog_comps.append(Capacitor(item.name, n1, n2, item.value))
+                elif ct == "L" and item.value > 0:
+                    analog_comps.append(Inductor(item.name, n1, n2, item.value))
+                elif ct in ("D", "LED"):
+                    analog_comps.append(Diode(item.name, n1, n2,
+                                              Is=item.value if item.value > 0 else 1e-14))
+                elif ct in ("BJT_NPN", "BJT_PNP"):
+                    t = "NPN" if ct == "BJT_NPN" else "PNP"
+                    analog_comps.append(BJT(item.name, n1, n3 or f"b_{item.name}", n2,
+                                            type_=t, Bf=item.value if item.value > 0 else 100))
+                elif ct in ("NMOS", "PMOS"):
+                    t = "NMOS" if ct == "NMOS" else "PMOS"
+                    analog_comps.append(MOSFET(item.name, n1, n3 or f"g_{item.name}", n2,
+                                               type_=t, Kn=item.value if item.value > 0 else 1e-3))
+                elif ct == "OPAMP":
+                    analog_comps.append(OpAmp(item.name, n1, n3 or f"vp_{item.name}", n2,
+                                              A=item.value if item.value > 0 else 1e5))
+                elif ct == "Z":
+                    import math as _math
+                    Z_val = (complex(item.z_real, item.z_imag) if item.z_mode == "rect"
+                             else complex(item.z_mag*_math.cos(_math.radians(item.z_phase)),
+                                          item.z_mag*_math.sin(_math.radians(item.z_phase))))
+                    if abs(Z_val) > 1e-12:
+                        analog_comps.append(Impedance(item.name, n1, n2, Z_val))
+            except Exception as e:
+                build_errors.append(f"{item.name}: {e}")
+
+        # ── DC ────────────────────────────────────────────────────────────
+        if flags.has_dc and analog_comps:
+            dc_comps = [VoltageSource(c.name, c.n_pos, c.n_neg, 0.0)
+                        if isinstance(c, VoltageSourceAC) else c for c in analog_comps]
+            dc = self.solver.solve_dc(dc_comps)
+            out.append("── Voltajes DC ──")
+            if dc["success"]:
+                for node, v in sorted(dc["voltages"].items()):
+                    out.append(f"  V({node}) = {v:+.4f} V")
+                if dc.get("branch_currents"):
+                    out.append(""); out.append("── Corrientes DC ──")
+                    for name, i in dc["branch_currents"].items():
+                        out.append(f"  I({name}) = {i*1000:+.4f} mA")
+                for item in self.scene.components:
+                    n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", "")
+                    n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
+                    item.result_voltage = dc["voltages"].get(n1)
+                    if item.comp_type == "LED":
+                        item.led_on = False
+                        op = dc.get("operating_points", {}).get(item.name, {})
+                        vd = op.get("Vd", op.get("vd")) if op else None
+                        item.led_on = float(vd) > 0.3 if vd is not None else (
+                            (dc["voltages"].get(n1, 0) - dc["voltages"].get(n2, 0)) > 0.3)
+                    item.update()
+            else:
+                out.append(f"  ✗ {dc['error']}")
+            out.append("")
+
+        # ── AC ────────────────────────────────────────────────────────────
+        if flags.has_ac and analog_comps:
+            freq = next((it.frequency for it in self.scene.components
+                         if it.comp_type == "VAC"), 60.0)
+            ac = self.solver.solve_ac_single(analog_comps, freq)
+            out.append(f"── Fasores AC ({freq} Hz) ──")
+            if ac["success"]:
+                for node, V in sorted(ac["voltages"].items()):
+                    out.append(f"  V({node}) = {abs(V):.4f} V  ∠{_cmath.phase(V)*180/_cmath.pi:.2f}°")
+                t = ac.get("total", {})
+                if t:
+                    out += ["", "── Potencia total ──",
+                            f"  P={t.get('P',0):+.4f} W  Q={t.get('Q',0):+.4f} VAR",
+                            f"  S={t.get('S',0):.4f} VA  fp={t.get('fp',0):.4f} ({t.get('fp_type','')})"]
+                self._last_ac_result = ac
+                self.btn_power_triangle.setVisible(True)
+            else:
+                out.append(f"  ✗ {ac['error']}")
+            out.append("")
+
+        # ── Mixto ─────────────────────────────────────────────────────────
+        if flags.needs_mixed:
+            # Si no hay puentes reales ni nodos frontera, no hace falta
+            # co-simulación transitoria: correr DC analógico + digital por separado
+            _only_isolated = (
+                not flags.has_bridges
+                and not flags.implicit_boundary_nodes
+            )
+            if _only_isolated:
+                # Evaluar puertas digitales usando los voltajes DC ya calculados
+                # para determinar los niveles lógicos en las entradas
+                _dc_voltages = {}
+                if flags.has_dc and analog_comps:
+                    _dc_res = self.solver.solve_dc(
+                        [VoltageSource(c.name, c.n_pos, c.n_neg, 0.0)
+                         if isinstance(c, VoltageSourceAC) else c
+                         for c in analog_comps])
+                    if _dc_res.get("success"):
+                        _dc_voltages = _dc_res["voltages"]
+                self._evaluate_digital_gates(pin_node, _dc_voltages, out=out)
+                out.append("")
+                self.results_text.setPlainText("\n".join(out))
+                self.scene.update()
+                return
+            t_stop = 1e-3   # 1 ms por defecto
+            dt_chunk = max(t_stop / 100, 1e-6)
+            dsim = DigitalSimulator()
+            adc_list, dac_list = [], []
+            _gmap = {"AND":"AND","OR":"OR","NOT":"NOT","NAND":"NAND","NOR":"NOR","XOR":"XOR"}
+            for item in self.scene.components:
+                ct = item.comp_type; tpd = item.dig_tpd_ns * 1e-9
+                try:
+                    if ct in _gmap:
+                        n_in = max(1, item.dig_inputs)
+                        dsim.add(Gate(item.name, _gmap[ct],
+                                      [f"{item.name}_I{i}" for i in range(n_in)],
+                                      f"{item.name}_Y", t_pd=tpd))
+                    elif ct == "DFF":
+                        dsim.add(DFF(item.name, d=f"{item.name}_D", clk=item.dig_clk,
+                                     q=f"{item.name}_Q", qn=f"{item.name}_Qn", t_pd=tpd))
+                    elif ct == "ADC_BRIDGE":
+                        nd = item.dig_analog_node or pin_node.get(f"{item.name}__p1","")
+                        adc_list.append(ADC(item.name, node=nd, bits=item.dig_bits_adc, vref=item.dig_vref))
+                    elif ct == "DAC_BRIDGE":
+                        nd = item.dig_analog_node or pin_node.get(f"{item.name}__p1","")
+                        dac_list.append(DAC(item.name, bits=item.dig_bits_adc, vref=item.dig_vref, out_node=nd))
+                    elif ct == "COMPARATOR":
+                        nd = item.dig_analog_node or pin_node.get(f"{item.name}__p1","")
+                        adc_list.append(ComparatorBridge(item.name, node_pos=nd))
+                except Exception as e:
+                    build_errors.append(f"{item.name}: {e}")
+            if flags.implicit_boundary_nodes:
+                std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+                out.append(f"── Fronteras implícitas ({std_name}) ──")
+                for node in flags.implicit_boundary_nodes:
+                    out.append(f"  Nodo '{node}'")
+                    adc_list.append(ADC(f"__impl_{node}", node=node, bits=1, vref=std.Vdd))
+                out.append("")
+            if analog_comps:
+                iface = MixedSignalInterface(self.solver, dsim, analog_comps)
+                for a in adc_list: iface.add_adc(a)
+                for d in dac_list:
+                    if hasattr(d,"pwm_net"): iface.add_pwm(d)
+                    elif hasattr(d,"input_nets"): iface.add_dac(d)
+                    else: iface.add_comparator(d)
+                mr = iface.run_iterative(t_stop=t_stop, dt_chunk=dt_chunk,
+                                          dt_analog=min(dt_chunk/10, 1e-6))
+                out.append("── Co-simulación mixta ──")
+                if mr.success:
+                    for nd, arr in sorted(mr.analog_voltages.items()):
+                        if len(arr) > 0: out.append(f"  V({nd}) = {arr[-1]:+.4f} V")
+                    for net, hist in sorted(mr.digital_waveforms.items()):
+                        if hist and not net.startswith("__impl"):
+                            out.append(f"  {net} = {hist[-1][1]}")
+                else:
+                    out.append(f"  ✗ {mr.error}")
+                out.append("")
+
+        if build_errors:
+            out.append("── Advertencias ──")
+            out.extend([f"  ⚠ {e}" for e in build_errors])
+        self.results_text.setPlainText("\n".join(out))
+        self.scene.update()
 
     def _run_simulation_dc(self, silent: bool = False):
         components = []
@@ -1614,6 +2555,17 @@ class MainWindow(QMainWindow):
             n3 = item.node3.strip() if item.node3.strip() else auto_n3
 
             try:
+                # ── Componentes digitales: se ignoran en DC/AC ──────────
+                if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                    # LOGIC_STATE: modelar como fuente de voltaje ideal
+                    if item.comp_type == 'LOGIC_STATE':
+                        std_name = DEFAULT_LOGIC_STANDARD
+                        std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+                        v_out = std.Voh if item.value else std.Vol
+                        out_node = item.node1.strip() or pin_node.get(f"{item.name}__p1", f"ls_{item.name}")
+                        if out_node and out_node not in ('0', 'gnd', 'GND'):
+                            components.append(VoltageSource(item.name, out_node, '0', v_out))
+                    continue
                 if item.comp_type == 'R':
                     if item.value <= 0:
                         errors.append(f"{item.name}: resistencia debe ser > 0")
@@ -1661,8 +2613,56 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
+        # ── Excluir LEDs/Diodos cuyo ánodo es salida exclusiva de puerta digital ──
+        # Esos componentes no tienen driver analógico → matriz singular.
+        # Se evalúan luego con _evaluate_digital_gates.
+        _gate_types_dc = {'AND','OR','NOT','NAND','NOR','XOR','NAND','NOR',
+                          'DFF','JKFF','TFF','SRFF','MUX2','COUNTER'}
+        _dig_out_nodes = set()
+        for _item in self.scene.components:
+            if _item.comp_type in _gate_types_dc:
+                _on = _item.node1.strip() or pin_node.get(f"{_item.name}__p1", "")
+                if _on and _on not in ('0','gnd','GND'):
+                    _dig_out_nodes.add(_on)
+        # Reunir todos los nodos que tienen driver analógico
+        _analog_driver_nodes = set()
+        for _c in components:
+            for _attr in ('n_pos','n_neg','n_p','n_n','n_out','n_in',
+                          'n_base','n_collector','n_emitter',
+                          'n_gate','n_drain','n_source'):
+                _nd = getattr(_c, _attr, None)
+                if _nd and _nd not in ('0','gnd','GND'):
+                    _analog_driver_nodes.add(_nd)
+        # Quitar del netlist analógico los LED/Diodo cuyo ánodo
+        # solo está en nodos de salida digital sin otro driver analógico
+        components = [
+            _c for _c in components
+            if not (
+                getattr(_c, '__class__', None) is not None
+                and _c.__class__.__name__ == 'Diode'
+                and getattr(_c, 'n_p', getattr(_c, 'n_pos', '')) in _dig_out_nodes
+                and getattr(_c, 'n_p', getattr(_c, 'n_pos', '')) not in _analog_driver_nodes
+            )
+        ]
+
         if not components:
-            self.results_text.setPlainText("⚠  No hay componentes en el canvas.")
+            # Solo puertas digitales y LEDs en sus salidas: evaluar directo.
+            # FIX: construir dc_voltages desde los LOGIC_STATE antes de
+            # llamar a _evaluate_digital_gates. Sin esto, el diccionario
+            # llega vacío y todas las entradas se leen como 0 V (LOW).
+            std_name = DEFAULT_LOGIC_STANDARD
+            std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+            _dig_voltages = {}
+            for _it in self.scene.components:
+                if _it.comp_type == 'LOGIC_STATE':
+                    _v = std.Voh if _it.value else std.Vol
+                    _net = _it.node1.strip() or pin_node.get(f"{_it.name}__p1", "")
+                    if _net:
+                        _dig_voltages[_net] = _v
+            self._evaluate_digital_gates(pin_node, _dig_voltages, silent=silent, out=out)
+            if not silent:
+                self.results_text.setPlainText('\n'.join(out))
+            self.scene.update()
             return
 
         # Mostrar netlist extraida antes de simular
@@ -1790,10 +2790,66 @@ class MainWindow(QMainWindow):
             out.append("\n── Advertencias ──")
             out.extend([f"  ⚠ {e}" for e in errors])
 
+        # Evaluar puertas digitales y actualizar LEDs en su salida
+        if result.get('success'):
+            self._evaluate_digital_gates(pin_node, result['voltages'], silent=silent, out=out)
+
         if not silent:
             self.results_text.setPlainText('\n'.join(out))
         self.scene.update()
 
+
+    def _evaluate_digital_gates(self, pin_node, dc_voltages, silent=False, out=None):
+        std_name = DEFAULT_LOGIC_STANDARD
+        std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+        _gmap = {'AND':'AND','OR':'OR','NOT':'NOT','NAND':'NAND','NOR':'NOR','XOR':'XOR'}
+        _funcs = {
+            'AND':  lambda vals: all(vals),
+            'OR':   lambda vals: any(vals),
+            'NAND': lambda vals: not all(vals),
+            'NOR':  lambda vals: not any(vals),
+            'XOR':  lambda vals: bool(sum(vals) % 2),
+            'NOT':  lambda vals: not bool(vals[0]),
+        }
+        gate_items = [it for it in self.scene.components if it.comp_type in _gmap]
+        if not gate_items:
+            return
+        if out is not None and not silent:
+            out.append('\n── Señales digitales ──')
+        for item in gate_items:
+            n_in = max(1, item.dig_inputs)
+            input_logics = []
+            for i in range(n_in):
+                if i == 0:
+                    node = (item.node2.strip()
+                            or pin_node.get(f'{item.name}__p2', ''))
+                elif i == 1:
+                    _n3 = item.node3.strip() if hasattr(item, 'node3') else ''
+                    node = _n3 or pin_node.get(f'{item.name}__p3', '')
+                else:
+                    _extra = getattr(item, 'dig_input_nodes', [])
+                    _manual_extra = _extra[i-2].strip() if len(_extra) > i-2 else ''
+                    node = _manual_extra or pin_node.get(f'{item.name}__p{i+2}', '')
+                if node in ('0', 'gnd', 'GND'):
+                    v = 0.0
+                elif not node:
+                    v = 0.0
+                else:
+                    v = dc_voltages.get(node, 0.0)
+                input_logics.append(1 if v >= std.Vih else 0)
+            y = int(_funcs[item.comp_type](input_logics))
+            out_node = item.node1.strip() or pin_node.get(f'{item.name}__p1', '')
+            v_out = std.Voh if y else std.Vol
+            if out_node and out_node not in ('0', 'gnd', 'GND'):
+                dc_voltages[out_node] = v_out
+            for led in self.scene.components:
+                if led.comp_type == 'LED':
+                    led_anode = led.node1.strip() or pin_node.get(f'{led.name}__p1', '')
+                    if led_anode == out_node:
+                        led.led_on = (v_out > 0.3)
+                        led.update()
+            if out is not None and not silent:
+                out.append(f"  {item.name}_Y = {y}  ({'HIGH' if y else 'LOW'})")
     # ── Panel de propiedades ─────────────────────
     def _run_simulation_ac(self):
         """Análisis AC de frecuencia única con triángulo de potencia."""
@@ -1826,6 +2882,8 @@ class MainWindow(QMainWindow):
             n2 = item.node2.strip() if item.node2.strip() else auto_n2
 
             try:
+                if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                    continue
                 if item.comp_type == 'R':
                     if item.value <= 0:
                         errors.append(f"{item.name}: R debe ser > 0"); continue
@@ -1914,11 +2972,208 @@ class MainWindow(QMainWindow):
         self._last_ac_result = result
         self.btn_power_triangle.setVisible(True)
 
+
+    def _run_simulation_mixed(self):
+        """
+        Simulación mixta analógica-digital.
+        Construye:
+          - Lista de componentes MNA (analógicos)
+          - DigitalSimulator con puertas y flip-flops del canvas
+          - Puentes ADC/DAC desde los bloques ADC_BRIDGE / DAC_BRIDGE
+        Luego lanza MixedSignalInterface.run_iterative() y muestra resultados.
+        """
+        from engine.digital_engine import (
+            DigitalSimulator, Gate, DFF, JKFF, TFF, SRFF,
+            BinaryCounter, MUX,
+        )
+        from engine.bridges import ADC, DAC, ComparatorBridge, PWMBridge
+        from engine.mixed_signal import MixedSignalInterface
+
+        # ── Parámetros de simulación ─────────────────────────────────────
+        t_stop = 1e-3      # 1 ms por defecto
+        dt_chunk = 100e-6  # 100 µs por chunk
+
+        self.results_text.setPlainText("Preparando simulación mixta...")
+        QApplication.processEvents()
+
+        pin_node = self.scene.extract_netlist()
+        analog_comps = []
+        errors = []
+
+        # ── Construir circuito analógico ─────────────────────────────────
+        for item in self.scene.components:
+            if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                continue
+            auto_n1 = pin_node.get(f"{item.name}__p1", f'iso_{item.name}_p')
+            auto_n2 = pin_node.get(f"{item.name}__p2", '0')
+            n1 = item.node1.strip() if item.node1.strip() else auto_n1
+            n2 = item.node2.strip() if item.node2.strip() else auto_n2
+            try:
+                if item.comp_type == 'R' and item.value > 0:
+                    analog_comps.append(Resistor(item.name, n1, n2, item.value))
+                elif item.comp_type == 'V':
+                    analog_comps.append(VoltageSource(item.name, n1, n2, item.value))
+                elif item.comp_type == 'VAC':
+                    analog_comps.append(VoltageSource(item.name, n1, n2, 0.0))
+                elif item.comp_type == 'I':
+                    analog_comps.append(CurrentSource(item.name, n1, n2, item.value))
+                elif item.comp_type == 'C' and item.value > 0:
+                    analog_comps.append(Capacitor(item.name, n1, n2, item.value))
+                elif item.comp_type == 'L' and item.value > 0:
+                    analog_comps.append(Inductor(item.name, n1, n2, item.value))
+            except Exception as e:
+                errors.append(f"{item.name}: {e}")
+
+        if not analog_comps:
+            self.results_text.setPlainText(
+                "⚠  No hay componentes analógicos en el canvas.\n"
+                "Añade al menos una fuente y una resistencia.")
+            return
+
+        # ── Construir circuito digital ────────────────────────────────────
+        dsim = DigitalSimulator()
+        adc_bridges = []
+        dac_bridges = []
+
+        _gate_map = {'AND':'AND','OR':'OR','NOT':'NOT',
+                     'NAND':'NAND','NOR':'NOR','XOR':'XOR'}
+
+        for item in self.scene.components:
+            ct = item.comp_type
+            tpd = item.dig_tpd_ns * 1e-9
+            try:
+                if ct in _gate_map:
+                    n_in = max(1, item.dig_inputs)
+                    ins  = [f'{item.name}_I{i}' for i in range(n_in)]
+                    dsim.add(Gate(item.name, _gate_map[ct], ins,
+                                  f'{item.name}_Y', t_pd=tpd))
+                elif ct == 'DFF':
+                    dsim.add(DFF(item.name,
+                                 d=f'{item.name}_D', clk=item.dig_clk,
+                                 q=f'{item.name}_Q', qn=f'{item.name}_Qn',
+                                 t_pd=tpd))
+                elif ct == 'JKFF':
+                    dsim.add(JKFF(item.name,
+                                  j=f'{item.name}_J', k=f'{item.name}_K',
+                                  clk=item.dig_clk,
+                                  q=f'{item.name}_Q', qn=f'{item.name}_Qn',
+                                  t_pd=tpd))
+                elif ct == 'TFF':
+                    dsim.add(TFF(item.name,
+                                 t_in=f'{item.name}_T', clk=item.dig_clk,
+                                 q=f'{item.name}_Q', qn=f'{item.name}_Qn',
+                                 t_pd=tpd))
+                elif ct == 'SRFF':
+                    dsim.add(SRFF(item.name,
+                                  s=f'{item.name}_S', r=f'{item.name}_R',
+                                  q=f'{item.name}_Q', qn=f'{item.name}_Qn',
+                                  t_pd=tpd))
+                elif ct == 'COUNTER':
+                    dsim.add(BinaryCounter(item.name, n=item.dig_bits,
+                                           clk=item.dig_clk,
+                                           q_prefix=f'{item.name}_Q',
+                                           t_pd=tpd))
+                elif ct == 'MUX2':
+                    dsim.add(MUX(item.name,
+                                 inputs=[f'{item.name}_I0', f'{item.name}_I1'],
+                                 sel=[f'{item.name}_SEL'],
+                                 output=f'{item.name}_Y', t_pd=tpd))
+                elif ct == 'ADC_BRIDGE':
+                    node = item.dig_analog_node or pin_node.get(f"{item.name}__p1", '')
+                    adc  = ADC(item.name, node=node,
+                               bits=item.dig_bits_adc,
+                               vref=item.dig_vref,
+                               clk=item.dig_clk if item.dig_clk else None)
+                    adc_bridges.append(adc)
+                elif ct == 'DAC_BRIDGE':
+                    node = item.dig_analog_node or pin_node.get(f"{item.name}__p1", '')
+                    dac  = DAC(item.name, bits=item.dig_bits_adc,
+                               vref=item.dig_vref, out_node=node,
+                               clk=item.dig_clk if item.dig_clk else None)
+                    dac_bridges.append(dac)
+                elif ct == 'COMPARATOR':
+                    node = item.dig_analog_node or pin_node.get(f"{item.name}__p1", '')
+                    cmp  = ComparatorBridge(item.name, node_pos=node)
+                    adc_bridges.append(cmp)
+                elif ct == 'PWM':
+                    pwm  = PWMBridge(item.name,
+                                     pwm_net=f'{item.name}_IN',
+                                     vmax=item.dig_vref)
+                    dac_bridges.append(pwm)
+            except Exception as e:
+                errors.append(f"{item.name} (digital): {e}")
+
+        # ── Lanzar co-simulación ─────────────────────────────────────────
+        iface = MixedSignalInterface(self.solver, dsim, analog_comps)
+        for adc in adc_bridges:
+            iface.add_adc(adc)
+        for dac in dac_bridges:
+            if hasattr(dac, 'pwm_net'):   # PWMBridge
+                iface.add_pwm(dac)
+            elif hasattr(dac, 'input_nets'):  # DAC
+                iface.add_dac(dac)
+            else:
+                iface.add_comparator(dac)
+
+        result = iface.run_iterative(
+            t_stop=t_stop,
+            dt_chunk=dt_chunk,
+            dt_analog=min(dt_chunk / 10, 1e-6),
+        )
+
+        # ── Mostrar resultados ───────────────────────────────────────────
+        out = ["═══ SIMULACIÓN MIXTA ═══", ""]
+        if not result.success:
+            out.append(f"✗ Error: {result.error}")
+        else:
+            out.append(result.summary())
+            out.append("")
+            out.append("── Voltajes analógicos (valor final) ──")
+            if len(result.t):
+                for node, arr in sorted(result.analog_voltages.items()):
+                    if len(arr):
+                        out.append(f"  V({node}) = {arr[-1]:+.4f} V")
+            if result.digital_waveforms:
+                out.append("")
+                out.append("── Señales digitales (valor final) ──")
+                for net, hist in sorted(result.digital_waveforms.items()):
+                    if hist:
+                        out.append(f"  {net} = {hist[-1][1]}")
+            if result.adc_samples:
+                out.append("")
+                out.append("── Muestras ADC (último código) ──")
+                for name, samples in result.adc_samples.items():
+                    if samples:
+                        out.append(f"  {name}: code={samples[-1][1]}")
+            if result.warnings:
+                out.append("")
+                for w in result.warnings:
+                    out.append(f"  ⚠ {w}")
+
+        if errors:
+            out.append("\n── Errores de construcción ──")
+            out.extend([f"  ✗ {e}" for e in errors])
+
+        self.results_text.setPlainText('\n'.join(out))
+
     def _show_power_triangle(self):
         if not self._last_ac_result:
             return
         dlg = PowerTriangleDialog(self._last_ac_result, parent=self)
         dlg.exec()
+
+    def _on_logic_state_toggled(self, item):
+        """Re-ejecuta la simulación cuando un LOGIC_STATE cambia de estado."""
+        if self._sim_running:
+            self._run_simulation_dc(silent=True)
+        else:
+            # Aunque no esté en modo continuo, actualizar igual (one-shot silencioso)
+            pin_node = self.scene.extract_netlist()
+            std_name = DEFAULT_LOGIC_STANDARD
+            std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+            # Calcular voltaje del estado y actualizar display del prop_table
+            v = std.Voh if item.value else std.Vol
+            self._on_component_selected(item)
 
     def _on_component_selected(self, item):
         self.prop_table.setRowCount(0)
@@ -1940,33 +3195,57 @@ class MainWindow(QMainWindow):
             'PMOS':    ('Drain (D)',         'Source (S)',         'Gate (G)'),
             'OPAMP':   ('Salida (OUT)',      'Entrada − (V−)',     'Entrada + (V+)'),
         }
-        lbl1, lbl2, lbl3 = terminal_labels.get(item.comp_type, ('Nodo +', 'Nodo −', None))
-
         # Nodos automáticos desde cables
-        pin_node  = self.scene.extract_netlist()
-        auto_n1   = pin_node.get(f"{item.name}__p1", '—')
-        auto_n2   = pin_node.get(f"{item.name}__p2", '—')
-        auto_n3   = pin_node.get(f"{item.name}__p3", '—')
-        n1_display = item.node1.strip() or f"{auto_n1} (auto)"
-        n2_display = item.node2.strip() or f"{auto_n2} (auto)"
-        n3_display = item.node3.strip() or f"{auto_n3} (auto)"
+        pin_node = self.scene.extract_netlist()
+
+        def _node_display(manual, auto_key):
+            v = manual.strip() if manual.strip() else pin_node.get(auto_key, '—')
+            return v if manual.strip() else f"{v} (auto)"
 
         rows = [
             ("Tipo",     item.comp_type),
             ("Nombre",   item.name),
             ("Valor",    f"{item.value} {item.unit}"),
             ("Rotación", f"{item._angle}°"),
-            (lbl1,       n1_display),
-            (lbl2,       n2_display),
         ]
-        if lbl3 is not None:
-            rows.append((lbl3, n3_display))
-        if item.comp_type == 'Z':
-            rows.append(("Modo Z", item.z_mode))
-            if item.z_mode == 'rect':
-                rows.append(("Z", f"{item.z_real:.4g} {item.z_imag:+.4g}j Ω"))
-            else:
-                rows.append(("Z", f"{item.z_mag:.4g} ∠{item.z_phase:.2f}° Ω"))
+
+        _dig_gate_types_tbl = {'AND','OR','NOT','NAND','NOR','XOR'}
+        _dig_ff_types_tbl   = {'DFF','JKFF','TFF','SRFF'}
+
+        if item.comp_type in _dig_gate_types_tbl:
+            n_in = item.dig_inputs if item.comp_type != 'NOT' else 1
+            rows.append(("Salida (Y)", _node_display(item.node1, f"{item.name}__p1")))
+            rows.append(("Entrada 1 (A)", _node_display(item.node2, f"{item.name}__p2")))
+            if n_in >= 2:
+                rows.append(("Entrada 2 (B)", _node_display(
+                    item.node3 if hasattr(item,'node3') else '', f"{item.name}__p3")))
+            for i in range(2, n_in):
+                _extra = getattr(item, 'dig_input_nodes', [])
+                _manual = _extra[i-2] if len(_extra) > i-2 else ''
+                rows.append((f"Entrada {i+1}", _node_display(_manual, f"{item.name}__p{i+2}")))
+            rows.append(("Nº entradas", str(n_in)))
+            rows.append(("Retardo tpd", f"{item.dig_tpd_ns} ns"))
+        elif item.comp_type in _dig_ff_types_tbl:
+            rows.append(("Salida Q",    _node_display(item.node1, f"{item.name}__p1")))
+            rows.append(("Dato D / J",  _node_display(item.node2, f"{item.name}__p2")))
+            rows.append(("CLK",         _node_display(
+                item.node3 if hasattr(item,'node3') else '', f"{item.name}__p3")))
+        elif item.comp_type == 'LOGIC_STATE':
+            rows.append(("Salida",  _node_display(item.node1, f"{item.name}__p1")))
+            rows.append(("Estado",  "1 (HIGH)" if item.value else "0 (LOW)"))
+        else:
+            lbl1, lbl2, lbl3 = terminal_labels.get(item.comp_type, ('Nodo +', 'Nodo −', None))
+            rows.append((lbl1, _node_display(item.node1, f"{item.name}__p1")))
+            rows.append((lbl2, _node_display(item.node2, f"{item.name}__p2")))
+            if lbl3 is not None:
+                rows.append((lbl3, _node_display(
+                    item.node3 if hasattr(item,'node3') else '', f"{item.name}__p3")))
+            if item.comp_type == 'Z':
+                rows.append(("Modo Z", item.z_mode))
+                if item.z_mode == 'rect':
+                    rows.append(("Z", f"{item.z_real:.4g} {item.z_imag:+.4g}j Ω"))
+                else:
+                    rows.append(("Z", f"{item.z_mag:.4g} ∠{item.z_phase:.2f}° Ω"))
 
         for label, val in rows:
             r = self.prop_table.rowCount()
@@ -1986,7 +3265,7 @@ class MainWindow(QMainWindow):
             "Circuito demo: divisor de voltaje\n"
             "V1=10V, R1=R2=1kΩ\n\n"
             "Esperado: V(B) = 5.0 V\n\n"
-            "Presiona ▶ SIMULAR DC para verificar.\n\n"
+            "Presiona ▶ SIMULAR AUTO para verificar.\n\n"
             "Tip: doble-click sobre un componente\npara editar sus nodos y valores."
         )
 
@@ -2227,6 +3506,190 @@ class MainWindow(QMainWindow):
 
 
 # ══════════════════════════════════════════════════════════════
+# DIÁLOGO DE CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════
+class SettingsDialog(QDialog):
+    """
+    Ventana de configuración general de la app.
+
+    Está organizada en secciones:
+      • Apariencia → Tema (combo + carpeta de temas externos).
+
+    Pensada para crecer: añadir secciones (Simulación, Atajos, etc.)
+    consiste en agregar nuevos QGroupBox dentro de _build_ui.
+    """
+
+    def __init__(self,
+                 parent=None,
+                 current_theme_id: str = DEFAULT_THEME_ID,
+                 on_theme_change=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configuración")
+        self.setMinimumSize(560, 380)
+        self._current_theme_id = current_theme_id
+        self._on_theme_change  = on_theme_change   # callback(theme_id)
+        self._build_ui()
+
+    # ── Construcción de la UI ──────────────────────────────────────────────
+    def _build_ui(self):
+        from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox,
+                                      QPushButton, QLabel, QComboBox,
+                                      QDialogButtonBox)
+        main = QVBoxLayout(self)
+        main.setSpacing(10)
+
+        # ── Sección: Apariencia / Tema ─────────────────────────────────────
+        gb_theme = QGroupBox("Apariencia")
+        gl = QVBoxLayout(gb_theme)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Tema:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.setMinimumWidth(240)
+        self.theme_combo.setToolTip(
+            "Cambia el esquema de colores de la app.\n"
+            "Se aplica al instante y se recuerda entre sesiones.")
+        self._populate_theme_combo()
+        self.theme_combo.currentIndexChanged.connect(self._on_combo_changed)
+        row1.addWidget(self.theme_combo)
+        row1.addStretch()
+        gl.addLayout(row1)
+
+        # Descripción del tema seleccionado
+        self.theme_desc = QLabel("")
+        self.theme_desc.setWordWrap(True)
+        self.theme_desc.setFont(QFont('Consolas', 9))
+        self.theme_desc.setStyleSheet(f"color: {COLORS['text_dim']};")
+        gl.addWidget(self.theme_desc)
+
+        # Botones para gestionar temas externos
+        row2 = QHBoxLayout()
+        btn_open = QPushButton("📁  Abrir carpeta de temas")
+        btn_open.setToolTip(
+            "Abre la carpeta donde puedes dejar archivos .json\n"
+            "para añadir tus propios temas.")
+        btn_open.clicked.connect(self._open_themes_folder)
+        row2.addWidget(btn_open)
+
+        btn_reload = QPushButton("🔄  Recargar lista")
+        btn_reload.setToolTip(
+            "Vuelve a escanear las carpetas de temas tras añadir\n"
+            "o quitar archivos .json sin reiniciar la app.")
+        btn_reload.clicked.connect(self._reload_themes)
+        row2.addWidget(btn_reload)
+
+        btn_export = QPushButton("💾  Exportar tema actual…")
+        btn_export.setToolTip(
+            "Guarda el tema seleccionado como plantilla .json para\n"
+            "que puedas modificarlo y crear el tuyo.")
+        btn_export.clicked.connect(self._export_current_theme)
+        row2.addWidget(btn_export)
+
+        row2.addStretch()
+        gl.addLayout(row2)
+
+        # Hint informativo
+        hint = QLabel(
+            "Para añadir un tema instalable por separado, deja un archivo .json\n"
+            "con el formato indicado en themes/README.md dentro de la carpeta\n"
+            "y pulsa «Recargar lista» (o reinicia la app)."
+        )
+        hint.setWordWrap(True)
+        hint.setFont(QFont('Consolas', 8))
+        hint.setStyleSheet(f"color: {COLORS['text_dim']};")
+        gl.addWidget(hint)
+
+        main.addWidget(gb_theme)
+        main.addStretch()
+
+        # ── Botón cerrar ───────────────────────────────────────────────────
+        bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bbox.rejected.connect(self.accept)
+        bbox.accepted.connect(self.accept)
+        main.addWidget(bbox)
+
+        # Refresca descripción del tema actual
+        self._refresh_theme_description()
+
+    # ── Lógica del combo ───────────────────────────────────────────────────
+    def _populate_theme_combo(self):
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.clear()
+        for entry in THEME_MANAGER.list_themes():
+            label = entry['name']
+            if entry['source'] != 'builtin':
+                label += '  (externo)'
+            self.theme_combo.addItem(label, entry['id'])
+        idx = self.theme_combo.findData(self._current_theme_id)
+        if idx < 0:
+            idx = 0
+        self.theme_combo.setCurrentIndex(idx)
+        self.theme_combo.blockSignals(False)
+
+    def _on_combo_changed(self, _index: int):
+        tid = self.theme_combo.currentData()
+        if not tid or tid == self._current_theme_id:
+            self._refresh_theme_description()
+            return
+        self._current_theme_id = tid
+        if self._on_theme_change:
+            self._on_theme_change(tid)
+        self._refresh_theme_description()
+
+    def _refresh_theme_description(self):
+        tid  = self.theme_combo.currentData()
+        meta = THEME_MANAGER.get_theme_meta(tid) if tid else None
+        if meta is None:
+            self.theme_desc.setText("")
+            return
+        src = ("Origen: built-in" if meta['source'] == 'builtin'
+               else f"Origen: {meta['source']}")
+        desc = meta.get('description', '')
+        self.theme_desc.setText(f"  {desc}\n  {src}" if desc else f"  {src}")
+
+    # ── Acciones ───────────────────────────────────────────────────────────
+    def _open_themes_folder(self):
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui  import QDesktopServices
+        path = THEME_MANAGER.ensure_user_themes_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _reload_themes(self):
+        THEME_MANAGER.refresh()
+        self._populate_theme_combo()
+        self._refresh_theme_description()
+        QMessageBox.information(
+            self, "Temas recargados",
+            f"Se descubrieron {len(THEME_MANAGER.list_themes())} temas en total."
+        )
+
+    def _export_current_theme(self):
+        tid = self.theme_combo.currentData()
+        if not tid:
+            return
+        meta = THEME_MANAGER.get_theme_meta(tid)
+        suggested = f"{tid}_copia.json"
+        # Sugerir guardar en la carpeta de temas de usuario
+        default_dir = THEME_MANAGER.ensure_user_themes_dir()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar tema como plantilla",
+            os.path.join(default_dir, suggested),
+            "Tema JSON (*.json)")
+        if not path:
+            return
+        ok = THEME_MANAGER.export_theme_template(tid, path)
+        if ok:
+            QMessageBox.information(
+                self, "Tema exportado",
+                f"Plantilla guardada en:\n{path}\n\n"
+                "Edita los colores y pulsa «Recargar lista» para verlo en el selector.")
+        else:
+            QMessageBox.warning(
+                self, "Error",
+                f"No se pudo guardar el archivo:\n{path}")
+
+
+# ══════════════════════════════════════════════════════════════
 # DIÁLOGO TRIÁNGULO DE POTENCIA
 # ══════════════════════════════════════════════════════════════
 class PowerTriangleDialog(QDialog):
@@ -2246,7 +3709,7 @@ class PowerTriangleDialog(QDialog):
     def _build_ui(self):
         from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox,
                                       QDoubleSpinBox, QPushButton, QLabel,
-                                      QTextEdit, QSplitter)
+                                      QTextEdit, QSplitter, QComboBox)
         main = QVBoxLayout(self)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -2267,6 +3730,23 @@ class PowerTriangleDialog(QDialog):
         self.fp_spin.setSingleStep(0.01)
         self.fp_spin.setValue(1.0)
         box_layout.addWidget(self.fp_spin)
+
+        # Selector de tipo de FP resultante
+        box_layout.addSpacing(10)
+        box_layout.addWidget(QLabel("Tipo:"))
+        self.target_combo = QComboBox()
+        # (texto visible, valor enviado al solver)
+        self.target_combo.addItem("Auto (mismo dominio)", 'auto')
+        self.target_combo.addItem("Inductivo (Q > 0)",     'inductive')
+        self.target_combo.addItem("Capacitivo (Q < 0)",    'capacitive')
+        self.target_combo.setToolTip(
+            "Auto: mantiene el dominio actual (capacitivo↔capacitivo,\n"
+            "inductivo↔inductivo).\n"
+            "Inductivo: fuerza un Q resultante positivo (puede cruzar\n"
+            "de capacitivo a inductivo agregando un inductor grande).\n"
+            "Capacitivo: fuerza un Q resultante negativo."
+        )
+        box_layout.addWidget(self.target_combo)
 
         self.correct_btn = QPushButton("Calcular corrección")
         self.correct_btn.clicked.connect(self._on_correct)
@@ -2297,22 +3777,26 @@ class PowerTriangleDialog(QDialog):
 
     def _on_correct(self):
         from engine import MNASolver
-        solver  = MNASolver()
-        total   = self.ac_result['total']
-        freq    = self.ac_result['frequency']
-        fp_tgt  = self.fp_spin.value()
-        res     = solver.correct_power_factor(total, freq, fp_tgt)
+        solver       = MNASolver()
+        total        = self.ac_result['total']
+        freq         = self.ac_result['frequency']
+        fp_tgt       = self.fp_spin.value()
+        target_type  = self.target_combo.currentData() or 'auto'
+        res          = solver.correct_power_factor(
+            total, freq, fp_tgt, target_type=target_type)
 
         if 'error' in res:
             self.corr_label.setText(f"⚠ {res['error']}")
             return
 
-        tipo   = res['type']
-        val    = res['value']
-        Q_corr = res['Q_corr']
-        fp_new = res['fp_new']
-        note   = res.get('note', '')
-        form   = res['formula']
+        tipo        = res['type']
+        val         = res['value']
+        Q_corr      = res['Q_corr']
+        fp_new      = res['fp_new']
+        fp_type_new = res.get('fp_type_new', '')
+        note        = res.get('note', '')
+        form        = res['formula']
+        tt_used     = res.get('target_type', 'auto')
 
         if tipo == 'capacitor':
             val_str = f"C = {val*1e6:.4f} µF  (normalizado a 1 Vrms)"
@@ -2321,12 +3805,17 @@ class PowerTriangleDialog(QDialog):
             val_str = f"L = {val*1e3:.4f} mH  (normalizado a 1 Vrms)"
             emoji   = "🔄 Inductor"
 
+        modo_map = {'auto': 'Auto', 'inductive': 'Inductivo',
+                    'capacitive': 'Capacitivo'}
+        modo_str = modo_map.get(tt_used, tt_used)
+
         text = (
+            f"  Modo objetivo:      {modo_str}\n"
             f"  Elemento corrector: {emoji} en PARALELO\n"
             f"  {val_str}\n"
-            f"  Q a compensar:  {Q_corr:.4f} VAR\n"
-            f"  FP resultante:  {fp_new:.4f}\n"
-            f"  Fórmula:        {form}\n"
+            f"  Q a compensar:      {Q_corr:.4f} VAR\n"
+            f"  FP resultante:      {fp_new:.4f}  ({fp_type_new})\n"
+            f"  Fórmula:            {form}\n"
             f"  📌 {note}"
         )
         self.corr_label.setText(text)
@@ -2420,34 +3909,44 @@ class _PowerTriangleCanvas(QWidget):
 
         # Origen centrado en el widget, ajustado por pan
         ox = int(W * 0.15) + int(self._pan_x)
-        oy = int(H * 0.55) + int(self._pan_y)
-        # Si Q es negativo (capacitivo), el triángulo apunta hacia abajo;
-        # desplazamos el origen hacia arriba para dejar espacio
-        if Q < 0:
+
+        # ── Posicionar oy considerando Q original Y Q corregido ────────────
+        # Si la corrección cruza el dominio (p.ej. capacitivo → inductivo)
+        # necesitamos espacio arriba Y abajo, así que centramos.
+        Q_values = [Q]
+        if self._correction is not None:
+            Q_values.append(self._correction.get('Q_new', Q))
+        has_up   = any(q >  1e-12 for q in Q_values)   # apunta hacia arriba
+        has_down = any(q < -1e-12 for q in Q_values)   # apunta hacia abajo
+
+        if has_up and has_down:
+            # Cruza dominios → centrar verticalmente
+            oy = int(H * 0.5) + int(self._pan_y)
+        elif has_down:
+            # Sólo capacitivo → origen arriba para dejar espacio abajo
             oy = int(H * 0.35) + int(self._pan_y)
         else:
+            # Sólo inductivo (o unitario) → origen abajo para dejar espacio arriba
             oy = int(H * 0.65) + int(self._pan_y)
 
+        # Q>0 inductivo → triángulo hacia ARRIBA (Qy negativo en coords pantalla)
+        # Q<0 capacitivo → triángulo hacia ABAJO  (Qy positivo en coords pantalla)
         Px = int(P * scale)
-        Qy = int(-Q * scale)   # Q positivo → hacia arriba en pantalla
+        Qy = int(-Q * scale)   # signo correcto: Q+ → arriba, Q- → abajo
 
-        # ── Vectores del triángulo ────────────────────────────────────────
-        # P: horizontal (rojo)
-        # Q: vertical   (azul, arriba si inductivo)
-        # S: hipotenusa (verde)
-
-        pen_P = QPen(QColor('#e74c3c'), 3)   # rojo — potencia activa
-        pen_Q = QPen(QColor('#3498db'), 3)   # azul — potencia reactiva
-        pen_S = QPen(QColor('#2ecc71'), 3)   # verde — potencia aparente
-        pen_c = QPen(QColor('#f39c12'), 2, Qt.PenStyle.DashLine)  # naranja corrección
+        pen_P   = QPen(QColor('#e74c3c'), 3)   # rojo  — P activa
+        pen_Q   = QPen(QColor('#3498db'), 3)   # azul  — Q reactiva
+        pen_S   = QPen(QColor('#2ecc71'), 3)   # verde — S aparente
+        pen_ax  = QPen(QColor('#444466'), 1)   # gris  — ejes
+        pen_c   = QPen(QColor('#f39c12'), 2, Qt.PenStyle.DashLine)
 
         font_lbl = QFont('Consolas', 9, QFont.Weight.Bold)
+        font_ax  = QFont('Consolas', 8)
         painter.setFont(font_lbl)
 
         def arrow(painter, pen, x1, y1, x2, y2, label='', lside='end'):
             painter.setPen(pen)
             painter.drawLine(x1, y1, x2, y2)
-            # Punta de flecha
             dx = x2 - x1; dy = y2 - y1
             L  = math.sqrt(dx*dx + dy*dy)
             if L < 1: return
@@ -2470,11 +3969,32 @@ class _PowerTriangleCanvas(QWidget):
                     mx = (x1+x2)//2; my = (y1+y2)//2
                     painter.drawText(mx+6, my-4, label)
 
+        # ── Ejes de referencia ────────────────────────────────────────────
+        ax_len = max(abs(Px), abs(Qy), 60) + 50
+        painter.setFont(font_ax)
+
+        # Eje X (potencia activa — positiva a la derecha)
+        arrow(painter, pen_ax, ox - 20, oy, ox + ax_len, oy, '', 'end')
+        painter.setPen(QPen(QColor('#666688'), 1))
+        painter.drawText(ox + ax_len + 4, oy + 4, "P (W)")
+
+        # Eje Y (potencia reactiva — positiva hacia arriba = Q inductivo)
+        arrow(painter, pen_ax, ox, oy + 20, ox, oy - ax_len, '', 'end')
+        painter.drawText(ox + 4, oy - ax_len - 4, "Q+ inductivo")
+        painter.drawText(ox + 4, oy + 28, "Q− capacitivo")
+
+        # Línea punteada guía en Q− (zona capacitiva)
+        painter.setPen(QPen(QColor('#333355'), 1, Qt.PenStyle.DotLine))
+        painter.drawLine(ox, oy, ox, oy + ax_len)
+
+        painter.setFont(font_lbl)
+
+        # ── Triángulo ─────────────────────────────────────────────────────
         # P (horizontal)
         arrow(painter, pen_P, ox, oy, ox + Px, oy,
               f"P = {P:.2f} W", 'end')
 
-        # Q (vertical desde punta de P)
+        # Q (vertical desde punta de P — arriba si inductivo, abajo si capacitivo)
         arrow(painter, pen_Q, ox + Px, oy, ox + Px, oy + Qy,
               f"Q = {Q:.2f} VAR", 'end')
 
@@ -2482,21 +4002,28 @@ class _PowerTriangleCanvas(QWidget):
         arrow(painter, pen_S, ox, oy, ox + Px, oy + Qy,
               f"S = {S:.4f} VA", 'mid')
 
-        # Ángulo φ
-        phi = math.acos(min(abs(fp), 1.0)) * 180 / math.pi
+        # Ángulo φ — signo correcto usando atan2 con Q real
+        phi_rad = math.atan2(Q, P)            # positivo inductivo, negativo capacitivo
+        phi_deg = math.degrees(phi_rad)
         painter.setPen(QPen(QColor('#f1c40f'), 1))
         r_arc = 40
-        start_angle = 0
-        span_angle  = int(-math.degrees(math.atan2(Q, P)) * 16) if S > 1e-12 else 0
+        # Qt drawArc: 0° = 3 o'clock, span positivo = anti-horario (visualmente hacia ARRIBA),
+        # span negativo = horario (visualmente hacia ABAJO).
+        # Como phi_deg > 0 cuando Q es inductivo (vector hacia arriba) y phi_deg < 0
+        # cuando es capacitivo (vector hacia abajo), pasamos phi_deg directamente
+        # para que el arco siga la dirección real del vector Q.
+        start_qt  = 0
+        span_qt   = int(phi_deg * 16)
         painter.drawArc(ox - r_arc, oy - r_arc, 2*r_arc, 2*r_arc,
-                        start_angle * 16, span_angle)
-        painter.setPen(QPen(QColor('#f1c40f'), 1))
-        painter.drawText(ox + r_arc + 4, oy - 6,
-                         f"φ = {phi:.1f}°  fp={fp:.3f}  ({self.total.get('fp_type','')})")
+                        start_qt * 16, span_qt)
+        # Etiqueta del ángulo (encima si Q+ inductivo, debajo si Q− capacitivo)
+        label_y = oy - 14 if Q >= 0 else oy + 22
+        painter.drawText(ox + r_arc + 4, label_y,
+                         f"φ = {phi_deg:+.1f}°  fp={fp:.3f}  ({self.total.get('fp_type','')})")
 
-        # Corrección de FP (si existe)
+        # Corrección de FP
         if self._correction:
-            Q_new = self._correction.get('Q_new', Q)
+            Q_new  = self._correction.get('Q_new', Q)
             Qy_new = int(-Q_new * scale)
             arrow(painter, pen_c, ox, oy, ox + Px, oy + Qy_new,
                   f"S' (fp={self._correction['fp_new']:.3f})", 'mid')

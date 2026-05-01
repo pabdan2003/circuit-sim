@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .env
 venv/
+
+# Claude Code (worktrees, sesiones, configuración local de la herramienta)
+.claude/

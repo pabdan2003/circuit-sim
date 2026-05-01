@@ -1,0 +1,24 @@
+{
+  "name": "Solarized Dark",
+  "description": "Tema externo de ejemplo basado en la paleta Solarized de Ethan Schoonover. Cópialo y modifícalo para crear el tuyo.",
+  "colors": {
+    "bg":         "#002b36",
+    "grid":       "#073642",
+    "grid_line":  "#0c4452",
+    "component":  "#cb4b16",
+    "comp_body":  "#073642",
+    "comp_sel":   "#b58900",
+    "wire":       "#2aa198",
+    "wire_sel":   "#b58900",
+    "node_dot":   "#2aa198",
+    "text":       "#eee8d5",
+    "text_dim":   "#586e75",
+    "pin":        "#2aa198",
+    "gnd":        "#6c71c4",
+    "toolbar":    "#073642",
+    "panel":      "#073642",
+    "panel_brd":  "#0c4452",
+    "voltage":    "#b58900",
+    "current":    "#2aa198"
+  }
+}
