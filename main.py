@@ -1712,8 +1712,11 @@ class CircuitScene(QGraphicsScene):
                         name: str = '', value: float = 0.0, unit: str = '',
                         node1: str = '', node2: str = '', node3: str = '') -> ComponentItem:
         if not name:
-            count = self._comp_counter.get(comp_type, 0) + 1
-            self._comp_counter[comp_type] = count
+            # NET_LABEL_IN y NET_LABEL_OUT comparten prefijo "NL" → mismo contador
+            # para evitar colisiones de nombre (NL1 vs NL1) que rompen Union-Find.
+            counter_key = 'NET_LABEL' if comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') else comp_type
+            count = self._comp_counter.get(counter_key, 0) + 1
+            self._comp_counter[counter_key] = count
             prefixes = {'R': 'R', 'V': 'V', 'I': 'I', 'C': 'C', 'L': 'L',
                         'GND': 'GND', 'NODE': 'N', 'LOGIC_STATE': 'LS',
                         'AND': 'AND', 'OR': 'OR', 'NOT': 'NOT', 'NAND': 'NAND',
@@ -2563,6 +2566,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self.solver = MNASolver()
         self._sim_running = False
+        self._sim_all_comps = None
+        self._sim_pin_node = None
         # Timer para simulación continua (actualiza LEDs y canvas en vivo)
         from PyQt6.QtCore import QTimer
         self._sim_timer = QTimer(self)
@@ -2582,13 +2587,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.tabCloseRequested.connect(self._close_sheet)
         self.tab_widget.currentChanged.connect(self._on_sheet_changed)
 
-        # Botón "+" para agregar hojas
-        add_btn = QPushButton("+")
-        add_btn.setFixedSize(24, 24)
-        add_btn.setToolTip("Agregar nueva hoja")
-        add_btn.clicked.connect(lambda: self._add_sheet())
-        self.tab_widget.setCornerWidget(add_btn, Qt.Corner.TopRightCorner)
-
+        # El botón para agregar hojas vive en la toolbar principal (+ Hoja)
         # Doble-click en la pestaña para renombrar
         self.tab_widget.tabBarDoubleClicked.connect(self._rename_sheet)
 
@@ -2754,6 +2753,7 @@ class MainWindow(QMainWindow):
             ("Guardar como…",   "Ctrl+Shift+S",    self._save_circuit_as),
             ("Exportar SPICE",  "Ctrl+E",          self._export_spice),
             ("|", None, None),
+            ("+ Hoja",       "Ctrl+T", lambda: self._add_sheet()),
             ("Limpiar",      "Ctrl+L", self._clear_circuit),
             ("Zoom +",       "Ctrl+=", lambda: self.view.scale(1.2, 1.2)),
             ("Zoom −",       "Ctrl+-", lambda: self.view.scale(1/1.2, 1/1.2)),
@@ -3054,24 +3054,26 @@ class MainWindow(QMainWindow):
 
         return all_components, merged_pin_node
 
+    def _get_sim_context(self):
+        """Retorna (all_comps, pin_node) considerando net labels multi-hoja."""
+        has_net_labels = any(
+            comp.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT')
+            for sheet in self._sheets
+            for comp in sheet['scene'].components
+        )
+        if has_net_labels or len(self._sheets) > 1:
+            return self._merge_all_sheets()
+        return list(self.scene.components), self.scene.extract_netlist()
+
     def _toggle_simulation(self, checked: bool):
         """Analiza el circuito y despacha automáticamente al solver correcto."""
         if not checked:
             self._stop_simulation()
             return
 
-        # Usar merge siempre que haya net labels (NET_LABEL_IN/OUT),
-        # ya sea en una sola hoja o en varias — actúan como nodos inalámbricos.
-        has_net_labels = any(
-            comp.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT')
-            for sheet in self._sheets
-            for comp in sheet['scene'].components
-        )
-        if has_net_labels:
-            all_comps, pin_node = self._merge_all_sheets()
-        else:
-            pin_node = self.scene.extract_netlist()
-            all_comps = self.scene.components
+        all_comps, pin_node = self._get_sim_context()
+        self._sim_all_comps = all_comps
+        self._sim_pin_node = pin_node
 
         std_name = DEFAULT_LOGIC_STANDARD
         analyzer = CircuitAnalyzer(logic_standard=std_name)
@@ -3110,19 +3112,25 @@ class MainWindow(QMainWindow):
                 "Añade componentes al canvas y conéctalos a tierra.")
 
     def _stop_simulation(self):
-        """Detiene la simulación y apaga todos los LEDs."""
+        """Detiene la simulación y apaga todos los LEDs en todas las hojas."""
         self._sim_running = False
         self._sim_timer.stop()
+        self._sim_all_comps = None
+        self._sim_pin_node = None
         self.run_btn.setChecked(False)
         self.run_btn.setText("▶  SIMULAR AUTO")
-        for item in self.scene.components:
-            if item.comp_type == 'LED':
-                item.led_on = False
-                item.update()
+        for sheet in self._sheets:
+            for item in sheet['scene'].components:
+                if item.comp_type == 'LED':
+                    item.led_on = False
+                    item.update()
 
     def _tick_simulation(self):
         """Llamado por QTimer: re-corre DC silenciosamente para actualizar LEDs."""
         if self._sim_running:
+            all_comps, pin_node = self._get_sim_context()
+            self._sim_all_comps = all_comps
+            self._sim_pin_node = pin_node
             self._run_simulation_dc(silent=True)
 
     def _run_simulation(self):
@@ -3140,14 +3148,14 @@ class MainWindow(QMainWindow):
         import cmath as _cmath
 
         if pin_node is None:
-            pin_node = self.scene.extract_netlist()
+            pin_node = getattr(self, '_sim_pin_node', None) or self.scene.extract_netlist()
         if flags is None:
+            sim_comps_for_flags = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
             std_name = DEFAULT_LOGIC_STANDARD
             analyzer = CircuitAnalyzer(logic_standard=std_name)
-            flags = analyzer.analyze(self.scene.components, pin_node)
+            flags = analyzer.analyze(sim_comps_for_flags, pin_node)
 
-        # Use all components from active sheet for simulation
-        sim_components = self.scene.components
+        sim_components = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
 
         std_name = DEFAULT_LOGIC_STANDARD
         out = ["═══ SIMULACIÓN AUTOMÁTICA ═══", f"  {flags.summary()}", ""]
@@ -3158,6 +3166,8 @@ class MainWindow(QMainWindow):
         analog_comps, build_errors = [], []
         for item in sim_components:
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                continue
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT', 'GND', 'NODE'):
                 continue
             try:
                 analog_comps.extend(build_engine_components_for_item(item, pin_node))
@@ -3177,21 +3187,17 @@ class MainWindow(QMainWindow):
                     out.append(""); out.append("── Corrientes DC ──")
                     for name, i in dc["branch_currents"].items():
                         out.append(f"  I({name}) = {i*1000:+.4f} mA")
-                for item in self.scene.components:
+                for item in sim_components:
                     n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", "")
                     n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
                     item.result_voltage = dc["voltages"].get(n1)
                     if item.comp_type == "LED":
                         item.led_on = False
                         op = dc.get("operating_points", {}).get(item.name, {})
-                        # Criterio: corriente directa > 0.1 mA (LED ya emite luz visible).
-                        # Caída (Vd) por sí sola NO basta — un Si sin corriente apreciable
-                        # también muestra Vd≈0.5V por la exponencial del modelo Shockley.
                         Id_op = op.get("Id", op.get("id")) if op else None
                         if Id_op is not None:
-                            item.led_on = float(Id_op) > 1e-4    # 0.1 mA
+                            item.led_on = float(Id_op) > 1e-4
                         else:
-                            # Fallback: comparar caída con Vf nominal del color
                             v_a = dc["voltages"].get(n1, 0)
                             v_k = dc["voltages"].get(n2, 0)
                             vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
@@ -3311,10 +3317,15 @@ class MainWindow(QMainWindow):
         components = []
         errors = []
 
-        # Extraer nodos automaticos desde los cables del canvas
-        pin_node = self.scene.extract_netlist()
+        # Usar contexto multi-hoja si disponible (net labels / múltiples hojas)
+        sim_comps = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
+        pin_node = getattr(self, '_sim_pin_node', None) or self.scene.extract_netlist()
 
-        for item in self.scene.components:
+        for item in sim_comps:
+            # Net labels y nodos auxiliares no generan componentes de engine
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT', 'GND', 'NODE'):
+                continue
+
             # Prioridad: nodo manual del usuario > nodo extraido automaticamente
             auto_n1 = pin_node.get(f"{item.name}__p1", f'iso_{item.name}_p')
             auto_n2 = pin_node.get(f"{item.name}__p2", '0')
@@ -3358,7 +3369,7 @@ class MainWindow(QMainWindow):
         _gate_types_dc = {'AND','OR','NOT','NAND','NOR','XOR','NAND','NOR',
                           'DFF','JKFF','TFF','SRFF','MUX2','COUNTER'}
         _dig_out_nodes = set()
-        for _item in self.scene.components:
+        for _item in sim_comps:
             if _item.comp_type in _gate_types_dc:
                 _on = _item.node1.strip() or pin_node.get(f"{_item.name}__p1", "")
                 if _on and _on not in ('0','gnd','GND'):
@@ -3392,22 +3403,23 @@ class MainWindow(QMainWindow):
             std_name = DEFAULT_LOGIC_STANDARD
             std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
             _dig_voltages = {}
-            for _it in self.scene.components:
+            for _it in sim_comps:
                 if _it.comp_type == 'LOGIC_STATE':
                     _v = std.Voh if _it.value else std.Vol
                     _net = _it.node1.strip() or pin_node.get(f"{_it.name}__p1", "")
                     if _net:
                         _dig_voltages[_net] = _v
-            self._evaluate_digital_gates(pin_node, _dig_voltages, silent=silent, out=out)
+            self._evaluate_digital_gates(pin_node, _dig_voltages, silent=silent, out=out, sim_comps=sim_comps)
             if not silent:
                 self.results_text.setPlainText('\n'.join(out))
-            self.scene.update()
+            for sheet in self._sheets:
+                sheet['scene'].update()
             return
 
         # Mostrar netlist extraida antes de simular
         if not silent:
             out_pre = ["═══ NETLIST EXTRAIDA ═══"]
-            for item in self.scene.components:
+            for item in sim_comps:
                 if item.comp_type in ('GND', 'NODE'):
                     continue
                 auto_n1 = pin_node.get(f"{item.name}__p1", '?')
@@ -3470,7 +3482,7 @@ class MainWindow(QMainWindow):
                     out.append(f"  I({comp.name}) = {comp.I_val*1000:+.4f} mA  |  P = {abs(p):.4f} W")
 
             # Actualizar canvas con voltajes y estado LED
-            for item in self.scene.components:
+            for item in sim_comps:
                 auto_n1 = pin_node.get(f"{item.name}__p1", '')
                 auto_n2 = pin_node.get(f"{item.name}__p2", '0')
                 n1 = item.node1.strip() if item.node1.strip() else auto_n1
@@ -3479,15 +3491,8 @@ class MainWindow(QMainWindow):
                     item.result_voltage = result['voltages'][n1]
                 else:
                     item.result_voltage = None
-                # Encender/apagar LED según corriente que atraviesa el diodo
                 if item.comp_type == 'LED':
                     led_on = False
-                    # Método 1: corriente del operating point (autoritativo).
-                    # Umbral 0.1 mA — por debajo el LED no es visible.
-                    # IMPORTANTE: si el operating point existe, su veredicto
-                    # es FINAL.  No caer al método de voltaje porque la caída
-                    # Vd se queda cerca de Vf incluso con corrientes de µA
-                    # (curva exponencial del diodo) → daría falsos positivos.
                     op = result.get('operating_points', {}).get(item.name, {})
                     id_ = None
                     if op:
@@ -3495,8 +3500,6 @@ class MainWindow(QMainWindow):
                     if id_ is not None:
                         led_on = float(id_) > 1e-4
                     else:
-                        # Sólo si NO hay info de corriente: comparar caída
-                        # con Vf nominal del color (peor pero único disponible).
                         v_a = result['voltages'].get(n1, None)
                         v_k = result['voltages'].get(n2, None)
                         if v_a is not None and v_k is not None:
@@ -3510,7 +3513,7 @@ class MainWindow(QMainWindow):
                     item.scene().update(item.mapToScene(item.boundingRect()).boundingRect())
 
             # Debug LED — mostrar info de nodos y voltajes del LED
-            led_items = [it for it in self.scene.components if it.comp_type == 'LED']
+            led_items = [it for it in sim_comps if it.comp_type == 'LED']
             if led_items:
                 out.append("\n── Debug LED ──")
                 for it in led_items:
@@ -3538,14 +3541,15 @@ class MainWindow(QMainWindow):
 
         # Evaluar puertas digitales y actualizar LEDs en su salida
         if result.get('success'):
-            self._evaluate_digital_gates(pin_node, result['voltages'], silent=silent, out=out)
+            self._evaluate_digital_gates(pin_node, result['voltages'], silent=silent, out=out, sim_comps=sim_comps)
 
         if not silent:
             self.results_text.setPlainText('\n'.join(out))
-        self.scene.update()
+        for sheet in self._sheets:
+            sheet['scene'].update()
 
 
-    def _evaluate_digital_gates(self, pin_node, dc_voltages, silent=False, out=None):
+    def _evaluate_digital_gates(self, pin_node, dc_voltages, silent=False, out=None, sim_comps=None):
         std_name = DEFAULT_LOGIC_STANDARD
         std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
         _gmap = {'AND':'AND','OR':'OR','NOT':'NOT','NAND':'NAND','NOR':'NOR','XOR':'XOR'}
@@ -3557,7 +3561,8 @@ class MainWindow(QMainWindow):
             'XOR':  lambda vals: bool(sum(vals) % 2),
             'NOT':  lambda vals: not bool(vals[0]),
         }
-        gate_items = [it for it in self.scene.components if it.comp_type in _gmap]
+        _all = sim_comps if sim_comps is not None else list(self.scene.components)
+        gate_items = [it for it in _all if it.comp_type in _gmap]
         if not gate_items:
             return
         if out is not None and not silent:
@@ -3588,7 +3593,7 @@ class MainWindow(QMainWindow):
             v_out = std.Voh if y else std.Vol
             if out_node and out_node not in ('0', 'gnd', 'GND'):
                 dc_voltages[out_node] = v_out
-            for led in self.scene.components:
+            for led in _all:
                 if led.comp_type == 'LED':
                     led_anode = led.node1.strip() or pin_node.get(f'{led.name}__p1', '')
                     if led_anode == out_node:
@@ -3601,8 +3606,12 @@ class MainWindow(QMainWindow):
         """Análisis AC de frecuencia única con triángulo de potencia."""
         from PyQt6.QtWidgets import QInputDialog
 
+        # Usar contexto multi-hoja si disponible
+        sim_comps = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
+        pin_node = getattr(self, '_sim_pin_node', None) or self.scene.extract_netlist()
+
         # Buscar fuente VAC en el canvas para leer la frecuencia
-        vac_items = [it for it in self.scene.components if it.comp_type == 'VAC']
+        vac_items = [it for it in sim_comps if it.comp_type == 'VAC']
         if not vac_items:
             self.results_text.setPlainText(
                 "⚠  No hay fuentes VAC en el circuito.\n"
@@ -3619,9 +3628,10 @@ class MainWindow(QMainWindow):
 
         components = []
         errors     = []
-        pin_node   = self.scene.extract_netlist()
 
-        for item in self.scene.components:
+        for item in sim_comps:
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT', 'GND', 'NODE'):
+                continue
             auto_n1 = pin_node.get(f"{item.name}__p1", f'iso_{item.name}_p')
             auto_n2 = pin_node.get(f"{item.name}__p2", '0')
             n1 = item.node1.strip() if item.node1.strip() else auto_n1
@@ -3726,13 +3736,16 @@ class MainWindow(QMainWindow):
         self.results_text.setPlainText("Preparando simulación mixta...")
         QApplication.processEvents()
 
-        pin_node = self.scene.extract_netlist()
+        sim_all = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
+        pin_node = getattr(self, '_sim_pin_node', None) or self.scene.extract_netlist()
         analog_comps = []
         errors = []
 
         # ── Construir circuito analógico ─────────────────────────────────
-        for item in self.scene.components:
+        for item in sim_all:
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                continue
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT', 'GND', 'NODE'):
                 continue
             auto_n1 = pin_node.get(f"{item.name}__p1", f'iso_{item.name}_p')
             auto_n2 = pin_node.get(f"{item.name}__p2", '0')
@@ -3763,7 +3776,7 @@ class MainWindow(QMainWindow):
         _gate_map = {'AND':'AND','OR':'OR','NOT':'NOT',
                      'NAND':'NAND','NOR':'NOR','XOR':'XOR'}
 
-        for item in self.scene.components:
+        for item in sim_all:
             ct = item.comp_type
             tpd = item.dig_tpd_ns * 1e-9
             try:
