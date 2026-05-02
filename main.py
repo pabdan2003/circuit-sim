@@ -100,11 +100,15 @@ class ComponentItem(QGraphicsItem):
                   'DFF', 'JKFF', 'TFF', 'SRFF',
                   'MUX2', 'COUNTER',
                   'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM',
+                  'CLK',
                   # ── Inter-hoja ──
                   'NET_LABEL_IN', 'NET_LABEL_OUT']
 
     # Tipos analógicos con 4 terminales (necesitan p3 y p4)
     FOUR_PIN_TYPES = {'XFMR', 'BRIDGE'}
+
+    # Tipos de flip-flop con SET/RESET (4 inputs lógicos + Q,Qn)
+    FLIPFLOP_TYPES = {'DFF', 'JKFF', 'TFF', 'SRFF'}
 
     # Tipos que pertenecen al dominio digital (no se pasan al MNA)
     DIGITAL_TYPES = {
@@ -112,7 +116,7 @@ class ComponentItem(QGraphicsItem):
         'DFF', 'JKFF', 'TFF', 'SRFF',
         'MUX2', 'COUNTER',
         'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM',
-        'LOGIC_STATE',
+        'LOGIC_STATE', 'CLK',
     }
 
     def __init__(self, comp_type: str, name: str, value: float = 0.0,
@@ -173,6 +177,16 @@ class ComponentItem(QGraphicsItem):
         # Etiqueta de net label inalámbrico
         self.sheet_label: str = ''
 
+        # ── CLK (reloj digital) ─────────────────────────────────────────────
+        # Si está corriendo (oscilando), el timer global lo conmuta a la frecuencia
+        # configurada; en caso contrario se comporta como un LOGIC_STATE manual.
+        self.clk_running: bool = False
+
+        # ── Estado de memoria de flip-flops ─────────────────────────────────
+        # Refleja la salida Q actual del FF (0 ó 1) para visualizarla
+        # con un círculo en el centro durante la simulación.
+        self.dig_q_state: int = 0
+
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -198,6 +212,12 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
             # Tamaño similar a GND. Flecha de 30 px y etiqueta encima.
             return QRectF(-18, -16, 36, 28)
+        # Flip-flops: cuerpo + cables horizontales + pines SET/RESET arriba/abajo
+        if self.comp_type in self.FLIPFLOP_TYPES:
+            hw_f = COMP_W // 2
+            hh_f = COMP_H // 2 + 8
+            return QRectF(-hw_f - 14, -hh_f - 18,
+                          (hw_f + 14) * 2, (hh_f + 18) * 2)
         # Puertas: bounding rect dinámico según altura real
         if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                                'COMPARATOR', 'PWM', 'MUX2'):
@@ -258,6 +278,9 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'LOGIC_STATE':
             hw2 = COMP_W // 2
             return QPointF(hw2 + 10, 0), QPointF(hw2 + 10, 0)  # p1=salida, p2=dummy
+        if self.comp_type == 'CLK':
+            hw2 = COMP_W // 2
+            return QPointF(hw2 + 10, 0), QPointF(hw2 + 10, 0)  # p1=salida, p2=dummy
         if self.comp_type == 'NET_LABEL_IN':
             # Pin en la CABEZA de la flecha (lado derecho): ─►●
             return QPointF(15, 0), QPointF(15, 0)
@@ -311,19 +334,44 @@ class ComponentItem(QGraphicsItem):
         return self.mapToScene(self.pin3_position())
 
     def pin4_position(self) -> QPointF:
-        """Cuarto pin (sólo XFMR y BRIDGE).
+        """Cuarto pin.
 
-          XFMR    → SEC− (inferior derecho)
-          BRIDGE  → DC−  (inferior)
+          XFMR        → SEC− (inferior derecho)
+          BRIDGE      → DC−  (inferior)
+          DFF/JKFF/TFF/SRFF → SET (parte superior, arriba del centro)
         """
         if self.comp_type == 'XFMR':
             return QPointF(50, 25)
         if self.comp_type == 'BRIDGE':
             return QPointF(0, 50)
+        if self.comp_type in self.FLIPFLOP_TYPES:
+            hh_f = COMP_H // 2 + 8
+            return QPointF(0, -hh_f - 10)
         return QPointF(0, 0)
 
     def pin4_position_scene(self) -> QPointF:
         return self.mapToScene(self.pin4_position())
+
+    def pin5_position(self) -> QPointF:
+        """Quinto pin (sólo flip-flops): RESET en la parte inferior."""
+        if self.comp_type in self.FLIPFLOP_TYPES:
+            hh_f = COMP_H // 2 + 8
+            return QPointF(0, hh_f + 10)
+        return QPointF(0, 0)
+
+    def pin5_position_scene(self) -> QPointF:
+        return self.mapToScene(self.pin5_position())
+
+    def pin6_position(self) -> QPointF:
+        """Sexto pin (sólo flip-flops): salida complementada Q̄ (derecha-abajo)."""
+        if self.comp_type in self.FLIPFLOP_TYPES:
+            hw_f = COMP_W // 2
+            hh_f = COMP_H // 2 + 8
+            return QPointF(hw_f + 10, hh_f // 2)
+        return QPointF(0, 0)
+
+    def pin6_position_scene(self) -> QPointF:
+        return self.mapToScene(self.pin6_position())
 
     def all_pin_positions_scene(self) -> list:
         """Retorna todos los pines activos del componente en coordenadas de escena."""
@@ -337,7 +385,12 @@ class ComponentItem(QGraphicsItem):
             ys = self._gate_pin_ys()
             for y in ys[1:]:   # primer pin ya incluido como p2
                 pins.append(self.mapToScene(QPointF(-gw - 10, y)))
-        elif self.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF', 'MUX2'):
+        elif self.comp_type in self.FLIPFLOP_TYPES:
+            pins.append(self.pin3_position_scene())  # CLK / 2da entrada
+            pins.append(self.pin4_position_scene())  # SET
+            pins.append(self.pin5_position_scene())  # RESET
+            pins.append(self.pin6_position_scene())  # Q̄
+        elif self.comp_type == 'MUX2':
             pins.append(self.pin3_position_scene())
         elif self.comp_type in self.FOUR_PIN_TYPES:
             pins.append(self.pin3_position_scene())
@@ -390,9 +443,16 @@ class ComponentItem(QGraphicsItem):
         # ── Digital ──────────────────────────────────────────────────────
         elif self.comp_type in ('AND', 'NAND', 'OR', 'NOR', 'XOR', 'NOT'):
             self._draw_ansi_gate(painter, pen_body, pen_wire, body_color)
-        elif self.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF'):
-            lbl = {'DFF':'D-FF','JKFF':'JK-FF','TFF':'T-FF','SRFF':'SR-FF'}[self.comp_type]
-            self._draw_digital_ff(painter, pen_body, pen_wire, body_color, lbl)
+        elif self.comp_type == 'DFF':
+            self._draw_flipflop(painter, pen_body, pen_wire, body_color, 'DFF')
+        elif self.comp_type == 'JKFF':
+            self._draw_flipflop(painter, pen_body, pen_wire, body_color, 'JKFF')
+        elif self.comp_type == 'TFF':
+            self._draw_flipflop(painter, pen_body, pen_wire, body_color, 'TFF')
+        elif self.comp_type == 'SRFF':
+            self._draw_flipflop(painter, pen_body, pen_wire, body_color, 'SRFF')
+        elif self.comp_type == 'CLK':
+            self._draw_clk(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'ADC_BRIDGE':
             self._draw_adc_dac(painter, pen_body, pen_wire, body_color, is_adc=True)
         elif self.comp_type == 'DAC_BRIDGE':
@@ -416,7 +476,8 @@ class ComponentItem(QGraphicsItem):
         # Pines — los dispositivos de 3 terminales dibujan sus propios pines
         # internamente con etiquetas; solo dibujar pines genéricos para el resto
         three_terminal = ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP',
-                          'NET_LABEL_IN', 'NET_LABEL_OUT')
+                          'NET_LABEL_IN', 'NET_LABEL_OUT',
+                          'DFF', 'JKFF', 'TFF', 'SRFF')
         if self.comp_type not in three_terminal:
             for pin in self.pin_positions():
                 painter.setPen(pen_pin)
@@ -1183,45 +1244,161 @@ class ComponentItem(QGraphicsItem):
             painter.drawEllipse(QPointF(-hw - 10, y), PIN_RADIUS, PIN_RADIUS)
         painter.drawEllipse(QPointF(hw + 10, 0), PIN_RADIUS, PIN_RADIUS)
 
-    def _draw_digital_ff(self, painter, pen_body, pen_wire, body_color, label: str):
-        """Flip-flop: caja con D/CLK a la izquierda, Q/Qn a la derecha."""
-        hw, hh = COMP_W // 2, COMP_H // 2 + 8
+    def _draw_flipflop(self, painter, pen_body, pen_wire, body_color, ff_type: str):
+        """Flip-flop con etiquetas específicas por tipo, SET/RESET y círculo de memoria.
+
+        Layout común:
+            - Cuerpo rectangular con título (DFF / JKFF / TFF / SRFF)
+            - p1 = Q       (derecha-arriba)
+            - p2 = Entrada principal (izquierda-arriba): D / J / T / S
+            - p3 = Entrada secundaria (izquierda-abajo): CLK / K / R
+            - p4 = SET     (arriba)
+            - p5 = RESET   (abajo)
+            - Qn dibujada como salida derecha-abajo (sin pin externo)
+            - Círculo central muestra el estado actual de Q (dig_q_state)
+        """
+        hw, hh = COMP_W // 2, COMP_H // 2 + 8       # 30, 23
+        # ── Cuerpo ────────────────────────────────────────────────────────
         painter.setPen(pen_body)
         painter.setBrush(QBrush(body_color))
         painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
-        # Etiqueta
+
+        # ── Etiqueta del tipo (parte superior) ────────────────────────────
+        title = {'DFF': 'D-FF', 'JKFF': 'JK-FF',
+                 'TFF': 'T-FF', 'SRFF': 'SR-FF'}[ff_type]
         painter.setPen(QPen(QColor(COLORS['component']), 2))
         font = QFont('Consolas', 7, QFont.Weight.Bold)
         painter.setFont(font)
-        painter.drawText(QRectF(-hw, -hh, hw * 2, 14),
-                         Qt.AlignmentFlag.AlignCenter, label)
-        # Pines izquierda: D (arriba), CLK (abajo)
+        painter.drawText(QRectF(-hw, -hh + 1, hw * 2, 11),
+                         Qt.AlignmentFlag.AlignCenter, title)
+
+        # ── Pines izquierda (entrada principal arriba, secundaria abajo) ──
         painter.setPen(pen_wire)
         painter.drawLine(QPointF(-hw - 10, -hh // 2), QPointF(-hw, -hh // 2))
         painter.drawLine(QPointF(-hw - 10,  hh // 2), QPointF(-hw,  hh // 2))
-        # Pines derecha: Q (arriba), Qn (abajo)
+        # Pines derecha (Q arriba, Qn abajo)
         painter.drawLine(QPointF(hw, -hh // 2), QPointF(hw + 10, -hh // 2))
         painter.drawLine(QPointF(hw,  hh // 2), QPointF(hw + 10,  hh // 2))
-        # Símbolo de reloj (triángulo)
-        painter.setPen(QPen(QColor(COLORS['component']), 1))
-        cy = hh // 2
-        painter.drawLine(QPointF(-hw, cy - 5), QPointF(-hw + 6, cy))
-        painter.drawLine(QPointF(-hw + 6, cy), QPointF(-hw, cy + 5))
-        # Etiquetas de pines
+        # Pines verticales: SET arriba, RESET abajo
+        painter.drawLine(QPointF(0, -hh), QPointF(0, -hh - 10))
+        painter.drawLine(QPointF(0,  hh), QPointF(0,  hh + 10))
+
+        # ── Símbolo de reloj (triángulo) en el pin de CLK ─────────────────
+        # SRFF y JKFF no tienen CLK como pin físico (SRFF asíncrono;
+        # JKFF usa el net global dig_clk).
+        if ff_type in ('DFF', 'TFF'):
+            painter.setPen(QPen(QColor(COLORS['component']), 1.5))
+            cy = hh // 2
+            painter.drawLine(QPointF(-hw, cy - 5), QPointF(-hw + 6, cy))
+            painter.drawLine(QPointF(-hw + 6, cy), QPointF(-hw, cy + 5))
+
+        # ── Etiquetas de pin internas ─────────────────────────────────────
+        labels = {
+            'DFF':  ('D',  'CLK'),
+            'JKFF': ('J',  'K'),     # K en lugar de CLK como secundaria
+            'TFF':  ('T',  'CLK'),
+            'SRFF': ('S',  'R'),
+        }[ff_type]
+        # Para JKFF, la entrada CLK aparece etiquetada también: el flip-flop JK
+        # usa j/k/clk pero solo tenemos 2 pines de entrada laterales. Convención:
+        # p2 = J (arriba), p3 = K (abajo); CLK se asume en el net p3 también
+        # (la simulación lo enruta vía dig_clk como nombre de net global).
         font2 = QFont('Consolas', 6)
         painter.setFont(font2)
         painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
-        painter.drawText(QRectF(-hw + 2, -hh // 2 - 8, 14, 10), Qt.AlignmentFlag.AlignLeft, 'D')
-        painter.drawText(QRectF(-hw + 8, hh // 2 - 8, 20, 10), Qt.AlignmentFlag.AlignLeft, 'CLK')
-        painter.drawText(QRectF(hw - 14, -hh // 2 - 8, 14, 10), Qt.AlignmentFlag.AlignRight, 'Q')
-        painter.drawText(QRectF(hw - 14, hh // 2 - 8, 18, 10), Qt.AlignmentFlag.AlignRight, 'Q̄')
-        # Puntos de pin
+        painter.drawText(QRectF(-hw + 2, -hh // 2 - 8, 18, 10),
+                         Qt.AlignmentFlag.AlignLeft, labels[0])
+        painter.drawText(QRectF(-hw + 2,  hh // 2 - 8, 22, 10),
+                         Qt.AlignmentFlag.AlignLeft, labels[1])
+        painter.drawText(QRectF(hw - 14, -hh // 2 - 8, 14, 10),
+                         Qt.AlignmentFlag.AlignRight, 'Q')
+        painter.drawText(QRectF(hw - 14,  hh // 2 - 8, 18, 10),
+                         Qt.AlignmentFlag.AlignRight, 'Q̄')
+        # Etiquetas SET / RESET (encima/debajo del cuerpo, junto a sus pines)
+        painter.drawText(QRectF(2, -hh - 12, 28, 10),
+                         Qt.AlignmentFlag.AlignLeft, 'S')
+        painter.drawText(QRectF(2,  hh + 2, 28, 10),
+                         Qt.AlignmentFlag.AlignLeft, 'R')
+
+        # ── Círculo central de memoria ────────────────────────────────────
+        # Verde brillante = Q vale 1, gris oscuro = Q vale 0.
+        q = 1 if int(getattr(self, 'dig_q_state', 0)) else 0
+        mem_r = 7
+        mem_color = QColor('#27ae60') if q else QColor(COLORS['comp_body']).darker(125)
+        mem_border = QColor(COLORS['component'])
+        painter.setPen(QPen(mem_border, 1.5))
+        painter.setBrush(QBrush(mem_color))
+        painter.drawEllipse(QPointF(0, 1), mem_r, mem_r)
+        # Dígito interno (1 ó 0) en blanco
+        painter.setPen(QPen(QColor('white' if q else '#7f8c8d'), 1))
+        font_q = QFont('Consolas', 8, QFont.Weight.Bold)
+        painter.setFont(font_q)
+        painter.drawText(QRectF(-mem_r, 1 - mem_r, mem_r * 2, mem_r * 2),
+                         Qt.AlignmentFlag.AlignCenter, str(q))
+
+        # ── Puntos de pin ─────────────────────────────────────────────────
         pin_color = QColor(COLORS['pin'])
+        painter.setPen(QPen(pin_color, 2))
+        painter.setBrush(QBrush(pin_color))
         for px, py in [(-hw - 10, -hh // 2), (-hw - 10, hh // 2),
-                       (hw + 10, -hh // 2), (hw + 10, hh // 2)]:
-            painter.setPen(QPen(pin_color, 2))
-            painter.setBrush(QBrush(pin_color))
+                       (hw + 10, -hh // 2), (hw + 10, hh // 2),
+                       (0, -hh - 10), (0, hh + 10)]:
             painter.drawEllipse(QPointF(px, py), PIN_RADIUS, PIN_RADIUS)
+
+    def _draw_clk(self, painter, pen_body, pen_wire, body_color):
+        """Reloj digital: cuadrado con onda cuadrada y dígito 0/1 grande.
+
+        Doble-click: conmuta manualmente (como LOGIC_STATE).
+        Ctrl+K (con el componente seleccionado): activa/desactiva oscilación
+        automática a la frecuencia configurada en Herramientas → Frecuencia CLK.
+        """
+        hw = COMP_W // 2
+        hh = COMP_H // 2
+        state = int(self.value) & 1
+
+        # Color de fondo según estado y modo
+        if self.clk_running:
+            col_off = QColor('#2980b9')   # azul (oscilando, parte LOW)
+            col_on  = QColor('#3498db')
+        else:
+            col_off = QColor('#7f8c8d')   # gris (manual, parte LOW)
+            col_on  = QColor('#bdc3c7')
+        fill = col_on if state else col_off
+
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(fill))
+        painter.drawRoundedRect(QRectF(-hw, -hh, hw * 2, hh * 2), 4, 4)
+
+        # Onda cuadrada como icono central (esquina superior izquierda)
+        painter.setPen(QPen(QColor('white'), 1.5))
+        wx0 = -hw + 4
+        wy0 = -hh + 4
+        wave_h = 8
+        path = QPainterPath()
+        path.moveTo(wx0,        wy0 + wave_h)
+        path.lineTo(wx0 + 4,    wy0 + wave_h)
+        path.lineTo(wx0 + 4,    wy0)
+        path.lineTo(wx0 + 10,   wy0)
+        path.lineTo(wx0 + 10,   wy0 + wave_h)
+        path.lineTo(wx0 + 16,   wy0 + wave_h)
+        path.lineTo(wx0 + 16,   wy0)
+        path.lineTo(wx0 + 22,   wy0)
+        painter.drawPath(path)
+
+        # Dígito grande del estado
+        font_big = QFont('Consolas', 18, QFont.Weight.Bold)
+        painter.setFont(font_big)
+        painter.setPen(QPen(QColor('white'), 2))
+        painter.drawText(QRectF(-hw, -hh + 4, hw * 2, hh * 2),
+                         Qt.AlignmentFlag.AlignCenter, str(state))
+
+        # Pin de salida (derecha)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        pin_color = QColor(COLORS['pin'])
+        painter.setPen(QPen(pin_color, 2))
+        painter.setBrush(QBrush(pin_color))
+        painter.drawEllipse(QPointF(hw + 10, 0), PIN_RADIUS, PIN_RADIUS)
 
     def _draw_adc_dac(self, painter, pen_body, pen_wire, body_color, is_adc: bool):
         """Bloque ADC o DAC con flecha de conversión y datos de configuración."""
@@ -1686,8 +1863,11 @@ class CircuitScene(QGraphicsScene):
             prefixes = {'R': 'R', 'V': 'V', 'I': 'I', 'C': 'C', 'L': 'L',
                         'GND': 'GND', 'NODE': 'N', 'LOGIC_STATE': 'LS',
                         'AND': 'AND', 'OR': 'OR', 'NOT': 'NOT', 'NAND': 'NAND',
-                        'NOR': 'NOR', 'XOR': 'XOR', 'DFF': 'FF', 'JKFF': 'FF',
-                        'TFF': 'FF', 'SRFF': 'FF', 'COUNTER': 'CNT', 'MUX2': 'MUX',
+                        'NOR': 'NOR', 'XOR': 'XOR',
+                        'DFF': 'DFF', 'JKFF': 'JKFF',
+                        'TFF': 'TFF', 'SRFF': 'SRFF',
+                        'COUNTER': 'CNT', 'MUX2': 'MUX',
+                        'CLK': 'CLK',
                         'NET_LABEL_IN': 'NL', 'NET_LABEL_OUT': 'NL'}
             name = f"{prefixes.get(comp_type, comp_type)}{count}"
 
@@ -1705,11 +1885,12 @@ class CircuitScene(QGraphicsScene):
                     'D': 1e-14, 'LED': 0.0, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
                     'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5,
                     'XFMR': 1.0, 'BRIDGE': 0.7,
-                    'LOGIC_STATE': 0.0,
+                    'LOGIC_STATE': 0.0, 'CLK': 0.0,
                     'NET_LABEL_IN': 0.0, 'NET_LABEL_OUT': 0.0}
-        if value == 0.0 and comp_type not in ('LOGIC_STATE', 'NET_LABEL_IN', 'NET_LABEL_OUT'):
+        _stateful = ('LOGIC_STATE', 'CLK', 'NET_LABEL_IN', 'NET_LABEL_OUT')
+        if value == 0.0 and comp_type not in _stateful:
             value = defaults.get(comp_type, 1.0)
-        elif comp_type in ('LOGIC_STATE', 'NET_LABEL_IN', 'NET_LABEL_OUT'):
+        elif comp_type in _stateful:
             value = defaults.get(comp_type, 0.0)
 
         item = ComponentItem(comp_type, name, value, unit, node1, node2, node3)
@@ -1803,6 +1984,14 @@ class CircuitScene(QGraphicsScene):
                     item.update()
                     self.logic_state_toggled.emit(item)
                     return
+                if item.comp_type == 'CLK':
+                    # Doble-click conmuta manualmente y detiene la oscilación
+                    # automática (entra en modo manual como un LOGIC_STATE).
+                    item.clk_running = False
+                    item.value = 0.0 if item.value else 1.0
+                    item.update()
+                    self.logic_state_toggled.emit(item)
+                    return
                 self._edit_component(item)
                 return
         super().mouseDoubleClickEvent(event)
@@ -1847,7 +2036,12 @@ class CircuitScene(QGraphicsScene):
             # Registrar pin3 para dispositivos de 3 terminales
             if comp.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP'):
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
-            elif comp.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF', 'MUX2'):
+            elif comp.comp_type in ComponentItem.FLIPFLOP_TYPES:
+                pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+                pins[f"{comp.name}__p4"] = comp.pin4_position_scene()  # SET
+                pins[f"{comp.name}__p5"] = comp.pin5_position_scene()  # RESET
+                pins[f"{comp.name}__p6"] = comp.pin6_position_scene()  # Q̄
+            elif comp.comp_type == 'MUX2':
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
             elif comp.comp_type in ComponentItem.FOUR_PIN_TYPES:
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
@@ -2539,9 +2733,122 @@ class MainWindow(QMainWindow):
         self._sim_timer = QTimer(self)
         self._sim_timer.setInterval(200)   # ms entre actualizaciones
         self._sim_timer.timeout.connect(self._tick_simulation)
+
+        # ── Reloj global para componentes CLK ──────────────────────────────
+        # Cada CLK con clk_running=True conmuta su valor cada medio período
+        # de _clk_freq_hz. La frecuencia es ajustable desde Herramientas.
+        self._clk_freq_hz: float = 1.0
+        self._clk_timer = QTimer(self)
+        self._clk_timer.timeout.connect(self._tick_clk)
+        self._update_clk_timer_interval()
+
         self._build_ui()
         self._apply_style()
         self._load_demo_circuit()
+
+    # ── CLK (oscilador global) ────────────────────────────────────────────
+    def _update_clk_timer_interval(self):
+        """Configura el intervalo del timer según _clk_freq_hz.
+        Half-period en ms: 1/(2f) * 1000.  Mínimo 10 ms para no saturar la GUI.
+        """
+        f = max(0.001, float(self._clk_freq_hz))
+        half_period_ms = max(10, int(1000.0 / (2.0 * f)))
+        self._clk_timer.setInterval(half_period_ms)
+
+    def _tick_clk(self):
+        """Conmuta los CLK que están en modo automático."""
+        any_active = False
+        for sheet in self._sheets:
+            for it in sheet['scene'].components:
+                if it.comp_type == 'CLK' and it.clk_running:
+                    it.value = 0.0 if it.value else 1.0
+                    it.update()
+                    any_active = True
+        if not any_active:
+            self._clk_timer.stop()
+            return
+        # Re-disparar simulación en vivo si está activa
+        if self._sim_running:
+            self._run_simulation_dc(silent=True)
+
+    def _toggle_clk_running(self):
+        """Atajo Ctrl+K: invierte el estado oscilando de los CLK seleccionados.
+        Si no hay ninguno seleccionado, conmuta todos los CLK del canvas.
+        """
+        sel = [it for it in self.scene.selectedItems()
+               if isinstance(it, ComponentItem) and it.comp_type == 'CLK']
+        targets = sel if sel else [
+            it for it in self.scene.components if it.comp_type == 'CLK']
+        if not targets:
+            self.statusBar().showMessage(
+                "No hay componentes CLK en la hoja activa.")
+            return
+        # Si al menos uno está corriendo, los detenemos todos. Si ninguno
+        # corre, los iniciamos todos.
+        any_running = any(it.clk_running for it in targets)
+        for it in targets:
+            it.clk_running = not any_running
+            it.update()
+        # Iniciar/parar el timer global
+        any_running_now = any(
+            it.clk_running for sheet in self._sheets
+            for it in sheet['scene'].components if it.comp_type == 'CLK')
+        if any_running_now:
+            self._update_clk_timer_interval()
+            self._clk_timer.start()
+            self.statusBar().showMessage(
+                f"CLK activado a {self._clk_freq_hz:g} Hz "
+                f"({len(targets)} componente{'s' if len(targets)!=1 else ''})")
+        else:
+            self._clk_timer.stop()
+            self.statusBar().showMessage("CLK detenido.")
+
+    def _set_clk_frequency(self):
+        """Diálogo Herramientas → Frecuencia CLK."""
+        from PyQt6.QtWidgets import QInputDialog
+        f, ok = QInputDialog.getDouble(
+            self, "Frecuencia CLK",
+            "Frecuencia de oscilación del componente CLK (Hz):",
+            self._clk_freq_hz, 0.01, 100000.0, 3)
+        if not ok:
+            return
+        self._clk_freq_hz = f
+        self._update_clk_timer_interval()
+        self.statusBar().showMessage(f"Frecuencia CLK = {f:g} Hz")
+
+    def _open_circuit_analyzer(self):
+        """Abre el analizador de circuitos digitales (multi-pestaña)."""
+        dlg = CircuitAnalyzerDialog(parent=self)
+        dlg.exec()
+
+    def _build_tools_button(self):
+        """Construye el QToolButton 'Herramientas' con menú desplegable.
+        Aparece justo después del botón '+ Hoja' en la toolbar principal.
+        """
+        from PyQt6.QtWidgets import QToolButton, QMenu
+        btn = QToolButton(self)
+        btn.setText("Herramientas")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        menu = QMenu(btn)
+        act_freq = QAction("Frecuencia CLK…", self)
+        act_freq.triggered.connect(self._set_clk_frequency)
+        menu.addAction(act_freq)
+        act_analyze = QAction("Analizar Circuito…", self)
+        act_analyze.triggered.connect(self._open_circuit_analyzer)
+        menu.addAction(act_analyze)
+        btn.setMenu(menu)
+        # Mostrar el menú también al pasar el cursor (hover)
+        btn.installEventFilter(self)
+        self._tools_button = btn
+        return btn
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if (getattr(self, '_tools_button', None) is obj
+                and event.type() == QEvent.Type.Enter):
+            obj.showMenu()
+        return super().eventFilter(obj, event)
 
     # ── Construcción UI ──────────────────────────
     def _build_ui(self):
@@ -2720,6 +3027,7 @@ class MainWindow(QMainWindow):
             ("Exportar SPICE",  "Ctrl+E",          self._export_spice),
             ("|", None, None),
             ("+ Hoja",       "Ctrl+T", lambda: self._add_sheet()),
+            ("__TOOLS__", None, None),                    # placeholder Herramientas
             ("Limpiar",      "Ctrl+L", self._clear_circuit),
             ("Zoom +",       "Ctrl+=", lambda: self.view.scale(1.2, 1.2)),
             ("Zoom −",       "Ctrl+-", lambda: self.view.scale(1/1.2, 1/1.2)),
@@ -2729,11 +3037,20 @@ class MainWindow(QMainWindow):
             if name == '|':
                 tb.addSeparator()
                 continue
+            if name == '__TOOLS__':
+                tb.addWidget(self._build_tools_button())
+                continue
             act = QAction(name, self)
             if shortcut:
                 act.setShortcut(shortcut)
             act.triggered.connect(fn)
             tb.addAction(act)
+
+        # ── Atajo global Ctrl+K para conmutar oscilación de CLK ──────────
+        clk_act = QAction("Toggle CLK", self)
+        clk_act.setShortcut("Ctrl+K")
+        clk_act.triggered.connect(self._toggle_clk_running)
+        self.addAction(clk_act)
 
         # ── Botón Configuración (alineado a la derecha) ──────────────────
         tb.addSeparator()
@@ -2836,6 +3153,7 @@ class MainWindow(QMainWindow):
                 ('COMPARATOR','Comparador',     'CMP'),
                 ('PWM',       'Salida PWM',     '⊓⊓'),
                 ('LOGIC_STATE','Estado Lógico',  '0/1'),
+                ('CLK',       'Reloj (CLK)',    '⏲'),
             ]),
         ]
 
@@ -3304,8 +3622,8 @@ class MainWindow(QMainWindow):
             try:
                 # ── Componentes digitales: se ignoran en DC/AC ──────────
                 if item.comp_type in ComponentItem.DIGITAL_TYPES:
-                    # LOGIC_STATE: modelar como fuente de voltaje ideal
-                    if item.comp_type == 'LOGIC_STATE':
+                    # LOGIC_STATE / CLK: modelar como fuente de voltaje ideal
+                    if item.comp_type in ('LOGIC_STATE', 'CLK'):
                         std_name = DEFAULT_LOGIC_STANDARD
                         std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
                         v_out = std.Voh if item.value else std.Vol
@@ -3370,11 +3688,12 @@ class MainWindow(QMainWindow):
             std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
             _dig_voltages = {}
             for _it in sim_comps:
-                if _it.comp_type == 'LOGIC_STATE':
+                if _it.comp_type in ('LOGIC_STATE', 'CLK'):
                     _v = std.Voh if _it.value else std.Vol
                     _net = _it.node1.strip() or pin_node.get(f"{_it.name}__p1", "")
                     if _net:
                         _dig_voltages[_net] = _v
+            out = ["═══ SIMULACIÓN DIGITAL ═══", ""]
             self._evaluate_digital_gates(pin_node, _dig_voltages, silent=silent, out=out, sim_comps=sim_comps)
             if not silent:
                 self.results_text.setPlainText('\n'.join(out))
@@ -3529,9 +3848,7 @@ class MainWindow(QMainWindow):
         }
         _all = sim_comps if sim_comps is not None else list(self.scene.components)
         gate_items = [it for it in _all if it.comp_type in _gmap]
-        if not gate_items:
-            return
-        if out is not None and not silent:
+        if gate_items and out is not None and not silent:
             out.append('\n── Señales digitales ──')
         for item in gate_items:
             n_in = max(1, item.dig_inputs)
@@ -3567,6 +3884,86 @@ class MainWindow(QMainWindow):
                         led.update()
             if out is not None and not silent:
                 out.append(f"  {item.name}_Y = {y}  ({'HIGH' if y else 'LOW'})")
+
+        # ── Evaluación de flip-flops (DFF/JKFF/TFF/SRFF) ─────────────────
+        # Lectura de niveles desde dc_voltages, prioridad SET/RESET asíncronos,
+        # y actualización del círculo de memoria (dig_q_state).
+        ff_items = [it for it in _all
+                    if it.comp_type in ComponentItem.FLIPFLOP_TYPES]
+        if ff_items and out is not None and not silent:
+            out.append('\n── Flip-flops ──')
+
+        def _logic_at(node: str) -> int:
+            if not node or node in ('0', 'gnd', 'GND'):
+                return 0
+            return 1 if dc_voltages.get(node, 0.0) >= std.Vih else 0
+
+        for item in ff_items:
+            # Resolver nodos de cada pin: manual > automático.
+            n_q   = item.node1.strip() or pin_node.get(f'{item.name}__p1', '')
+            n_in1 = item.node2.strip() or pin_node.get(f'{item.name}__p2', '')
+            n_in2 = (item.node3.strip() if hasattr(item, 'node3') else '') \
+                    or pin_node.get(f'{item.name}__p3', '')
+            n_set = pin_node.get(f'{item.name}__p4', '')
+            n_rst = pin_node.get(f'{item.name}__p5', '')
+
+            # Persistir último valor de CLK por flip-flop para detectar flancos.
+            last_clk = getattr(item, '_last_clk_seen', 0)
+            q_prev   = int(getattr(item, 'dig_q_state', 0))
+            q_new    = q_prev
+
+            set_active = bool(_logic_at(n_set))
+            rst_active = bool(_logic_at(n_rst))
+
+            if rst_active:
+                q_new = 0
+            elif set_active:
+                q_new = 1
+            elif item.comp_type == 'SRFF':
+                # Asíncrono: S=p2, R=p3
+                S = _logic_at(n_in1)
+                R = _logic_at(n_in2)
+                if S and R:    q_new = 0    # estado prohibido → 0
+                elif S:        q_new = 1
+                elif R:        q_new = 0
+            else:
+                # Síncrono por flanco de subida.
+                # DFF/TFF: CLK está en p3 (entrada secundaria)
+                # JKFF: J=p2, K=p3, CLK = item.dig_clk (net global)
+                if item.comp_type == 'JKFF':
+                    clk_now = _logic_at(item.dig_clk)
+                else:
+                    clk_now = _logic_at(n_in2)
+                if clk_now == 1 and last_clk == 0:
+                    if item.comp_type == 'DFF':
+                        q_new = _logic_at(n_in1)
+                    elif item.comp_type == 'TFF':
+                        if _logic_at(n_in1):
+                            q_new = 1 - q_prev
+                    elif item.comp_type == 'JKFF':
+                        J = _logic_at(n_in1)
+                        K = _logic_at(n_in2)
+                        if   J == 0 and K == 0: pass
+                        elif J == 0 and K == 1: q_new = 0
+                        elif J == 1 and K == 0: q_new = 1
+                        else:                   q_new = 1 - q_prev
+                item._last_clk_seen = clk_now
+
+            item.dig_q_state = q_new
+
+            # Propagar Q y Q̄ a sus nodos para que la cadena digital los vea
+            if n_q and n_q not in ('0', 'gnd', 'GND'):
+                dc_voltages[n_q] = std.Voh if q_new else std.Vol
+            n_qn = pin_node.get(f'{item.name}__p6', '')
+            if n_qn and n_qn not in ('0', 'gnd', 'GND'):
+                dc_voltages[n_qn] = std.Voh if (1 - q_new) else std.Vol
+
+            # Repintar el componente para reflejar el círculo de memoria
+            item.update()
+
+            if out is not None and not silent:
+                out.append(f"  {item.name}.Q = {q_new}")
+
     # ── Panel de propiedades ─────────────────────
     def _run_simulation_ac(self):
         """Análisis AC de frecuencia única con triángulo de potencia."""
@@ -4088,6 +4485,8 @@ class MainWindow(QMainWindow):
                 entry['node4'] = item.node4
             if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
                 entry['sheet_label'] = item.sheet_label
+            if item.comp_type == 'CLK':
+                entry['clk_running'] = item.clk_running
             sheet_data['components'].append(entry)
 
         for wire in scene.wires:
@@ -4135,6 +4534,8 @@ class MainWindow(QMainWindow):
                 item.node4 = c['node4']
             if c['type'] in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
                 item.sheet_label = c.get('sheet_label', item.name)
+            if c['type'] == 'CLK':
+                item.clk_running = bool(c.get('clk_running', False))
 
         for w in sheet_data.get('wires', []):
             wire = WireItem(QPointF(w['x1'], w['y1']), QPointF(w['x2'], w['y2']))
@@ -4836,6 +5237,544 @@ class _PowerTriangleCanvas(QWidget):
             painter.setPen(QPen(QColor('#f39c12'), 1))
             painter.drawText(ox + Px + 8, (oy + Qy + oy + Qy_new)//2,
                              f"ΔQ={abs(Q-Q_new):.2f} VAR")
+
+
+# ══════════════════════════════════════════════════════════════
+# ANALIZADOR DE CIRCUITOS DIGITALES
+# ══════════════════════════════════════════════════════════════
+# Quine-McCluskey con soporte de don't cares: implementación independiente
+# y ligera (sin dependencias externas).  Se utiliza desde el diálogo
+# CircuitAnalyzerDialog para reducir tablas de verdad a SOP / POS mínimas.
+
+def _qm_combine(a: str, b: str):
+    """Combina dos cubos si difieren en exactamente 1 bit; retorna el cubo
+    fusionado (con '-' en la posición que difería) o None."""
+    if len(a) != len(b):
+        return None
+    diff = 0
+    out = []
+    for x, y in zip(a, b):
+        if x != y:
+            diff += 1
+            if diff > 1:
+                return None
+            out.append('-')
+        else:
+            out.append(x)
+    return ''.join(out) if diff == 1 else None
+
+
+def _qm_prime_implicants(terms, num_vars: int):
+    """Quine-McCluskey: encuentra todos los implicantes primos del conjunto
+    de términos (mintérminos + don't cares).  Cada cubo es un string binario
+    de longitud num_vars con caracteres en {'0','1','-'}."""
+    if not terms:
+        return []
+    cubes = {format(t, f'0{num_vars}b') for t in terms}
+    primes = set()
+    while cubes:
+        groups = {}
+        for c in cubes:
+            ones = c.replace('-', '').count('1')
+            groups.setdefault(ones, []).append(c)
+        used = set()
+        next_cubes = set()
+        keys = sorted(groups)
+        for i in range(len(keys) - 1):
+            for a in groups[keys[i]]:
+                for b in groups[keys[i + 1]]:
+                    combined = _qm_combine(a, b)
+                    if combined is not None:
+                        used.add(a); used.add(b)
+                        next_cubes.add(combined)
+        for c in cubes:
+            if c not in used:
+                primes.add(c)
+        cubes = next_cubes
+    return list(primes)
+
+
+def _qm_covers(prime: str, term: int, num_vars: int) -> bool:
+    bin_t = format(term, f'0{num_vars}b')
+    return all(p == '-' or p == m for p, m in zip(prime, bin_t))
+
+
+def _qm_minimum_cover(primes, must_cover, num_vars: int):
+    """Cobertura mínima de must_cover usando los primes disponibles.
+    Algoritmo: implicantes esenciales primero, luego greedy para el resto."""
+    if not must_cover:
+        return []
+    coverage = {p: {m for m in must_cover if _qm_covers(p, m, num_vars)}
+                for p in primes}
+    selected, remaining = set(), set(must_cover)
+    while remaining:
+        # Esenciales: mintérminos cubiertos por solo un implicante primo
+        essential_added = False
+        for m in list(remaining):
+            covers_m = [p for p in primes if m in coverage[p]]
+            if len(covers_m) == 1:
+                p = covers_m[0]
+                if p not in selected:
+                    selected.add(p)
+                    essential_added = True
+                remaining -= coverage[p]
+        if remaining and not essential_added:
+            # Greedy: el prime que cubra más mintérminos restantes
+            best, best_n = None, -1
+            for p in primes:
+                n = len(coverage[p] & remaining)
+                if n > best_n:
+                    best, best_n = p, n
+            if best is None or best_n <= 0:
+                break
+            selected.add(best)
+            remaining -= coverage[best]
+    return list(selected)
+
+
+def _prime_to_sop_term(prime: str, var_names) -> str:
+    parts = []
+    for bit, name in zip(prime, var_names):
+        if bit == '0':
+            parts.append(f"{name}'")
+        elif bit == '1':
+            parts.append(name)
+    return ''.join(parts) if parts else '1'
+
+
+def _prime_to_pos_term(prime: str, var_names) -> str:
+    """Para POS, los implicantes representan los maxtérminos del original;
+    la conversión invierte cada literal porque corresponde al complemento."""
+    parts = []
+    for bit, name in zip(prime, var_names):
+        if bit == '0':
+            parts.append(name)
+        elif bit == '1':
+            parts.append(f"{name}'")
+    if not parts:
+        return '0'
+    return '(' + ' + '.join(parts) + ')'
+
+
+def simplify_sop(minterms, dont_cares, var_names):
+    n = len(var_names)
+    if not minterms:
+        return '0'
+    if len(set(minterms) | set(dont_cares)) >= 2 ** n and len(minterms) == 2 ** n:
+        return '1'
+    primes = _qm_prime_implicants(list(set(minterms) | set(dont_cares)), n)
+    cover  = _qm_minimum_cover(primes, list(minterms), n)
+    if not cover:
+        return '0'
+    return ' + '.join(_prime_to_sop_term(p, var_names) for p in cover)
+
+
+def simplify_pos(minterms, dont_cares, var_names):
+    n = len(var_names)
+    all_idx = set(range(2 ** n))
+    maxterms = sorted(all_idx - set(minterms) - set(dont_cares))
+    if not maxterms:
+        return '1'
+    if len(maxterms) == 2 ** n:
+        return '0'
+    primes = _qm_prime_implicants(list(set(maxterms) | set(dont_cares)), n)
+    cover  = _qm_minimum_cover(primes, list(maxterms), n)
+    if not cover:
+        return '1'
+    return ' · '.join(_prime_to_pos_term(p, var_names) for p in cover)
+
+
+class CircuitAnalyzerDialog(QDialog):
+    """Analizador de circuitos digitales.
+
+    Pestañas:
+      1. Entradas / Salidas — definir variables del circuito.
+      2. Tabla de verdad    — llenar con 0/1/X; reduce filas todo-X.
+      3. Ecuaciones         — SOP / POS minimizados; botón futuro
+                              "Armar circuito automáticamente".
+      4. Mapa de Karnaugh   — placeholder para una futura implementación
+                              que también permita ingresar K-maps y
+                              obtener SOP/POS.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Analizar Circuito Digital")
+        self.resize(820, 580)
+
+        # Estado del modelo
+        self.var_inputs:  list = ['A', 'B']
+        self.var_outputs: list = ['Y']
+        # truth_data[(out_name, row_index)] = '0' | '1' | 'X'
+        self.truth_data: dict = {}
+        self._last_simplification: dict = {}   # {output_name: {'sop':..., 'pos':...}}
+
+        self._build_ui()
+
+    # ── UI principal ──────────────────────────────────────────────────────
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_io_tab(),    "Entradas y Salidas")
+        self.tabs.addTab(self._build_truth_tab(), "Tabla de Verdad")
+        self.tabs.addTab(self._build_eqs_tab(),   "Ecuaciones simplificadas")
+        self.tabs.addTab(self._build_kmap_tab(),  "Mapa de Karnaugh")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        layout.addWidget(self.tabs)
+
+        # Botón cerrar
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    # ── Pestaña 1: I/O ────────────────────────────────────────────────────
+    def _build_io_tab(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+
+        def col(title, list_widget, edit_widget, btn_add, btn_rm):
+            box = QGroupBox(title)
+            v = QVBoxLayout(box)
+            v.addWidget(list_widget)
+            v.addWidget(edit_widget)
+            row = QHBoxLayout()
+            row.addWidget(btn_add); row.addWidget(btn_rm)
+            v.addLayout(row)
+            return box
+
+        # Entradas
+        self.inputs_list = QListWidget()
+        self.inputs_list.addItems(self.var_inputs)
+        self.in_edit  = QLineEdit(); self.in_edit.setPlaceholderText("Ej: A, B, EN")
+        btn_add_in = QPushButton("Añadir entrada")
+        btn_rm_in  = QPushButton("Quitar seleccionada")
+        btn_add_in.clicked.connect(self._add_input)
+        btn_rm_in.clicked.connect(self._remove_input)
+        self.in_edit.returnPressed.connect(self._add_input)
+
+        # Salidas
+        self.outputs_list = QListWidget()
+        self.outputs_list.addItems(self.var_outputs)
+        self.out_edit = QLineEdit(); self.out_edit.setPlaceholderText("Ej: Y, S, COUT")
+        btn_add_out = QPushButton("Añadir salida")
+        btn_rm_out  = QPushButton("Quitar seleccionada")
+        btn_add_out.clicked.connect(self._add_output)
+        btn_rm_out.clicked.connect(self._remove_output)
+        self.out_edit.returnPressed.connect(self._add_output)
+
+        h.addWidget(col("Entradas",
+                        self.inputs_list, self.in_edit, btn_add_in, btn_rm_in))
+        h.addWidget(col("Salidas",
+                        self.outputs_list, self.out_edit, btn_add_out, btn_rm_out))
+
+        info = QLabel(
+            "<small>Define los nombres de variables.  "
+            "Al pasar a la pestaña <b>Tabla de Verdad</b> se generarán "
+            "automáticamente las 2<sup>N</sup> filas correspondientes."
+            "</small>")
+        info.setWordWrap(True)
+        outer = QVBoxLayout()
+        outer.addLayout(h)
+        outer.addWidget(info)
+        wrap = QWidget(); wrap.setLayout(outer)
+        return wrap
+
+    def _add_input(self):
+        name = self.in_edit.text().strip()
+        if not name:
+            return
+        if name in self.var_inputs or name in self.var_outputs:
+            QMessageBox.warning(self, "Nombre duplicado",
+                                f"La variable '{name}' ya existe.")
+            return
+        self.var_inputs.append(name)
+        self.inputs_list.addItem(name)
+        self.in_edit.clear()
+
+    def _remove_input(self):
+        row = self.inputs_list.currentRow()
+        if row < 0:
+            return
+        name = self.var_inputs.pop(row)
+        self.inputs_list.takeItem(row)
+        # Limpiar truth_data inválido (cambia el número de filas)
+        self.truth_data.clear()
+
+    def _add_output(self):
+        name = self.out_edit.text().strip()
+        if not name:
+            return
+        if name in self.var_inputs or name in self.var_outputs:
+            QMessageBox.warning(self, "Nombre duplicado",
+                                f"La variable '{name}' ya existe.")
+            return
+        self.var_outputs.append(name)
+        self.outputs_list.addItem(name)
+        self.out_edit.clear()
+
+    def _remove_output(self):
+        row = self.outputs_list.currentRow()
+        if row < 0:
+            return
+        name = self.var_outputs.pop(row)
+        self.outputs_list.takeItem(row)
+        # Eliminar las celdas asociadas a esa salida
+        for k in list(self.truth_data.keys()):
+            if k[0] == name:
+                del self.truth_data[k]
+
+    # ── Pestaña 2: Tabla de verdad ────────────────────────────────────────
+    def _build_truth_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        info = QLabel(
+            "<small>Llena cada celda de salida con <b>0</b>, <b>1</b> o "
+            "<b>X</b> (don't care).  Las filas donde todas las salidas son "
+            "<b>X</b> se ocultan automáticamente — no afectan a la "
+            "minimización.</small>")
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        self.truth_table = QTableWidget()
+        self.truth_table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked |
+            QTableWidget.EditTrigger.SelectedClicked)
+        self.truth_table.itemChanged.connect(self._on_truth_cell_changed)
+        v.addWidget(self.truth_table)
+
+        # Selector de salida a simplificar
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Salida a simplificar:"))
+        self.output_selector = QComboBox()
+        row.addWidget(self.output_selector)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        # Botones de minimización
+        btn_row = QHBoxLayout()
+        self.btn_sop = QPushButton("→ Mintérminos (SOP)")
+        self.btn_pos = QPushButton("→ Maxtérminos (POS)")
+        self.btn_sop.clicked.connect(lambda: self._simplify_and_show('sop'))
+        self.btn_pos.clicked.connect(lambda: self._simplify_and_show('pos'))
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_sop)
+        btn_row.addWidget(self.btn_pos)
+        v.addLayout(btn_row)
+
+        return w
+
+    def _rebuild_truth_table(self):
+        """Reconstruye la tabla de verdad según las variables definidas."""
+        n_in  = len(self.var_inputs)
+        n_out = len(self.var_outputs)
+        if n_in == 0 or n_out == 0:
+            self.truth_table.clear()
+            self.truth_table.setRowCount(0)
+            self.truth_table.setColumnCount(0)
+            return
+
+        n_rows = 2 ** n_in
+        # Bloquear señales mientras (re)llenamos
+        self.truth_table.blockSignals(True)
+        self.truth_table.clear()
+        self.truth_table.setRowCount(n_rows)
+        self.truth_table.setColumnCount(n_in + n_out + 1)   # +1 → columna #
+        headers = ['#'] + list(self.var_inputs) + list(self.var_outputs)
+        self.truth_table.setHorizontalHeaderLabels(headers)
+
+        for r in range(n_rows):
+            # Columna #: índice del mintérmino
+            num_item = QTableWidgetItem(str(r))
+            num_item.setFlags(num_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.truth_table.setItem(r, 0, num_item)
+            # Columnas de entrada (binario, no editables)
+            bin_str = format(r, f'0{n_in}b')
+            for c, b in enumerate(bin_str):
+                it = QTableWidgetItem(b)
+                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.truth_table.setItem(r, c + 1, it)
+            # Columnas de salida (editables, recuperar valor previo si existe)
+            for j, oname in enumerate(self.var_outputs):
+                key = (oname, r)
+                val = self.truth_data.get(key, '0')
+                it = QTableWidgetItem(val)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.truth_table.setItem(r, n_in + 1 + j, it)
+
+        self.truth_table.resizeColumnsToContents()
+        self.truth_table.blockSignals(False)
+        self._refresh_hidden_rows()
+
+        # Refrescar combo de salida a simplificar
+        self.output_selector.blockSignals(True)
+        self.output_selector.clear()
+        self.output_selector.addItems(self.var_outputs)
+        self.output_selector.blockSignals(False)
+
+    def _on_truth_cell_changed(self, item):
+        """Normaliza el contenido a 0/1/X y oculta filas todo-X."""
+        n_in = len(self.var_inputs)
+        col = item.column()
+        if col < n_in + 1:    # columna # o entrada
+            return
+        out_idx = col - (n_in + 1)
+        if out_idx < 0 or out_idx >= len(self.var_outputs):
+            return
+        oname = self.var_outputs[out_idx]
+        row = item.row()
+        text = item.text().strip().lower()
+        if text in ('1', 'true', 'high', 'h'):
+            normalized = '1'
+        elif text in ('x', 'd', 'dc', '-', '?'):
+            normalized = 'X'
+        else:
+            normalized = '0'
+        self.truth_data[(oname, row)] = normalized
+        # Re-mostrar el valor normalizado (sin disparar el slot recursivamente)
+        self.truth_table.blockSignals(True)
+        item.setText(normalized)
+        self.truth_table.blockSignals(False)
+        self._refresh_hidden_rows()
+
+    def _refresh_hidden_rows(self):
+        """Oculta filas donde TODAS las salidas son don't care (X)."""
+        n_in = len(self.var_inputs)
+        if n_in == 0 or not self.var_outputs:
+            return
+        n_rows = 2 ** n_in
+        for r in range(n_rows):
+            all_x = all(self.truth_data.get((o, r), '0') == 'X'
+                        for o in self.var_outputs)
+            self.truth_table.setRowHidden(r, all_x)
+
+    def _gather_terms(self, output_name: str):
+        """Devuelve (minterms, dont_cares, maxterms) para la salida dada."""
+        n_in = len(self.var_inputs)
+        n_rows = 2 ** n_in
+        minterms, dont_cares, maxterms = [], [], []
+        for r in range(n_rows):
+            v = self.truth_data.get((output_name, r), '0')
+            if v == '1':
+                minterms.append(r)
+            elif v == 'X':
+                dont_cares.append(r)
+            else:
+                maxterms.append(r)
+        return minterms, dont_cares, maxterms
+
+    def _simplify_and_show(self, mode: str):
+        """mode: 'sop' o 'pos'.  Calcula la expresión y salta a Ecuaciones."""
+        if not self.var_inputs or not self.var_outputs:
+            QMessageBox.warning(self, "Faltan variables",
+                                "Define al menos una entrada y una salida.")
+            return
+        results = {}
+        for o in self.var_outputs:
+            mins, dcs, _ = self._gather_terms(o)
+            sop = simplify_sop(mins, dcs, self.var_inputs)
+            pos = simplify_pos(mins, dcs, self.var_inputs)
+            results[o] = {
+                'sop': sop, 'pos': pos,
+                'minterms': mins, 'dont_cares': dcs,
+            }
+        self._last_simplification = results
+        self._populate_eqs_tab(highlight=mode)
+        self.tabs.setCurrentIndex(2)   # Saltar a la pestaña Ecuaciones
+
+    # ── Pestaña 3: Ecuaciones simplificadas ───────────────────────────────
+    def _build_eqs_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        info = QLabel(
+            "<small>Resultados de la minimización por Quine-McCluskey "
+            "con soporte para don't cares.  Notación: <b>'</b> = NEGADO, "
+            "<b>·</b> = AND, <b>+</b> = OR.</small>")
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        self.eqs_text = QTextEdit()
+        self.eqs_text.setReadOnly(True)
+        self.eqs_text.setFont(QFont('Consolas', 11))
+        v.addWidget(self.eqs_text)
+
+        # Botón futuro: armar circuito automáticamente
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_build_circuit = QPushButton("⚙  Armar circuito automáticamente")
+        self.btn_build_circuit.setToolTip(
+            "Próximamente: genera y coloca las puertas lógicas necesarias "
+            "en una hoja nueva, conectándolas según las ecuaciones SOP.")
+        self.btn_build_circuit.clicked.connect(self._build_circuit_stub)
+        btn_row.addWidget(self.btn_build_circuit)
+        v.addLayout(btn_row)
+        return w
+
+    def _populate_eqs_tab(self, highlight: str = 'sop'):
+        if not self._last_simplification:
+            self.eqs_text.setPlainText(
+                "Aún no se ha minimizado ninguna salida.  "
+                "Ve a la pestaña 'Tabla de Verdad', llena los valores "
+                "y pulsa Mintérminos (SOP) o Maxtérminos (POS).")
+            return
+        lines = []
+        for oname, info in self._last_simplification.items():
+            mins = info['minterms']; dcs = info['dont_cares']
+            lines.append(f"── {oname} ──")
+            mins_str = ','.join(str(m) for m in mins) or '∅'
+            dcs_str  = ','.join(str(d) for d in dcs) if dcs else '∅'
+            lines.append(f"  Σm = ({mins_str})    d = ({dcs_str})")
+            mark_sop = '◀' if highlight == 'sop' else ' '
+            mark_pos = '◀' if highlight == 'pos' else ' '
+            lines.append(f"  SOP {mark_sop}   {oname} = {info['sop']}")
+            lines.append(f"  POS {mark_pos}   {oname} = {info['pos']}")
+            lines.append("")
+        self.eqs_text.setPlainText('\n'.join(lines))
+
+    def _build_circuit_stub(self):
+        QMessageBox.information(
+            self, "Armado automático",
+            "El armado automático del circuito lógico aún no está "
+            "implementado.\n\n"
+            "Esta función generará las puertas (AND/OR/NOT) y las "
+            "colocará en una hoja nueva conectando las entradas a "
+            "los pines correspondientes.")
+
+    # ── Pestaña 4: Mapa de Karnaugh (placeholder) ─────────────────────────
+    def _build_kmap_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        title = QLabel("<h3>Mapa de Karnaugh</h3>")
+        v.addWidget(title)
+        msg = QLabel(
+            "<p>Próximamente:</p>"
+            "<ul>"
+            "<li>Visualización del K-map para cada salida con sus "
+            "agrupaciones óptimas.</li>"
+            "<li>Edición directa del mapa para introducir 0/1/X.</li>"
+            "<li>Generar SOP y POS desde el mapa "
+            "y viceversa (ecuación → mapa).</li>"
+            "<li>Exportación a imagen.</li>"
+            "</ul>")
+        msg.setWordWrap(True)
+        v.addWidget(msg)
+        v.addStretch(1)
+        return w
+
+    # ── Cambio de pestaña ─────────────────────────────────────────────────
+    def _on_tab_changed(self, idx: int):
+        if idx == 1:    # Tabla de verdad
+            self._rebuild_truth_table()
+        elif idx == 2:  # Ecuaciones (mostrar texto previo si existe)
+            if self._last_simplification:
+                self._populate_eqs_tab(highlight='sop')
+            else:
+                self.eqs_text.setPlainText(
+                    "Aún no se ha minimizado ninguna salida.  Ve a la "
+                    "pestaña 'Tabla de Verdad', llena los valores y "
+                    "pulsa Mintérminos (SOP) o Maxtérminos (POS).")
 
 
 # ══════════════════════════════════════════════════════════════

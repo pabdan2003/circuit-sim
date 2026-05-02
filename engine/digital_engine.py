@@ -410,13 +410,21 @@ class SRFF(DigitalComponent):
 
 
 class JKFF(DigitalComponent):
-    """Flip-flop JK disparado por flanco de subida."""
+    """Flip-flop JK disparado por flanco de subida.
+    SET y RESET asíncronos opcionales, activos en alto.
+    """
 
     def __init__(self, name: str, j: str, k: str, clk: str,
-                 q: str, qn: str = None, t_pd: float = 2e-9):
-        super().__init__(name, [j, k, clk], [q] + ([qn] if qn else []), t_pd)
+                 q: str, qn: str = None,
+                 reset: str = None, set_: str = None,
+                 t_pd: float = 2e-9):
+        inputs = [j, k, clk]
+        if reset: inputs.append(reset)
+        if set_:  inputs.append(set_)
+        super().__init__(name, inputs, [q] + ([qn] if qn else []), t_pd)
         self.j  = j;  self.k  = k;  self.clk = clk
         self.q  = q;  self.qn = qn
+        self.reset = reset; self.set_ = set_
         self._Q = 0;  self._last_clk = 0
 
     def reset(self):
@@ -425,7 +433,12 @@ class JKFF(DigitalComponent):
     def evaluate(self, t, nets):
         clk_now = self._get(nets, self.clk)
         events  = []
-        if clk_now == 1 and self._last_clk == 0:
+        # Asíncronos: tienen prioridad sobre el reloj
+        if self.reset and self._get(nets, self.reset):
+            self._Q = 0
+        elif self.set_ and self._get(nets, self.set_):
+            self._Q = 1
+        elif clk_now == 1 and self._last_clk == 0:
             J = self._get(nets, self.j)
             K = self._get(nets, self.k)
             if   J == 0 and K == 0: pass          # hold
@@ -433,21 +446,29 @@ class JKFF(DigitalComponent):
             elif J == 1 and K == 0: self._Q = 1   # set
             else:                   self._Q ^= 1   # toggle
 
-            events.append(self._emit(t, self.q, self._Q))
-            if self.qn:
-                events.append(self._emit(t, self.qn, 1 - self._Q))
+        events.append(self._emit(t, self.q, self._Q))
+        if self.qn:
+            events.append(self._emit(t, self.qn, 1 - self._Q))
         self._last_clk = clk_now
         return events
 
 
 class TFF(DigitalComponent):
-    """Flip-flop T (Toggle): en cada flanco de CLK si T=1 → invierte Q."""
+    """Flip-flop T (Toggle): en cada flanco de CLK si T=1 → invierte Q.
+    SET y RESET asíncronos opcionales, activos en alto.
+    """
 
     def __init__(self, name: str, t_in: str, clk: str,
-                 q: str, qn: str = None, t_pd: float = 2e-9):
-        super().__init__(name, [t_in, clk], [q] + ([qn] if qn else []), t_pd)
+                 q: str, qn: str = None,
+                 reset: str = None, set_: str = None,
+                 t_pd: float = 2e-9):
+        inputs = [t_in, clk]
+        if reset: inputs.append(reset)
+        if set_:  inputs.append(set_)
+        super().__init__(name, inputs, [q] + ([qn] if qn else []), t_pd)
         self.t_in = t_in; self.clk = clk
         self.q    = q;    self.qn  = qn
+        self.reset = reset; self.set_ = set_
         self._Q   = 0;    self._last_clk = 0
 
     def reset(self):
@@ -456,12 +477,16 @@ class TFF(DigitalComponent):
     def evaluate(self, t, nets):
         clk_now = self._get(nets, self.clk)
         events  = []
-        if clk_now == 1 and self._last_clk == 0:
+        if self.reset and self._get(nets, self.reset):
+            self._Q = 0
+        elif self.set_ and self._get(nets, self.set_):
+            self._Q = 1
+        elif clk_now == 1 and self._last_clk == 0:
             if self._get(nets, self.t_in):
                 self._Q ^= 1
-            events.append(self._emit(t, self.q, self._Q))
-            if self.qn:
-                events.append(self._emit(t, self.qn, 1 - self._Q))
+        events.append(self._emit(t, self.q, self._Q))
+        if self.qn:
+            events.append(self._emit(t, self.qn, 1 - self._Q))
         self._last_clk = clk_now
         return events
 
