@@ -51,6 +51,39 @@ def _sparse_factor(G_lil):
     return splu(G_csc)
 
 
+def _component_fingerprint(c) -> tuple:
+    """
+    Devuelve una huella estable que identifica unívocamente un componente
+    incluyendo SUS PARÁMETROS NUMÉRICOS, no sólo su nombre/tipo.
+
+    Esencial para que la caché de LU del solver AC se invalide cuando el
+    usuario cambia un valor (p.ej. el wiper de un potenciómetro o la
+    relación de un transformador en tiempo real durante la simulación).
+    """
+    parts = [c.name, type(c).__name__]
+    # Recorrer los atributos numéricos / strings (los nodos cuentan también
+    # porque cambiar un nodo cambia la topología).
+    for k in sorted(vars(c).keys()):
+        if k.startswith('_'):
+            continue
+        v = getattr(c, k)
+        if isinstance(v, bool):
+            parts.append((k, bool(v)))
+        elif isinstance(v, (int, float)):
+            parts.append((k, round(float(v), 12)))
+        elif isinstance(v, complex):
+            parts.append((k, round(v.real, 12), round(v.imag, 12)))
+        elif isinstance(v, str):
+            parts.append((k, v))
+        # Otros tipos (numpy arrays, callables, etc.) se ignoran
+    return tuple(parts)
+
+
+def _circuit_fingerprint(components) -> tuple:
+    """Huella del circuito completo para cachear factorizaciones."""
+    return tuple(_component_fingerprint(c) for c in components)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Solver principal
 # ──────────────────────────────────────────────────────────────────────────────
@@ -264,8 +297,9 @@ class MNASolver:
             node_map, branch_map, size = self._build_maps(components)
             results = {n: np.zeros(points, dtype=complex) for n in node_map}
 
-            # Fingerprint de topología (nombres y tipos de componentes)
-            topo_key = tuple((c.name, type(c).__name__) for c in components)
+            # Fingerprint que incluye PARÁMETROS — invalida la caché si
+            # algún valor cambia (potenciómetro, ratio del xfmr, etc.).
+            topo_key = _circuit_fingerprint(components)
 
             for i, f in enumerate(freqs):
                 omega   = 2 * np.pi * f
@@ -318,10 +352,16 @@ class MNASolver:
 
             G, I_vec = self._build_matrices_ac(components, node_map, branch_map, size, omega)
 
-            # Reutilizar LU si está en caché
-            topo_key = tuple((c.name, type(c).__name__) for c in components)
+            # Reutilizar LU si está en caché — la huella INCLUYE los valores
+            # de los componentes, así que cambiar (p.ej.) el wiper de un
+            # potenciómetro fuerza re-factorización.
+            topo_key = _circuit_fingerprint(components)
             cache_k  = (topo_key, round(omega, 10))
             if cache_k not in self._lu_cache:
+                # Limitar tamaño de la caché para no crecer sin límite
+                # cuando los valores cambian continuamente (slider en vivo).
+                if len(self._lu_cache) >= 64:
+                    self._lu_cache.pop(next(iter(self._lu_cache)))
                 G_csc = csc_matrix(G)
                 self._lu_cache[cache_k] = splu(G_csc)
 

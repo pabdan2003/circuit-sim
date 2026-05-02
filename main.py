@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem
 )
 from PyQt6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QPainterPath,
+    QPainter, QPen, QBrush, QColor, QFont, QPainterPath, QPolygonF,
     QIcon, QPixmap, QTransform, QAction, QKeySequence
 )
 from PyQt6.QtCore import (
@@ -92,13 +92,17 @@ class ComponentItem(QGraphicsItem):
     Soporta drag, selección y doble-click para editar propiedades.
     """
 
-    COMP_TYPES = ['R', 'V', 'VAC', 'I', 'C', 'L', 'Z', 'GND', 'NODE',
+    COMP_TYPES = ['R', 'POT', 'V', 'VAC', 'I', 'C', 'L', 'Z', 'GND', 'NODE',
                   'D', 'LED', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP',
+                  'XFMR', 'BRIDGE',
                   # ── Digital ──
                   'AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                   'DFF', 'JKFF', 'TFF', 'SRFF',
                   'MUX2', 'COUNTER',
                   'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM']
+
+    # Tipos analógicos con 4 terminales (necesitan p3 y p4)
+    FOUR_PIN_TYPES = {'XFMR', 'BRIDGE'}
 
     # Tipos que pertenecen al dominio digital (no se pasan al MNA)
     DIGITAL_TYPES = {
@@ -152,6 +156,18 @@ class ComponentItem(QGraphicsItem):
         # Nodos de entradas extra (entrada 3, 4, ... N) para puertas multi-entrada
         self.dig_input_nodes: list = []   # ['net_A', 'net_B', ...]
 
+        # ── Atributos analógicos extendidos ─────────────────────────────────
+        # Potenciómetro: posición del cursor (0.0 a 1.0). El valor base se
+        # guarda en self.value (R_total).  R_efectiva = value * pot_wiper.
+        self.pot_wiper: float = 0.5
+        # Transformador: relación de transformación (n=N1/N2) y corriente máx
+        self.xfmr_ratio: float = 2.0          # primario:secundario (n)
+        self.xfmr_imax:  float = 1.0          # corriente nominal del primario (A)
+        # Puente rectificador: tensión directa de cada diodo (informativa)
+        self.bridge_vf: float = 0.7
+        # Cuarto nodo para componentes de 4 terminales
+        self.node4: str = ''
+
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -181,6 +197,12 @@ class ComponentItem(QGraphicsItem):
             margin = 20
             return QRectF(-gw - 10 - margin, -gh - margin,
                           (gw + 10) * 2 + margin * 2, gh * 2 + margin * 2)
+        if self.comp_type == 'XFMR':
+            # 80×80, primario izq y secundario der
+            return QRectF(-50, -45, 100, 100)
+        if self.comp_type == 'BRIDGE':
+            # Diamante 80×80
+            return QRectF(-50, -50, 100, 100)
         return QRectF(-COMP_W//2 - 10, -COMP_H//2 - 20, COMP_W + 20, COMP_H + 40)
 
     def pin_positions(self) -> Tuple[QPointF, QPointF]:
@@ -196,6 +218,14 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'OPAMP':
             hh_op = hh + 6
             return QPointF(hw + 10, 0), QPointF(-hw - 10, hh_op // 2)
+        # ── Transformador: p1=PRI+ (sup-izq), p2=PRI- (inf-izq) ─────────
+        if self.comp_type == 'XFMR':
+            return QPointF(-50, -25), QPointF(-50, 25)
+        # ── Puente rectificador (diamante):
+        #     p1 = AC1 (izq),  p2 = AC2 (der)
+        #     p3 = DC+ (sup),  p4 = DC− (inf)
+        if self.comp_type == 'BRIDGE':
+            return QPointF(-50, 0), QPointF(50, 0)
         # ── Puertas lógicas: usar _gate_geometry para coincidir exactamente ──
         if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                                'COMPARATOR', 'PWM'):
@@ -255,10 +285,31 @@ class ComponentItem(QGraphicsItem):
             gw, gh, step, _ = self._gate_geometry()
             ys = self._gate_pin_ys()
             return QPointF(-gw - 10, ys[1] if len(ys) > 1 else 0)
+        # Transformador: p3 = SEC+ (sup-der)
+        if self.comp_type == 'XFMR':
+            return QPointF(50, -25)
+        # Puente: p3 = DC+ (sup)
+        if self.comp_type == 'BRIDGE':
+            return QPointF(0, -50)
         return QPointF(0, 0)
 
     def pin3_position_scene(self) -> QPointF:
         return self.mapToScene(self.pin3_position())
+
+    def pin4_position(self) -> QPointF:
+        """Cuarto pin (sólo XFMR y BRIDGE).
+
+          XFMR    → SEC− (inferior derecho)
+          BRIDGE  → DC−  (inferior)
+        """
+        if self.comp_type == 'XFMR':
+            return QPointF(50, 25)
+        if self.comp_type == 'BRIDGE':
+            return QPointF(0, 50)
+        return QPointF(0, 0)
+
+    def pin4_position_scene(self) -> QPointF:
+        return self.mapToScene(self.pin4_position())
 
     def all_pin_positions_scene(self) -> list:
         """Retorna todos los pines activos del componente en coordenadas de escena."""
@@ -274,6 +325,9 @@ class ComponentItem(QGraphicsItem):
                 pins.append(self.mapToScene(QPointF(-gw - 10, y)))
         elif self.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF', 'MUX2'):
             pins.append(self.pin3_position_scene())
+        elif self.comp_type in self.FOUR_PIN_TYPES:
+            pins.append(self.pin3_position_scene())
+            pins.append(self.pin4_position_scene())
         return pins
 
     # ── Dibujo ──────────────────────────────────
@@ -295,6 +349,8 @@ class ComponentItem(QGraphicsItem):
             self._draw_node(painter, line_color)
         elif self.comp_type == 'R':
             self._draw_resistor(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'POT':
+            self._draw_potentiometer(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'C':
             self._draw_capacitor(painter, pen_body, pen_wire)
         elif self.comp_type == 'L':
@@ -313,6 +369,10 @@ class ComponentItem(QGraphicsItem):
             self._draw_opamp(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'Z':
             self._draw_impedance(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'XFMR':
+            self._draw_transformer(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'BRIDGE':
+            self._draw_bridge_rectifier(painter, pen_body, pen_wire, body_color)
         # ── Digital ──────────────────────────────────────────────────────
         elif self.comp_type in ('AND', 'NAND', 'OR', 'NOR', 'XOR', 'NOT'):
             self._draw_ansi_gate(painter, pen_body, pen_wire, body_color)
@@ -367,6 +427,187 @@ class ComponentItem(QGraphicsItem):
             pts.append(QPointF(x, y))
         for i in range(len(pts) - 1):
             painter.drawLine(pts[i], pts[i+1])
+
+    def _draw_potentiometer(self, painter, pen_body, pen_wire, body_color):
+        """Resistor + flecha diagonal que lo atraviesa (cursor variable)."""
+        # Primero el resistor base
+        self._draw_resistor(painter, pen_body, pen_wire, body_color)
+        hw = COMP_W // 2
+        hh = COMP_H // 2
+
+        # Flecha diagonal con la inclinación según la posición del cursor.
+        # wiper=0  → flecha apuntando a la izq;  wiper=1 → a la derecha.
+        w        = max(0.0, min(1.0, float(self.pot_wiper)))
+        # Punto inicial: izq-inferior, punta: cruza el cuerpo en diagonal
+        arrow_pen = QPen(QColor(COLORS['comp_sel']), 2.2)
+        painter.setPen(arrow_pen)
+        x_start = -hw + 4
+        y_start = hh + 8
+        # X de la punta varía con el wiper para visualizar la posición
+        x_tip   = -hw + 6 + (COMP_W - 12) * w
+        y_tip   = -hh - 8
+        # Línea principal
+        painter.drawLine(QPointF(x_start, y_start), QPointF(x_tip, y_tip))
+        # Cabeza de la flecha (triángulo)
+        import math as _m
+        dx = x_tip - x_start; dy = y_tip - y_start
+        L  = _m.hypot(dx, dy) or 1.0
+        ux, uy = dx/L, dy/L
+        px, py = -uy, ux
+        sz = 7
+        head = QPolygonF([
+            QPointF(x_tip, y_tip),
+            QPointF(x_tip - sz*ux + sz*0.45*px, y_tip - sz*uy + sz*0.45*py),
+            QPointF(x_tip - sz*ux - sz*0.45*px, y_tip - sz*uy - sz*0.45*py),
+        ])
+        painter.setBrush(QColor(COLORS['comp_sel']))
+        painter.drawPolygon(head)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Indicador del % (pequeño, debajo)
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.setFont(QFont('Consolas', 6))
+        painter.drawText(QRectF(-hw, hh + 14, COMP_W, 10),
+                         Qt.AlignmentFlag.AlignCenter, f"{w*100:.0f}%")
+
+    def _draw_transformer(self, painter, pen_body, pen_wire, body_color):
+        """
+        Transformador con dos bobinas verticales (primario izq, secundario der)
+        y dos líneas verticales centrales que representan el núcleo de hierro.
+        """
+        import math as _m
+        # ── Cables a los 4 pines ──────────────────────────────────────────
+        painter.setPen(pen_wire)
+        # Primario (izq): bobina entre y=-25 y y=25 a x=-30
+        painter.drawLine(QPointF(-50, -25), QPointF(-30, -25))   # p1 → top de bobina
+        painter.drawLine(QPointF(-50,  25), QPointF(-30,  25))   # p2 → bot de bobina
+        # Secundario (der): bobina a x=30
+        painter.drawLine(QPointF(30, -25), QPointF(50, -25))     # p3 → top
+        painter.drawLine(QPointF(30,  25), QPointF(50,  25))     # p4 → bot
+
+        # ── Bobinas (semicírculos apilados) ───────────────────────────────
+        painter.setPen(QPen(QColor(COLORS['component']), 1.8))
+        # Primario: 4 lazos a la izquierda (abren hacia la derecha)
+        path_p = QPainterPath()
+        path_p.moveTo(-30, -25)
+        for i in range(4):
+            cy = -25 + i*12 + 6
+            # Semicírculo de radio 6 abriendo hacia la derecha (+90 a -90)
+            path_p.arcTo(QRectF(-36, cy - 6, 12, 12), 90, -180)
+        painter.drawPath(path_p)
+        # Secundario: 4 lazos a la derecha (abren hacia la izquierda)
+        path_s = QPainterPath()
+        path_s.moveTo(30, -25)
+        for i in range(4):
+            cy = -25 + i*12 + 6
+            path_s.arcTo(QRectF(24, cy - 6, 12, 12), 90, 180)
+        painter.drawPath(path_s)
+
+        # ── Núcleo de hierro: dos líneas verticales paralelas ─────────────
+        painter.setPen(QPen(QColor(COLORS['text']), 1.4))
+        painter.drawLine(QPointF(-3, -28), QPointF(-3, 28))
+        painter.drawLine(QPointF( 3, -28), QPointF( 3, 28))
+
+        # ── Etiqueta de relación ──────────────────────────────────────────
+        painter.setFont(QFont('Consolas', 7))
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        # Mostrar n = ratio
+        n   = self.xfmr_ratio
+        # Formato pretty para 1:n o n:1
+        if n >= 1:
+            label = f"{n:.1f}:1"
+        else:
+            label = f"1:{1/n:.1f}"
+        painter.drawText(QRectF(-30, 32, 60, 10),
+                         Qt.AlignmentFlag.AlignCenter, label)
+        # Indicar polaridad con un punto en la parte superior de cada bobina
+        painter.setPen(QPen(QColor(COLORS['component']), 1))
+        painter.setBrush(QColor(COLORS['component']))
+        painter.drawEllipse(QPointF(-22, -30), 1.8, 1.8)
+        painter.drawEllipse(QPointF( 22, -30), 1.8, 1.8)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_bridge_rectifier(self, painter, pen_body, pen_wire, body_color):
+        """
+        Puente rectificador en disposición de diamante con 4 diodos:
+
+                    DC+ (top)
+                     /\\
+                    /  \\
+              D3 ↗      ↘ D1
+                /        \\
+        AC1 ──┤          ├── AC2
+                \\        /
+              D4 ↘      ↗ D2
+                    \\/
+                    DC− (bottom)
+        """
+        # ── Pines ─────────────────────────────────────────────────────────
+        # AC1 (izq), AC2 (der), DC+ (sup), DC- (inf)
+        # Conectores cortos a los vértices del diamante
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-50, 0),  QPointF(-30, 0))   # AC1
+        painter.drawLine(QPointF(30, 0),   QPointF(50, 0))    # AC2
+        painter.drawLine(QPointF(0, -50),  QPointF(0, -30))   # DC+
+        painter.drawLine(QPointF(0,  30),  QPointF(0,  50))   # DC−
+
+        # ── Diamante ──────────────────────────────────────────────────────
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        diamond = QPolygonF([
+            QPointF(0, -30),   # top  (DC+)
+            QPointF(30,  0),   # right (AC2)
+            QPointF(0,  30),   # bot  (DC-)
+            QPointF(-30, 0),   # left (AC1)
+        ])
+        painter.drawPolygon(diamond)
+
+        # ── 4 diodos dentro del diamante ──────────────────────────────────
+        # Cada diodo: triángulo + raya. Los 4 apuntan hacia DC+ (excepto los
+        # de DC- que apuntan desde DC- hacia los nodos AC).
+        painter.setPen(QPen(QColor(COLORS['component']), 1.5))
+        painter.setBrush(QBrush(QColor(COLORS['component'])))
+
+        def draw_diode_arrow(painter, p_from, p_to):
+            """Dibuja un diodo orientado de p_from → p_to dentro del puente."""
+            dx = p_to.x() - p_from.x()
+            dy = p_to.y() - p_from.y()
+            import math as _m
+            L  = _m.hypot(dx, dy) or 1.0
+            ux, uy = dx/L, dy/L
+            px, py = -uy, ux
+            # Centro del diodo
+            cx = (p_from.x() + p_to.x()) / 2
+            cy = (p_from.y() + p_to.y()) / 2
+            # Triángulo (apuntando a p_to)
+            sz = 5
+            tri = QPolygonF([
+                QPointF(cx + sz*ux,            cy + sz*uy),
+                QPointF(cx - sz*ux + sz*0.7*px, cy - sz*uy + sz*0.7*py),
+                QPointF(cx - sz*ux - sz*0.7*px, cy - sz*uy - sz*0.7*py),
+            ])
+            painter.drawPolygon(tri)
+            # Raya en la cabeza del triángulo (cátodo)
+            tip_x = cx + sz*ux
+            tip_y = cy + sz*uy
+            painter.drawLine(
+                QPointF(tip_x + 0.7*sz*px, tip_y + 0.7*sz*py),
+                QPointF(tip_x - 0.7*sz*px, tip_y - 0.7*sz*py))
+
+        # Brazos del puente: AC1→DC+ (D1), AC2→DC+ (D2), DC-→AC1 (D3), DC-→AC2 (D4)
+        draw_diode_arrow(painter, QPointF(-30, 0), QPointF(0, -30))   # D1: AC1→DC+
+        draw_diode_arrow(painter, QPointF(30, 0),  QPointF(0, -30))   # D2: AC2→DC+
+        draw_diode_arrow(painter, QPointF(0, 30),  QPointF(-30, 0))   # D3: DC-→AC1
+        draw_diode_arrow(painter, QPointF(0, 30),  QPointF(30, 0))    # D4: DC-→AC2
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Etiquetas de pines
+        painter.setFont(QFont('Consolas', 6))
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.drawText(QRectF(-50, -8, 18, 10),  Qt.AlignmentFlag.AlignCenter, '~')
+        painter.drawText(QRectF(32,  -8, 18, 10),  Qt.AlignmentFlag.AlignCenter, '~')
+        painter.drawText(QRectF(-12, -50, 24, 10), Qt.AlignmentFlag.AlignCenter, '+')
+        painter.drawText(QRectF(-12,  40, 24, 10), Qt.AlignmentFlag.AlignCenter, '−')
 
     def _draw_capacitor(self, painter, pen_body, pen_wire):
         painter.setPen(pen_wire)
@@ -1354,9 +1595,14 @@ class CircuitScene(QGraphicsScene):
         if not unit:
             unit = units.get(comp_type, '')
 
-        defaults = {'R': 1000.0, 'V': 5.0, 'VAC': 120.0, 'I': 0.001, 'C': 1e-6, 'L': 1e-3,
-                    'D': 1e-14, 'LED': 1e-14, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
+        # NOTA: el default de LED es 0.0 para que el `Is` lo determine el COLOR
+        # (ver build_engine_components_for_item).  Si el usuario escribe un Is
+        # positivo en la propiedad, se usa ese valor en lugar del preset.
+        defaults = {'R': 1000.0, 'POT': 10_000.0, 'V': 5.0, 'VAC': 120.0,
+                    'I': 0.001, 'C': 1e-6, 'L': 1e-3,
+                    'D': 1e-14, 'LED': 0.0, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
                     'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5,
+                    'XFMR': 1.0, 'BRIDGE': 0.7,
                     'LOGIC_STATE': 0.0}  # 0=LOW, 1=HIGH
         if value == 0.0 and comp_type != 'LOGIC_STATE':
             value = defaults.get(comp_type, 1.0)
@@ -1495,6 +1741,9 @@ class CircuitScene(QGraphicsScene):
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
             elif comp.comp_type in ('DFF', 'JKFF', 'TFF', 'SRFF', 'MUX2'):
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+            elif comp.comp_type in ComponentItem.FOUR_PIN_TYPES:
+                pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+                pins[f"{comp.name}__p4"] = comp.pin4_position_scene()
             elif comp.comp_type in ('AND', 'OR', 'NAND', 'NOR', 'XOR', 'COMPARATOR'):
                 # Registrar TODOS los pines de entrada de la puerta:
                 # p1 = salida (ya registrado), p2 = entrada 1 (ya registrado),
@@ -1595,6 +1844,16 @@ class CircuitScene(QGraphicsScene):
                 item.z_phase  = data.get('z_phase', 0.0)
             if item.comp_type == 'LED':
                 item.led_color = data.get('led_color', 'red')
+            # POT
+            if item.comp_type == 'POT' and 'pot_wiper' in data:
+                item.pot_wiper = max(0.0, min(1.0, float(data['pot_wiper'])))
+            # XFMR
+            if item.comp_type == 'XFMR':
+                if 'xfmr_ratio' in data: item.xfmr_ratio = float(data['xfmr_ratio'])
+                if 'xfmr_imax'  in data: item.xfmr_imax  = float(data['xfmr_imax'])
+            # 4º nodo
+            if item.comp_type in ComponentItem.FOUR_PIN_TYPES and 'node4' in data:
+                item.node4 = data['node4']
             # Campos digitales
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
                 if 'dig_inputs'  in data: item.dig_inputs      = data['dig_inputs']
@@ -1644,13 +1903,16 @@ class ComponentDialog(QDialog):
         value_labels = {
             'R': 'Resistencia (Ω)', 'V': 'Voltaje (V)', 'I': 'Corriente (A)',
             'C': 'Capacitancia (F)', 'L': 'Inductancia (H)',
+            'POT': 'R total (Ω)',
             'D': 'Is — Corriente saturación (A)',
-            'LED': 'Is — Corriente saturación (A)',
+            'LED': 'Valor (no usado — Vf según color)',
             'BJT_NPN': 'hFE — Ganancia β',
             'BJT_PNP': 'hFE — Ganancia β',
             'NMOS': 'Kn — Transconductancia (A/V²)',
             'PMOS': 'Kp — Transconductancia (A/V²)',
             'OPAMP': 'A — Ganancia lazo abierto (V/V)',
+            'XFMR':   'V_pri nominal (V) — informativo',
+            'BRIDGE': 'V_f por diodo (V) — informativo',
         }
         self.value_spin = QDoubleSpinBox()
         self.value_spin.setRange(-1e12, 1e12)
@@ -1661,6 +1923,7 @@ class ComponentDialog(QDialog):
         # Etiquetas de nodos según terminales reales del componente
         node_labels = {
             'R':       ('Nodo 1',    'Nodo 2',    None),
+            'POT':     ('Nodo 1',    'Nodo 2 (cursor)', None),
             'C':       ('Nodo 1',    'Nodo 2',    None),
             'L':       ('Nodo 1',    'Nodo 2',    None),
             'V':       ('Nodo + (ánodo)',  'Nodo − (cátodo)', None),
@@ -1706,6 +1969,23 @@ class ComponentDialog(QDialog):
             layout.addRow(lbl2 + ':', self.node2_edit)
             self.node3_edit = QLineEdit(self.item.node3 if hasattr(self.item,'node3') else '')
             layout.addRow(lbl3 + ':', self.node3_edit)
+            self._extra_node_edits = []
+        elif self.item.comp_type in ComponentItem.FOUR_PIN_TYPES:
+            # XFMR / BRIDGE: 4 nodos
+            if self.item.comp_type == 'XFMR':
+                lbls = ('Primario + (P1)', 'Primario − (P2)',
+                        'Secundario + (S1)', 'Secundario − (S2)')
+            else:  # BRIDGE
+                lbls = ('AC1 (entrada ~)', 'AC2 (entrada ~)',
+                        'DC + (salida +)', 'DC − (salida −)')
+            self.node1_edit = QLineEdit(self.item.node1)
+            self.node2_edit = QLineEdit(self.item.node2)
+            self.node3_edit = QLineEdit(self.item.node3)
+            self._node4_edit = QLineEdit(self.item.node4)
+            layout.addRow(lbls[0] + ':', self.node1_edit)
+            layout.addRow(lbls[1] + ':', self.node2_edit)
+            layout.addRow(lbls[2] + ':', self.node3_edit)
+            layout.addRow(lbls[3] + ':', self._node4_edit)
             self._extra_node_edits = []
         else:
             lbl1, lbl2, lbl3 = node_labels.get(self.item.comp_type, ('Nodo +', 'Nodo −', None))
@@ -1804,6 +2084,33 @@ class ComponentDialog(QDialog):
             self._z_stack.addWidget(w_phas)
             layout.addRow(self._z_stack)
             self._z_mode_combo.currentIndexChanged.connect(self._z_stack.setCurrentIndex)
+
+        # ── Campos extra para POT / XFMR / BRIDGE ────────────────────────
+        self._pot_wiper_spin = None
+        self._xfmr_ratio_spin = None
+        self._xfmr_imax_spin  = None
+
+        if self.item.comp_type == 'POT':
+            self._pot_wiper_spin = QDoubleSpinBox()
+            self._pot_wiper_spin.setRange(0.0, 1.0)
+            self._pot_wiper_spin.setDecimals(3)
+            self._pot_wiper_spin.setSingleStep(0.05)
+            self._pot_wiper_spin.setValue(self.item.pot_wiper)
+            layout.addRow("Cursor (0–1):", self._pot_wiper_spin)
+
+        if self.item.comp_type == 'XFMR':
+            self._xfmr_ratio_spin = QDoubleSpinBox()
+            self._xfmr_ratio_spin.setRange(0.001, 1000.0)
+            self._xfmr_ratio_spin.setDecimals(4)
+            self._xfmr_ratio_spin.setValue(self.item.xfmr_ratio)
+            layout.addRow("Relación n = N1/N2:", self._xfmr_ratio_spin)
+
+            self._xfmr_imax_spin = QDoubleSpinBox()
+            self._xfmr_imax_spin.setRange(0.001, 1e6)
+            self._xfmr_imax_spin.setDecimals(3)
+            self._xfmr_imax_spin.setSuffix(' A')
+            self._xfmr_imax_spin.setValue(self.item.xfmr_imax)
+            layout.addRow("Corriente máx primaria:", self._xfmr_imax_spin)
 
         # ── Campos para componentes digitales ────────────────────────────
         self._dig_inputs_spin = None
@@ -1915,7 +2222,131 @@ class ComponentDialog(QDialog):
         # Nodos de entradas extra para puertas con más de 2 entradas
         if hasattr(self, '_extra_node_edits') and self._extra_node_edits:
             data['dig_input_nodes'] = [e.text() for e in self._extra_node_edits]
+        # Cuarto nodo (XFMR / BRIDGE)
+        if hasattr(self, '_node4_edit') and self._node4_edit is not None:
+            data['node4'] = self._node4_edit.text()
+        # Wiper del potenciómetro
+        if self._pot_wiper_spin is not None:
+            data['pot_wiper'] = self._pot_wiper_spin.value()
+        # Transformador
+        if self._xfmr_ratio_spin is not None:
+            data['xfmr_ratio'] = self._xfmr_ratio_spin.value()
+        if self._xfmr_imax_spin is not None:
+            data['xfmr_imax']  = self._xfmr_imax_spin.value()
         return data
+
+
+# ══════════════════════════════════════════════════════════════
+# Helper: convertir un ComponentItem analógico a objetos del engine
+# ══════════════════════════════════════════════════════════════
+def build_engine_components_for_item(item, pin_node):
+    """
+    Devuelve la lista de componentes del motor MNA que representan a `item`.
+    Lista vacía si:
+      • el item es de tipo digital (lo gestiona el engine digital aparte),
+      • no se puede construir (valor inválido, etc.).
+
+    Casos especiales:
+      • POT     → 1 Potentiometer.
+      • XFMR    → 1 Transformer  (4 nodos).
+      • BRIDGE  → 4 Diodes interconectados como puente.
+    """
+    from engine import (
+        Resistor, VoltageSource, VoltageSourceAC, CurrentSource,
+        Capacitor, Inductor, Diode, BJT, MOSFET, OpAmp, Impedance,
+        Potentiometer, Transformer,
+    )
+
+    if item.comp_type in ComponentItem.DIGITAL_TYPES:
+        return []
+
+    n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", f"iso_{item.name}_p1")
+    n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
+    n3 = ((item.node3.strip() if hasattr(item, "node3") and item.node3.strip()
+           else pin_node.get(f"{item.name}__p3", "")))
+    n4 = ((item.node4.strip() if hasattr(item, "node4") and item.node4.strip()
+           else pin_node.get(f"{item.name}__p4", "")))
+
+    ct = item.comp_type
+    try:
+        if ct == 'R' and item.value > 0:
+            return [Resistor(item.name, n1, n2, item.value)]
+        if ct == 'POT':
+            return [Potentiometer(item.name, n1, n2,
+                                  R_total=max(item.value, 1.0),
+                                  wiper=item.pot_wiper)]
+        if ct == 'V':
+            return [VoltageSource(item.name, n1, n2, item.value)]
+        if ct == 'VAC':
+            return [VoltageSourceAC(item.name, n1, n2,
+                                    amplitude=item.value, frequency=item.frequency,
+                                    phase_deg=item.phase_deg, mode=item.ac_mode)]
+        if ct == 'I':
+            return [CurrentSource(item.name, n1, n2, item.value)]
+        if ct == 'C' and item.value > 0:
+            return [Capacitor(item.name, n1, n2, item.value)]
+        if ct == 'L' and item.value > 0:
+            return [Inductor(item.name, n1, n2, item.value)]
+        if ct == 'D':
+            Is_v = item.value if item.value > 0 else 1e-14
+            return [Diode(item.name, n1, n2, Is=Is_v,
+                          n=1.0, Vd_init=0.6, Vd_max=2.0)]
+        if ct == 'LED':
+            # Parámetros LED por color (Vf nominal a ~10 mA).
+            # El COLOR es la única fuente de verdad para los parámetros físicos
+            # del LED.  El campo `value` del item NO se utiliza aquí —
+            # mantenerlo como override sería peligroso porque su default
+            # heredado del diodo Si (1e-14) hace que el LED conduzca a 0.6V.
+            #          (Is,         n,    Vf_typ,  Vd_init)
+            led_params = {
+                'red':    (1.0e-18, 2.0,  1.8,     1.7),
+                'orange': (1.0e-19, 2.1,  2.0,     1.9),
+                'yellow': (1.0e-20, 2.2,  2.1,     2.0),
+                'green':  (1.0e-23, 2.5,  2.2,     2.1),
+                'blue':   (1.0e-27, 3.0,  3.0,     2.9),
+                'white':  (1.0e-27, 3.0,  3.1,     3.0),
+            }
+            color = getattr(item, 'led_color', 'red')
+            Is_v, n_v, _, Vd0 = led_params.get(color, led_params['red'])
+            return [Diode(item.name, n1, n2, Is=Is_v, n=n_v,
+                          Vd_init=Vd0, Vd_max=5.0)]
+        if ct in ('BJT_NPN', 'BJT_PNP'):
+            t = 'NPN' if ct == 'BJT_NPN' else 'PNP'
+            return [BJT(item.name, n1, n3 or f'b_{item.name}', n2,
+                        type_=t, Bf=item.value if item.value > 0 else 100)]
+        if ct in ('NMOS', 'PMOS'):
+            t = 'NMOS' if ct == 'NMOS' else 'PMOS'
+            return [MOSFET(item.name, n1, n3 or f'g_{item.name}', n2,
+                           type_=t, Kn=item.value if item.value > 0 else 1e-3)]
+        if ct == 'OPAMP':
+            return [OpAmp(item.name, n1, n3 or f'vp_{item.name}', n2,
+                          A=item.value if item.value > 0 else 1e5)]
+        if ct == 'Z':
+            import math as _m
+            Z_val = (complex(item.z_real, item.z_imag) if item.z_mode == 'rect'
+                     else complex(item.z_mag*_m.cos(_m.radians(item.z_phase)),
+                                  item.z_mag*_m.sin(_m.radians(item.z_phase))))
+            if abs(Z_val) > 1e-12:
+                return [Impedance(item.name, n1, n2, Z_val)]
+        if ct == 'XFMR':
+            n3_x = n3 or f'sec1_{item.name}'
+            n4_x = n4 or f'sec2_{item.name}'
+            return [Transformer(item.name, n1, n2, n3_x, n4_x,
+                                ratio=item.xfmr_ratio,
+                                I_max=item.xfmr_imax)]
+        if ct == 'BRIDGE':
+            n3_b = n3 or f'dcp_{item.name}'   # DC+
+            n4_b = n4 or f'dcn_{item.name}'   # DC−
+            Is = 1e-14
+            return [
+                Diode(f'{item.name}_D1', n1,   n3_b, Is=Is),  # AC1 → DC+
+                Diode(f'{item.name}_D2', n2,   n3_b, Is=Is),  # AC2 → DC+
+                Diode(f'{item.name}_D3', n4_b, n1,   Is=Is),  # DC− → AC1
+                Diode(f'{item.name}_D4', n4_b, n2,   Is=Is),  # DC− → AC2
+            ]
+    except Exception:
+        pass
+    return []
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1990,6 +2421,32 @@ class MainWindow(QMainWindow):
         self.prop_table.horizontalHeader().setStretchLastSection(True)
         self.prop_table.setMaximumHeight(200)
         layout.addWidget(self.prop_table)
+
+        # ── Slider de potenciómetro (visible sólo cuando hay un POT seleccionado) ──
+        from PyQt6.QtWidgets import QSlider
+        self.pot_panel = QWidget()
+        pot_layout = QVBoxLayout(self.pot_panel)
+        pot_layout.setContentsMargins(0, 4, 0, 4)
+        self.pot_label = QLabel("CURSOR DEL POTENCIÓMETRO")
+        self.pot_label.setFont(QFont('Consolas', 8, QFont.Weight.Bold))
+        pot_layout.addWidget(self.pot_label)
+
+        self.pot_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pot_slider.setRange(0, 1000)        # resolución 0.1%
+        self.pot_slider.setValue(500)
+        self.pot_slider.setToolTip(
+            "Mueve el cursor del potenciómetro en tiempo real.\n"
+            "Si la simulación está activa, el efecto se ve al instante.")
+        self.pot_slider.valueChanged.connect(self._on_pot_slider)
+        pot_layout.addWidget(self.pot_slider)
+
+        self.pot_value_label = QLabel("50.0% — R = ----")
+        self.pot_value_label.setFont(QFont('Consolas', 8))
+        pot_layout.addWidget(self.pot_value_label)
+
+        self.pot_panel.setVisible(False)
+        layout.addWidget(self.pot_panel)
+        self._selected_pot = None   # ComponentItem actualmente seleccionado (POT)
 
         # Resultados de simulación
         res_label = QLabel("RESULTADOS")
@@ -2094,10 +2551,11 @@ class MainWindow(QMainWindow):
         # ── Categorías de componentes ────────────────────────────────────
         categories = [
             ("Pasivos", [
-                ('R', 'Resistor',    '━┤ZZZ├━'),
-                ('C', 'Capacitor',   '━┤  ├━'),
-                ('L', 'Inductor',    '━⌒⌒⌒━'),
-                ('Z', 'Impedancia',  '━┤▭├━'),
+                ('R',   'Resistor',      '━┤ZZZ├━'),
+                ('POT', 'Potenciómetro', '━┤Z↗├━'),
+                ('C',   'Capacitor',     '━┤  ├━'),
+                ('L',   'Inductor',      '━⌒⌒⌒━'),
+                ('Z',   'Impedancia',    '━┤▭├━'),
             ]),
             ("Fuentes", [
                 ('V',   'Fuente VDC',  '━(+)━'),
@@ -2105,13 +2563,15 @@ class MainWindow(QMainWindow):
                 ('I',   'Fuente I',    '━(→)━'),
             ]),
             ("Semiconductores", [
-                ('D',       'Diodo',       '━|▷|━'),
-                ('LED',     'LED',         '━|▷|★'),
-                ('BJT_NPN', 'BJT NPN',     '━(NPN)'),
-                ('BJT_PNP', 'BJT PNP',     '━(PNP)'),
-                ('NMOS',    'MOSFET N',    '━[N]━'),
-                ('PMOS',    'MOSFET P',    '━[P]━'),
-                ('OPAMP',   'Op-Amp',      '━[▷]━'),
+                ('D',       'Diodo',                 '━|▷|━'),
+                ('LED',     'LED',                   '━|▷|★'),
+                ('BRIDGE',  'Puente rectificador',   '◇'),
+                ('BJT_NPN', 'BJT NPN',               '━(NPN)'),
+                ('BJT_PNP', 'BJT PNP',               '━(PNP)'),
+                ('NMOS',    'MOSFET N',              '━[N]━'),
+                ('PMOS',    'MOSFET P',              '━[P]━'),
+                ('OPAMP',   'Op-Amp',                '━[▷]━'),
+                ('XFMR',    'Transformador',         '⌇⌇'),
             ]),
             ("Referencia", [
                 ('GND',  'Tierra',   '⏚'),
@@ -2361,47 +2821,8 @@ class MainWindow(QMainWindow):
         for item in self.scene.components:
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
                 continue
-            n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", f"iso_{item.name}")
-            n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
-            n3 = (item.node3.strip() if hasattr(item, "node3") and item.node3.strip()
-                  else pin_node.get(f"{item.name}__p3", ""))
             try:
-                ct = item.comp_type
-                if ct == "R" and item.value > 0:
-                    analog_comps.append(Resistor(item.name, n1, n2, item.value))
-                elif ct == "V":
-                    analog_comps.append(VoltageSource(item.name, n1, n2, item.value))
-                elif ct == "VAC":
-                    analog_comps.append(VoltageSourceAC(
-                        item.name, n1, n2, amplitude=item.value,
-                        frequency=item.frequency, phase_deg=item.phase_deg, mode=item.ac_mode))
-                elif ct == "I":
-                    analog_comps.append(CurrentSource(item.name, n1, n2, item.value))
-                elif ct == "C" and item.value > 0:
-                    analog_comps.append(Capacitor(item.name, n1, n2, item.value))
-                elif ct == "L" and item.value > 0:
-                    analog_comps.append(Inductor(item.name, n1, n2, item.value))
-                elif ct in ("D", "LED"):
-                    analog_comps.append(Diode(item.name, n1, n2,
-                                              Is=item.value if item.value > 0 else 1e-14))
-                elif ct in ("BJT_NPN", "BJT_PNP"):
-                    t = "NPN" if ct == "BJT_NPN" else "PNP"
-                    analog_comps.append(BJT(item.name, n1, n3 or f"b_{item.name}", n2,
-                                            type_=t, Bf=item.value if item.value > 0 else 100))
-                elif ct in ("NMOS", "PMOS"):
-                    t = "NMOS" if ct == "NMOS" else "PMOS"
-                    analog_comps.append(MOSFET(item.name, n1, n3 or f"g_{item.name}", n2,
-                                               type_=t, Kn=item.value if item.value > 0 else 1e-3))
-                elif ct == "OPAMP":
-                    analog_comps.append(OpAmp(item.name, n1, n3 or f"vp_{item.name}", n2,
-                                              A=item.value if item.value > 0 else 1e5))
-                elif ct == "Z":
-                    import math as _math
-                    Z_val = (complex(item.z_real, item.z_imag) if item.z_mode == "rect"
-                             else complex(item.z_mag*_math.cos(_math.radians(item.z_phase)),
-                                          item.z_mag*_math.sin(_math.radians(item.z_phase))))
-                    if abs(Z_val) > 1e-12:
-                        analog_comps.append(Impedance(item.name, n1, n2, Z_val))
+                analog_comps.extend(build_engine_components_for_item(item, pin_node))
             except Exception as e:
                 build_errors.append(f"{item.name}: {e}")
 
@@ -2425,9 +2846,20 @@ class MainWindow(QMainWindow):
                     if item.comp_type == "LED":
                         item.led_on = False
                         op = dc.get("operating_points", {}).get(item.name, {})
-                        vd = op.get("Vd", op.get("vd")) if op else None
-                        item.led_on = float(vd) > 0.3 if vd is not None else (
-                            (dc["voltages"].get(n1, 0) - dc["voltages"].get(n2, 0)) > 0.3)
+                        # Criterio: corriente directa > 0.1 mA (LED ya emite luz visible).
+                        # Caída (Vd) por sí sola NO basta — un Si sin corriente apreciable
+                        # también muestra Vd≈0.5V por la exponencial del modelo Shockley.
+                        Id_op = op.get("Id", op.get("id")) if op else None
+                        if Id_op is not None:
+                            item.led_on = float(Id_op) > 1e-4    # 0.1 mA
+                        else:
+                            # Fallback: comparar caída con Vf nominal del color
+                            v_a = dc["voltages"].get(n1, 0)
+                            v_k = dc["voltages"].get(n2, 0)
+                            vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
+                                      'green':1.9,'blue':2.6,'white':2.6}
+                            thr = vf_min.get(getattr(item,'led_color','red'), 1.5)
+                            item.led_on = (v_a - v_k) > thr
                     item.update()
             else:
                 out.append(f"  ✗ {dc['error']}")
@@ -2566,50 +2998,19 @@ class MainWindow(QMainWindow):
                         if out_node and out_node not in ('0', 'gnd', 'GND'):
                             components.append(VoltageSource(item.name, out_node, '0', v_out))
                     continue
-                if item.comp_type == 'R':
-                    if item.value <= 0:
-                        errors.append(f"{item.name}: resistencia debe ser > 0")
-                        continue
-                    components.append(Resistor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'V':
-                    components.append(VoltageSource(item.name, n1, n2, item.value))
-                elif item.comp_type == 'VAC':
-                    # En DC la fuente AC vale 0 V (valor medio de senoidal)
+
+                # En DC la fuente VAC vale 0 V (valor medio de senoidal)
+                if item.comp_type == 'VAC':
                     components.append(VoltageSource(item.name, n1, n2, 0.0))
-                elif item.comp_type == 'I':
-                    components.append(CurrentSource(item.name, n1, n2, item.value))
-                elif item.comp_type == 'C':
-                    components.append(Capacitor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'L':
-                    components.append(Inductor(item.name, n1, n2, item.value))
-                elif item.comp_type in ('D', 'LED'):
-                    Is = item.value if item.value > 0 else 1e-14
-                    components.append(Diode(item.name, n1, n2, Is=Is))
-                elif item.comp_type in ('BJT_NPN', 'BJT_PNP'):
-                    # n1=Colector, n2=Emisor, n3=Base
-                    type_ = 'NPN' if item.comp_type == 'BJT_NPN' else 'PNP'
-                    Bf = item.value if item.value > 0 else 100.0
-                    components.append(BJT(item.name, n1, n3 or f'b_{item.name}', n2,
-                                          type_=type_, Bf=Bf))
-                elif item.comp_type in ('NMOS', 'PMOS'):
-                    # n1=Drain, n2=Source, n3=Gate
-                    type_ = 'NMOS' if item.comp_type == 'NMOS' else 'PMOS'
-                    Kn = item.value if item.value > 0 else 1e-3
-                    components.append(MOSFET(item.name, n1, n3 or f'g_{item.name}', n2,
-                                             type_=type_, Kn=Kn))
-                elif item.comp_type == 'OPAMP':
-                    # n1=Salida, n2=Entrada−, n3=Entrada+
-                    A = item.value if item.value > 0 else 1e5
-                    components.append(OpAmp(item.name, n1, n3 or f'vp_{item.name}', n2, A=A))
-                elif item.comp_type == 'Z':
-                    if item.z_mode == 'rect':
-                        Z_val = complex(item.z_real, item.z_imag)
-                    else:
-                        mag = item.z_mag
-                        ph_rad = math.radians(item.z_phase)
-                        Z_val = complex(mag * math.cos(ph_rad), mag * math.sin(ph_rad))
-                    if abs(Z_val.real) > 1e-12 or abs(Z_val.imag) > 1e-12:
-                        components.append(Impedance(item.name, n1, n2, Z_val))
+                    continue
+
+                # Validación específica de R
+                if item.comp_type == 'R' and item.value <= 0:
+                    errors.append(f"{item.name}: resistencia debe ser > 0")
+                    continue
+
+                # Resto de componentes analógicos (incluye POT, XFMR, BRIDGE)
+                components.extend(build_engine_components_for_item(item, pin_node))
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
@@ -2743,21 +3144,28 @@ class MainWindow(QMainWindow):
                 # Encender/apagar LED según corriente que atraviesa el diodo
                 if item.comp_type == 'LED':
                     led_on = False
-                    # Método 1: usar operating_points del solver (más confiable)
+                    # Método 1: corriente del operating point (autoritativo).
+                    # Umbral 0.1 mA — por debajo el LED no es visible.
+                    # IMPORTANTE: si el operating point existe, su veredicto
+                    # es FINAL.  No caer al método de voltaje porque la caída
+                    # Vd se queda cerca de Vf incluso con corrientes de µA
+                    # (curva exponencial del diodo) → daría falsos positivos.
                     op = result.get('operating_points', {}).get(item.name, {})
+                    id_ = None
                     if op:
-                        vd = op.get('Vd', op.get('vd', op.get('V', None)))
                         id_ = op.get('Id', op.get('id', op.get('I', None)))
-                        if vd is not None:
-                            led_on = float(vd) > 0.3
-                        elif id_ is not None:
-                            led_on = float(id_) > 1e-6
-                    # Método 2: diferencia de voltaje entre nodos
-                    if not led_on:
+                    if id_ is not None:
+                        led_on = float(id_) > 1e-4
+                    else:
+                        # Sólo si NO hay info de corriente: comparar caída
+                        # con Vf nominal del color (peor pero único disponible).
                         v_a = result['voltages'].get(n1, None)
                         v_k = result['voltages'].get(n2, None)
                         if v_a is not None and v_k is not None:
-                            led_on = (v_a - v_k) > 0.3
+                            vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
+                                      'green':1.9,'blue':2.6,'white':2.6}
+                            thr = vf_min.get(getattr(item,'led_color','red'), 1.5)
+                            led_on = (v_a - v_k) > thr
                     item.led_on = led_on
                 item.update()
                 if hasattr(item, 'scene') and item.scene():
@@ -2884,37 +3292,21 @@ class MainWindow(QMainWindow):
             try:
                 if item.comp_type in ComponentItem.DIGITAL_TYPES:
                     continue
-                if item.comp_type == 'R':
-                    if item.value <= 0:
-                        errors.append(f"{item.name}: R debe ser > 0"); continue
-                    components.append(Resistor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'V':
-                    # Fuente DC en análisis AC → contribución 0
+                # En AC pura, las fuentes DC contribuyen 0 V
+                if item.comp_type == 'V':
                     components.append(VoltageSource(item.name, n1, n2, 0.0))
-                elif item.comp_type == 'VAC':
-                    components.append(VoltageSourceAC(
-                        item.name, n1, n2,
-                        amplitude=item.value,
-                        frequency=item.frequency,
-                        phase_deg=item.phase_deg,
-                        mode=item.ac_mode))
-                elif item.comp_type == 'I':
-                    components.append(CurrentSource(item.name, n1, n2, item.value))
-                elif item.comp_type == 'C':
-                    if item.value > 0:
-                        components.append(Capacitor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'L':
-                    if item.value > 0:
-                        components.append(Inductor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'Z':
-                    if item.z_mode == 'rect':
-                        Z_val = complex(item.z_real, item.z_imag)
-                    else:
-                        mag = item.z_mag
-                        ph_rad = math.radians(item.z_phase)
-                        Z_val = complex(mag * math.cos(ph_rad), mag * math.sin(ph_rad))
-                    if abs(Z_val) > 1e-12:
-                        components.append(Impedance(item.name, n1, n2, Z_val))
+                    continue
+                # En AC pura, los diodos del puente rectificador no tienen
+                # sentido (son no-lineales) → omitir BRIDGE.
+                if item.comp_type == 'BRIDGE':
+                    errors.append(f"{item.name}: BRIDGE requiere análisis transitorio (no AC)")
+                    continue
+                # Validación específica
+                if item.comp_type == 'R' and item.value <= 0:
+                    errors.append(f"{item.name}: R debe ser > 0")
+                    continue
+                # Resto: helper centralizado (POT, XFMR, VAC, C, L, Z, I…)
+                components.extend(build_engine_components_for_item(item, pin_node))
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
@@ -3009,18 +3401,13 @@ class MainWindow(QMainWindow):
             n1 = item.node1.strip() if item.node1.strip() else auto_n1
             n2 = item.node2.strip() if item.node2.strip() else auto_n2
             try:
-                if item.comp_type == 'R' and item.value > 0:
-                    analog_comps.append(Resistor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'V':
-                    analog_comps.append(VoltageSource(item.name, n1, n2, item.value))
-                elif item.comp_type == 'VAC':
+                if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                    continue
+                if item.comp_type == 'VAC':
+                    # En esta ruta DC se ignora la VAC
                     analog_comps.append(VoltageSource(item.name, n1, n2, 0.0))
-                elif item.comp_type == 'I':
-                    analog_comps.append(CurrentSource(item.name, n1, n2, item.value))
-                elif item.comp_type == 'C' and item.value > 0:
-                    analog_comps.append(Capacitor(item.name, n1, n2, item.value))
-                elif item.comp_type == 'L' and item.value > 0:
-                    analog_comps.append(Inductor(item.name, n1, n2, item.value))
+                    continue
+                analog_comps.extend(build_engine_components_for_item(item, pin_node))
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
@@ -3175,14 +3562,52 @@ class MainWindow(QMainWindow):
             v = std.Voh if item.value else std.Vol
             self._on_component_selected(item)
 
+    # ──────────────────────────────────────────────────────────────────
+    # Potenciómetro: control en tiempo real desde el panel derecho
+    # ──────────────────────────────────────────────────────────────────
+    def _on_pot_slider(self, value: int):
+        """El usuario movió el slider → actualiza el wiper en vivo."""
+        if self._selected_pot is None:
+            return
+        self._selected_pot.pot_wiper = value / 1000.0
+        self._selected_pot.update()           # repinta el componente con la flecha movida
+        self._update_pot_label()
+        # Si la simulación continua está corriendo, el siguiente tick
+        # recalcula con el nuevo valor automáticamente.
+
+    def _update_pot_label(self):
+        if self._selected_pot is None:
+            return
+        w   = self._selected_pot.pot_wiper
+        Rt  = max(self._selected_pot.value, 1.0)
+        Ref = Rt * w
+        # Formato bonito de R efectiva
+        if Ref >= 1e6:   r_str = f"{Ref/1e6:.2f} MΩ"
+        elif Ref >= 1e3: r_str = f"{Ref/1e3:.2f} kΩ"
+        else:            r_str = f"{Ref:.2f} Ω"
+        self.pot_value_label.setText(f"{w*100:.1f}% — R = {r_str}")
+
     def _on_component_selected(self, item):
         self.prop_table.setRowCount(0)
+        # ── Slider del potenciómetro ──────────────────────────────────────
+        if item is not None and item.comp_type == 'POT':
+            self._selected_pot = item
+            self.pot_slider.blockSignals(True)
+            self.pot_slider.setValue(int(item.pot_wiper * 1000))
+            self.pot_slider.blockSignals(False)
+            self.pot_panel.setVisible(True)
+            self._update_pot_label()
+        else:
+            self._selected_pot = None
+            self.pot_panel.setVisible(False)
+
         if item is None:
             return
 
         # Etiquetas de terminales según tipo de componente
         terminal_labels = {
             'R':       ('Nodo 1',            'Nodo 2',             None),
+            'POT':     ('Nodo 1',            'Nodo 2 (cursor)',    None),
             'C':       ('Nodo 1',            'Nodo 2',             None),
             'L':       ('Nodo 1',            'Nodo 2',             None),
             'V':       ('Nodo + (ánodo)',    'Nodo − (cátodo)',    None),
@@ -3709,7 +4134,7 @@ class PowerTriangleDialog(QDialog):
     def _build_ui(self):
         from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox,
                                       QDoubleSpinBox, QPushButton, QLabel,
-                                      QTextEdit, QSplitter, QComboBox)
+                                      QTextEdit, QSplitter, QComboBox, QSpinBox)
         main = QVBoxLayout(self)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -3747,7 +4172,14 @@ class PowerTriangleDialog(QDialog):
             "Capacitivo: fuerza un Q resultante negativo."
         )
         box_layout.addWidget(self.target_combo)
+        self.decimals_label = QLabel("Decimales:")
+        self.decimals_spinbox = QSpinBox()
 
+        self.decimals_spinbox.setRange(0, 15)   # mínimo y máximo
+        self.decimals_spinbox.setValue(4)       # valor por defecto
+        
+        box_layout.addWidget(self.decimals_label)
+        box_layout.addWidget(self.decimals_spinbox)
         self.correct_btn = QPushButton("Calcular corrección")
         self.correct_btn.clicked.connect(self._on_correct)
         box_layout.addWidget(self.correct_btn)
@@ -3782,6 +4214,7 @@ class PowerTriangleDialog(QDialog):
         freq         = self.ac_result['frequency']
         fp_tgt       = self.fp_spin.value()
         target_type  = self.target_combo.currentData() or 'auto'
+        decsel = self.decimals_spinbox.value()
         res          = solver.correct_power_factor(
             total, freq, fp_tgt, target_type=target_type)
 
@@ -3799,10 +4232,10 @@ class PowerTriangleDialog(QDialog):
         tt_used     = res.get('target_type', 'auto')
 
         if tipo == 'capacitor':
-            val_str = f"C = {val*1e6:.4f} µF  (normalizado a 1 Vrms)"
+            val_str = f"C = {val*1e6:.{decsel}f} µF  (normalizado a 1 Vrms)"
             emoji   = "⚡ Capacitor"
         else:
-            val_str = f"L = {val*1e3:.4f} mH  (normalizado a 1 Vrms)"
+            val_str = f"L = {val*1e3:.{decsel}f} mH  (normalizado a 1 Vrms)"
             emoji   = "🔄 Inductor"
 
         modo_map = {'auto': 'Auto', 'inductive': 'Inductivo',

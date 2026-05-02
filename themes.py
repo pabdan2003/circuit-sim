@@ -1,5 +1,5 @@
 """
-Sistema de temas de CircuitSim.
+Sistema de temas.
 
 Cada tema es un diccionario con las mismas claves que el COLORS
 original de main.py.  Hay dos tipos de temas:
@@ -23,7 +23,7 @@ Uso desde código:
     tm = ThemeManager()
     tm.refresh()                        # descubre temas externos
     tm.list_themes()                    # [{'id', 'name', 'source'}, …]
-    colors = tm.load_theme('light_spice')
+    colors = tm.load_theme('light')
     tm.save_selection('dark')           # persistencia en config.json
     sel = tm.load_selection()           # 'dark' por defecto
 """
@@ -74,13 +74,12 @@ THEME_DARK: Dict[str, str] = {
     'current':    '#4ecca3',
 }
 
-#: Tema claro estilo SPICE/LTspice — fondo blanco, líneas oscuras.
-#: Pensado para impresión y para usuarios habituados a SPICE.
-THEME_LIGHT_SPICE: Dict[str, str] = {
+#: Tema claro  — fondo blanco, líneas oscuras.
+THEME_LIGHT: Dict[str, str] = {
     'bg':         '#ffffff',   # papel blanco
     'grid':       '#fafafa',
     'grid_line':  '#d0d0d0',   # cuadrícula gris suave
-    'component':  '#1a4f8a',   # cuerpo de componente azul SPICE
+    'component':  '#1a4f8a',   # cuerpo de componente azul
     'comp_body':  '#ffffff',
     'comp_sel':   '#e67e22',   # naranja para selección
     'wire':       '#0a4d2e',   # cables verde oscuro
@@ -104,10 +103,10 @@ BUILTIN_THEMES: Dict[str, Dict] = {
         'description': 'Paleta azul-medianoche, contraste alto.',
         'colors':      THEME_DARK,
     },
-    'light_spice': {
-        'name':        'Claro (estilo SPICE)',
-        'description': 'Fondo blanco con líneas oscuras, similar a LTspice.',
-        'colors':      THEME_LIGHT_SPICE,
+    'light': {
+        'name':        'Claro',
+        'description': 'Fondo blanco con líneas oscuras',
+        'colors':      THEME_LIGHT,
     },
 }
 

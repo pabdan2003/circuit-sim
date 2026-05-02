@@ -331,28 +331,47 @@ class VoltageSourceAC(Component):
         I[k] += self.phasor
 class Diode(Component):
     """
-    Diodo ideal con modelo de Shockley: I = Is*(exp(Vd/(n*Vt)) - 1)
+    Diodo con modelo de Shockley: I = Is·(exp(Vd / (n·Vt)) − 1)
 
     Parámetros:
-        n_a:  nodo ánodo
-        n_k:  nodo cátodo
-        Is:   corriente de saturación (default 1e-14 A)
-        n:    factor de idealidad (default 1.0)
-        Vt:   voltaje térmico (default 25.85 mV a 300 K)
+        n_a:    nodo ánodo
+        n_k:    nodo cátodo
+        Is:     corriente de saturación (A)
+                  · Diodo Si genérico  → 1e-14
+                  · LED rojo ~1.8 V   → ~1e-18
+                  · LED azul/blanco ~3 V → ~1e-26
+        n:      factor de idealidad
+                  · Diodo Si  ≈ 1.0
+                  · LED       ≈ 2.0–3.0
+        Vt:     voltaje térmico (default 25.85 mV a 300 K)
+        Vd_init: estimado inicial del Vd en el punto de operación.
+                 Importa para que Newton-Raphson arranque cerca del Vf real
+                 (e.g. ~0.6 V para Si, ~1.8 V para LED rojo, ~3 V para LED blanco).
+        Vd_max:  cota superior usada al evaluar la exponencial — protege
+                 contra overflow numérico cuando NR lanza un Vd disparatado
+                 antes de converger.  Para Si basta 1 V; los LEDs llegan a
+                 ~3.5 V por lo que se sube a 5 V por defecto.
     """
     def __init__(self, name: str, n_a: str, n_k: str,
-                 Is: float = 1e-14, n: float = 1.0, Vt: float = 0.02585):
+                 Is: float = 1e-14, n: float = 1.0, Vt: float = 0.02585,
+                 Vd_init: float = 0.6, Vd_max: float = 5.0):
         super().__init__(name)
-        self.n_a = n_a
-        self.n_k = n_k
-        self.Is  = Is
-        self.n   = n
-        self.Vt  = Vt
-        self._Vd = 0.6  # estimado inicial del punto de operación
+        self.n_a    = n_a
+        self.n_k    = n_k
+        self.Is     = Is
+        self.n      = n
+        self.Vt     = Vt
+        self.Vd_max = Vd_max
+        self._Vd    = Vd_init
 
     def _clamp_vd(self, Vd: float) -> float:
         """Limita Vd para evitar overflow en exp()."""
-        return min(Vd, 1.0)
+        if Vd > self.Vd_max:
+            return self.Vd_max
+        # En reverso muy negativo, exp() → 0; lo limitamos para evitar nan.
+        if Vd < -50.0:
+            return -50.0
+        return Vd
 
     def _id(self, Vd: float) -> float:
         """Corriente del diodo."""
@@ -362,7 +381,33 @@ class Diode(Component):
     def _gd(self, Vd: float) -> float:
         """Conductancia dinámica dId/dVd (para linealización)."""
         Vd = self._clamp_vd(Vd)
-        return self.Is * np.exp(Vd / (self.n * self.Vt)) / (self.n * self.Vt)
+        # Mínima conductancia para que la matriz no sea singular en reverso
+        return max(self.Is * np.exp(Vd / (self.n * self.Vt)) / (self.n * self.Vt),
+                   1e-12)
+
+    # ── SPICE-style diode limiting ────────────────────────────────────────
+    def _vd_limit(self, Vd_new: float, Vd_old: float) -> float:
+        """
+        Limita el cambio de Vd entre iteraciones de Newton-Raphson.
+        Evita que el solver "salte" al rincón saturado de la exponencial
+        cuando arranca lejos del punto de operación real (típico con
+        fuentes de corriente que fuerzan I a través del diodo).
+
+        Implementación clásica (Vlach & Singhal §7.3.2 / SPICE):
+          Si Vd_new > V_crit  Y  |Vd_new − Vd_old| > 2·n·Vt:
+              Vd_new ← Vd_old + n·Vt · log(1 + (Vd_new − Vd_old)/(n·Vt))
+          (cuando la nueva tiene sentido; si no, se ancla a V_crit).
+        """
+        nVt   = self.n * self.Vt
+        V_crit = nVt * np.log(nVt / (np.sqrt(2) * max(self.Is, 1e-30)))
+        if Vd_new > V_crit and abs(Vd_new - Vd_old) > 2 * nVt:
+            if Vd_old > 0:
+                arg = 1.0 + (Vd_new - Vd_old) / nVt
+                if arg > 0:
+                    return Vd_old + nVt * np.log(arg)
+                return V_crit
+            return nVt * np.log(max(Vd_new / nVt, 1.0))
+        return Vd_new
 
     def stamp_linear(self, G: np.ndarray, I: np.ndarray, node_map: dict, V: np.ndarray):
         """
@@ -374,7 +419,9 @@ class Diode(Component):
 
         Va = V[na] if na is not None else 0.0
         Vk = V[nk] if nk is not None else 0.0
-        self._Vd = Va - Vk
+        Vd_new   = Va - Vk
+        # Diode limiting con respecto al Vd guardado de la iteración anterior
+        self._Vd = self._vd_limit(Vd_new, self._Vd)
 
         gd  = self._gd(self._Vd)
         Id  = self._id(self._Vd)
@@ -824,3 +871,149 @@ class OpAmp(Component):
     @property
     def operating_point(self):
         return {'A': self.A, 'Rin': self.Rin, 'Rout': self.Rout}
+
+
+# ──────────────────────────────────────────────
+# Potenciómetro (resistencia variable)
+# ──────────────────────────────────────────────
+class Potentiometer(Component):
+    """
+    Potenciómetro modelado como reóstato (2 terminales) con resistencia
+    variable R_eff = R_total * wiper, donde wiper ∈ [0, 1].
+
+    En DC y AC se comporta exactamente como un Resistor con R = R_eff,
+    pero permite cambiar su valor "en tiempo real" durante la simulación
+    sin re-ensamblar el circuito (basta con actualizar self.wiper y volver
+    a resolver).
+
+    Atributos:
+        n1, n2:   nodos
+        R_total:  resistencia total entre extremos (Ω)
+        wiper:    fracción del recorrido [0, 1] — 0 = corto, 1 = R_total
+        R_min:    resistencia mínima (Ω) para evitar div/0 cuando wiper→0
+    """
+    def __init__(self, name: str, n1: str, n2: str,
+                 R_total: float = 10_000.0,
+                 wiper: float = 0.5,
+                 R_min: float = 1e-3):
+        super().__init__(name)
+        self.n1      = n1
+        self.n2      = n2
+        self.R_total = float(R_total)
+        self.wiper   = max(0.0, min(1.0, float(wiper)))
+        self.R_min   = float(R_min)
+
+    @property
+    def R(self) -> float:
+        """Resistencia efectiva actual."""
+        return max(self.R_min, self.R_total * self.wiper)
+
+    def stamp(self, G, I, node_map, branch_idx=None):
+        g  = 1.0 / self.R
+        n1 = node_map.get(self.n1)
+        n2 = node_map.get(self.n2)
+        if n1 is not None:
+            G[n1, n1] += g
+        if n2 is not None:
+            G[n2, n2] += g
+        if n1 is not None and n2 is not None:
+            G[n1, n2] -= g
+            G[n2, n1] -= g
+
+    def stamp_ac(self, G, I, node_map, omega: float, branch_idx=None):
+        # Resistivo puro → comportamiento idéntico en AC
+        self.stamp(G, I, node_map, branch_idx)
+
+
+# ──────────────────────────────────────────────
+# Transformador ideal con resistencia de bobinado en DC
+# ──────────────────────────────────────────────
+class Transformer(Component):
+    """
+    Transformador ideal de dos devanados acoplados magnéticamente.
+
+    Terminales:
+        n_p1, n_p2   →  primario    (lado de entrada,  N1 vueltas)
+        n_s1, n_s2   →  secundario  (lado de salida,   N2 vueltas)
+
+    Parámetros:
+        ratio:        n = N1/N2   (turns ratio)
+                      → V_p / V_s = n   y   I_s / I_p = -n  (ideal)
+        I_max:        corriente máxima primaria nominal (A)  — sólo informativa
+        R_winding:    resistencia óhmica de cada devanado (Ω)
+                      → en DC el transformador deja pasar la corriente con
+                        baja resistencia en cada bobinado, pero NO la acopla
+                        entre primario y secundario (un xfmr ideal no transmite DC).
+
+    Modelo MNA:
+        - DC:  cada devanado es un Resistor de R_winding entre sus 2 terminales,
+               sin acoplamiento entre primario y secundario.  La rama auxiliar
+               se "ancla" a 0 con G[k,k]=1 para mantener el sistema bien planteado.
+        - AC:  con UNA rama auxiliar I_p (corriente primaria) basta.  La
+               relación I_s = -n·I_p se impone estampando ±n en las columnas
+               del nodo secundario (column k), de modo que la KCL en los
+               nodos del secundario inyecta automáticamente la corriente
+               -n·I_p sin necesitar otra incógnita.  La constitutiva
+               V_p − n·V_s = 0 va en la fila k.
+    """
+    def __init__(self, name: str,
+                 n_p1: str, n_p2: str,
+                 n_s1: str, n_s2: str,
+                 ratio: float = 1.0,
+                 I_max: float = 1.0,
+                 R_winding: float = 1e-3):
+        super().__init__(name)
+        self.n_p1      = n_p1
+        self.n_p2      = n_p2
+        self.n_s1      = n_s1
+        self.n_s2      = n_s2
+        self.ratio     = float(ratio)
+        self.I_max     = float(I_max)
+        self.R_winding = float(R_winding)
+
+    def needs_branch(self) -> bool:
+        # En AC necesita variable de rama (I_p).  En DC también se le asigna
+        # una pero queda anclada a 0; ver `stamp` más abajo.
+        return True
+
+    # ── DC: cada devanado se comporta como una resistencia baja ──────────
+    def stamp(self, G, I, node_map, branch_idx=None):
+        g = 1.0 / self.R_winding
+        for (na, nb) in ((self.n_p1, self.n_p2), (self.n_s1, self.n_s2)):
+            ia = node_map.get(na)
+            ib = node_map.get(nb)
+            if ia is not None:
+                G[ia, ia] += g
+            if ib is not None:
+                G[ib, ib] += g
+            if ia is not None and ib is not None:
+                G[ia, ib] -= g
+                G[ib, ia] -= g
+        # Anclar la rama auxiliar (no se usa en DC)
+        if branch_idx is not None:
+            G[branch_idx, branch_idx] += 1.0
+            # I[branch_idx] ya es 0 → x[branch_idx] = 0
+
+    # ── AC: ecuaciones de transformador ideal ────────────────────────────
+    def stamp_ac(self, G, I, node_map, omega: float, branch_idx=None):
+        if branch_idx is None:
+            return
+        n  = self.ratio
+        a  = node_map.get(self.n_p1)   # primario +
+        b  = node_map.get(self.n_p2)   # primario −
+        c  = node_map.get(self.n_s1)   # secundario +
+        d  = node_map.get(self.n_s2)   # secundario −
+        k  = branch_idx                 # I_p
+
+        # Columna k (KCL):  I_p en primario, -n·I_p en secundario
+        if a is not None: G[a, k] += 1.0
+        if b is not None: G[b, k] -= 1.0
+        if c is not None: G[c, k] -= n
+        if d is not None: G[d, k] += n
+
+        # Fila k (constitutiva):  V_a − V_b − n·V_c + n·V_d = 0
+        if a is not None: G[k, a] += 1.0
+        if b is not None: G[k, b] -= 1.0
+        if c is not None: G[k, c] -= n
+        if d is not None: G[k, d] += n
+        # I[k] = 0 (no excitación)

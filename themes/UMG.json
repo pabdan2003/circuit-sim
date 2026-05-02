@@ -1,0 +1,30 @@
+{
+  "name": "UMG Guatemala",
+  "description": "Tema inspirado en el logo de la Universidad Mariano Gálvez de Guatemala: rojo institucional, dorado, azul profundo y tonos claros para contraste.",
+  "colors": {
+    "bg":         "#0F2233",
+    "grid":       "#1B3C56",
+    "grid_line":  "#2A5678",
+
+    "component":  "#D32F2F",
+    "comp_body":  "#2A5678",
+    "comp_sel":   "#C89B3C",
+
+    "wire":       "#E6E6E6",
+    "wire_sel":   "#C89B3C",
+    "node_dot":   "#FFFFFF",
+
+    "text":       "#F8F8F8",
+    "text_dim":   "#B8C2CC",
+
+    "pin":        "#FFFFFF",
+    "gnd":        "#C89B3C",
+
+    "toolbar":    "#C62828",
+    "panel":      "#17344A",
+    "panel_brd":  "#C89B3C",
+
+    "voltage":    "#C89B3C",
+    "current":    "#FFFFFF"
+  }
+}
