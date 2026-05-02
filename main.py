@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QDialogButtonBox, QMessageBox, QStatusBar, QFrame,
     QGraphicsPathItem, QPushButton, QComboBox, QDoubleSpinBox,
     QScrollArea, QGroupBox, QTextEdit, QFileDialog,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QTabWidget, QTabBar, QInputDialog
 )
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPainterPath, QPolygonF,
@@ -99,7 +99,9 @@ class ComponentItem(QGraphicsItem):
                   'AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                   'DFF', 'JKFF', 'TFF', 'SRFF',
                   'MUX2', 'COUNTER',
-                  'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM']
+                  'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM',
+                  # ── Inter-hoja ──
+                  'NET_LABEL_IN', 'NET_LABEL_OUT']
 
     # Tipos analógicos con 4 terminales (necesitan p3 y p4)
     FOUR_PIN_TYPES = {'XFMR', 'BRIDGE'}
@@ -168,6 +170,9 @@ class ComponentItem(QGraphicsItem):
         # Cuarto nodo para componentes de 4 terminales
         self.node4: str = ''
 
+        # Etiqueta de net label inalámbrico
+        self.sheet_label: str = ''
+
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -190,6 +195,9 @@ class ComponentItem(QGraphicsItem):
             return QRectF(-20, -5, 40, 30)
         if self.comp_type == 'NODE':
             return QRectF(-8, -8, 16, 16)
+        if self.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
+            # Forma: cable (20) + punta de flecha (12) + cuerpo (COMP_W+20) + margen
+            return QRectF(-COMP_W//2 - 20, -COMP_H//2 - 6, COMP_W + 64, COMP_H + 12)
         # Puertas: bounding rect dinámico según altura real
         if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                                'COMPARATOR', 'PWM', 'MUX2'):
@@ -250,6 +258,12 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'LOGIC_STATE':
             hw2 = COMP_W // 2
             return QPointF(hw2 + 10, 0), QPointF(hw2 + 10, 0)  # p1=salida, p2=dummy
+        if self.comp_type == 'NET_LABEL_IN':
+            # Pin único a la derecha: >--LABEL--[PIN]
+            return QPointF(hw + 22, 0), QPointF(hw + 22, 0)
+        if self.comp_type == 'NET_LABEL_OUT':
+            # Pin único a la derecha: [PIN]--LABEL-->
+            return QPointF(hw + 22, 0), QPointF(hw + 22, 0)
         return QPointF(-hw - 10, 0), QPointF(hw + 10, 0)
 
     def pin3_position(self) -> QPointF:
@@ -393,13 +407,16 @@ class ComponentItem(QGraphicsItem):
             self._draw_mux(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'LOGIC_STATE':
             self._draw_logic_state(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
+            self._draw_sheet_connector(painter, pen_body, pen_wire, body_color)
 
         # Nombre y valor
         self._draw_labels(painter, text_color)
 
         # Pines — los dispositivos de 3 terminales dibujan sus propios pines
         # internamente con etiquetas; solo dibujar pines genéricos para el resto
-        three_terminal = ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP')
+        three_terminal = ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP',
+                          'NET_LABEL_IN', 'NET_LABEL_OUT')
         if self.comp_type not in three_terminal:
             for pin in self.pin_positions():
                 painter.setPen(pen_pin)
@@ -1318,8 +1335,90 @@ class ComponentItem(QGraphicsItem):
             painter.setBrush(QBrush(pin_color))
             painter.drawEllipse(QPointF(px, py), PIN_RADIUS, PIN_RADIUS)
 
+    def _draw_sheet_connector(self, painter, pen_body, pen_wire, body_color):
+        """Net label inalámbrico con forma de flecha estilo EDA.
+
+        INPUT  (señal que entra al esquema):   >--[LABEL]--o
+               Punta de flecha apuntando a la DERECHA en el extremo izquierdo,
+               cable corto a la derecha donde el usuario conecta sus cables.
+
+        OUTPUT (señal que sale del esquema):   o--[LABEL]-->
+               Punta de flecha apuntando a la DERECHA en el extremo derecho,
+               cable corto a la derecha donde el usuario conecta sus cables.
+
+        El pin de conexión siempre está en el extremo derecho (hw+22, 0).
+        """
+        import math as _m
+        hw = COMP_W // 2      # 30
+        hh = COMP_H // 2      # 15
+        is_input = self.comp_type == 'NET_LABEL_IN'
+        label = self.sheet_label or self.name
+
+        # Paleta: azul para input, naranja para output
+        col_main  = QColor('#2980b9') if is_input else QColor('#e67e22')
+        col_fill  = col_main.lighter(175)
+        col_arrow = col_main
+
+        # ── Dimensiones del cuerpo ────────────────────────────────────────
+        # Cuerpo rectangular con el label, va de x=-hw a x=hw
+        body_x  = -hw          # izquierda del rect
+        body_w  = COMP_W       # ancho = 60
+        body_h  = hh * 2       # alto  = 30
+        tip_sz  = 12           # tamaño de la punta de flecha
+
+        # ── Cable de conexión (siempre a la derecha) ───────────────────────
+        # Va del borde derecho del cuerpo (hw) hasta el pin (hw+22)
+        painter.setPen(QPen(QColor(COLORS['wire']), 2))
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 22, 0))
+
+        # ── Cuerpo rectangular ────────────────────────────────────────────
+        painter.setPen(QPen(col_main, 2))
+        painter.setBrush(QBrush(col_fill))
+        painter.drawRect(QRectF(body_x, -hh, body_w, body_h))
+
+        # ── Punta de flecha ───────────────────────────────────────────────
+        painter.setPen(QPen(col_arrow, 2))
+        painter.setBrush(QBrush(col_arrow))
+
+        if is_input:
+            # Flecha apunta a la DERECHA en el extremo IZQUIERDO del cuerpo
+            # Forma ">": vértice en (body_x, 0), base en la izquierda
+            tip_x = body_x           # punta = borde izquierdo del rect
+            arrow = QPolygonF([
+                QPointF(tip_x,            0),
+                QPointF(tip_x - tip_sz,  -tip_sz * 0.55),
+                QPointF(tip_x - tip_sz,   tip_sz * 0.55),
+            ])
+            painter.drawPolygon(arrow)
+        else:
+            # Flecha apunta a la DERECHA en el extremo DERECHO del cuerpo
+            # Forma "→": vértice en (hw, 0), base a la izquierda del vértice
+            tip_x = hw               # punta = borde derecho del rect (antes del cable)
+            arrow = QPolygonF([
+                QPointF(tip_x,            0),
+                QPointF(tip_x - tip_sz,  -tip_sz * 0.55),
+                QPointF(tip_x - tip_sz,   tip_sz * 0.55),
+            ])
+            painter.drawPolygon(arrow)
+
+        # ── Etiqueta centrada en el cuerpo ────────────────────────────────
+        font = QFont('Consolas', 8, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QPen(col_main.darker(160), 1))
+        # Texto centrado, dejando margen para la flecha en el input
+        text_margin = tip_sz + 4 if is_input else 4
+        text_rect = QRectF(body_x + text_margin, -hh,
+                           body_w - text_margin - 4, body_h)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter, label)
+
+        # ── Pin de conexión ───────────────────────────────────────────────
+        pin_color = QColor(COLORS['pin'])
+        painter.setPen(QPen(pin_color, 2))
+        painter.setBrush(QBrush(pin_color))
+        painter.drawEllipse(QPointF(hw + 22, 0), PIN_RADIUS, PIN_RADIUS)
+
     def _draw_labels(self, painter, text_color):
-        if self.comp_type in ('GND', 'NODE'):
+        if self.comp_type in ('GND', 'NODE', 'NET_LABEL_IN', 'NET_LABEL_OUT'):
             return
         font = QFont('Consolas', 8)
         painter.setFont(font)
@@ -1554,17 +1653,50 @@ class CircuitScene(QGraphicsScene):
         self._mode = 'select'   # 'select' | 'wire' | 'place_{tipo}'
 
         self._comp_counter: Dict[str, int] = {}
-        self._draw_grid()
 
-    # ── Grid ────────────────────────────────────
-    def _draw_grid(self):
-        pen_minor = QPen(QColor(COLORS['grid_line']), 0.5, Qt.PenStyle.DotLine)
-        pen_major = QPen(QColor(COLORS['grid_line']), 1.0, Qt.PenStyle.SolidLine)
-        r = int(self.sceneRect().width() // GRID_SIZE)
-        for i in range(-r, r):
-            pen = pen_major if i % 5 == 0 else pen_minor
-            self.addLine(i*GRID_SIZE, -1000, i*GRID_SIZE, 1000, pen)
-            self.addLine(-1000, i*GRID_SIZE, 1000, i*GRID_SIZE, pen)
+    # ── Grid (dibujado en drawBackground para que sea independiente del zoom) ──
+    def drawBackground(self, painter: QPainter, rect: QRectF):
+        super().drawBackground(painter, rect)
+
+        left   = int(math.floor(rect.left()  / GRID_SIZE)) * GRID_SIZE
+        right  = int(math.ceil(rect.right()  / GRID_SIZE)) * GRID_SIZE
+        top    = int(math.floor(rect.top()   / GRID_SIZE)) * GRID_SIZE
+        bottom = int(math.ceil(rect.bottom() / GRID_SIZE)) * GRID_SIZE
+
+        pen_minor = QPen(QColor(COLORS['grid_line']), 0)
+        pen_minor.setCosmetic(True)
+        pen_minor.setStyle(Qt.PenStyle.DotLine)
+
+        pen_major = QPen(QColor(COLORS['grid_line']), 0)
+        pen_major.setCosmetic(True)
+        pen_major.setStyle(Qt.PenStyle.SolidLine)
+
+        lines_minor = []
+        lines_major = []
+        x = left
+        while x <= right:
+            idx = round(x / GRID_SIZE)
+            line = QLineF(x, rect.top(), x, rect.bottom())
+            if idx % 5 == 0:
+                lines_major.append(line)
+            else:
+                lines_minor.append(line)
+            x += GRID_SIZE
+
+        y = top
+        while y <= bottom:
+            idx = round(y / GRID_SIZE)
+            line = QLineF(rect.left(), y, rect.right(), y)
+            if idx % 5 == 0:
+                lines_major.append(line)
+            else:
+                lines_minor.append(line)
+            y += GRID_SIZE
+
+        painter.setPen(pen_minor)
+        painter.drawLines(lines_minor)
+        painter.setPen(pen_major)
+        painter.drawLines(lines_major)
 
     # ── Modo ────────────────────────────────────
     def set_mode(self, mode: str):
@@ -1586,7 +1718,8 @@ class CircuitScene(QGraphicsScene):
                         'GND': 'GND', 'NODE': 'N', 'LOGIC_STATE': 'LS',
                         'AND': 'AND', 'OR': 'OR', 'NOT': 'NOT', 'NAND': 'NAND',
                         'NOR': 'NOR', 'XOR': 'XOR', 'DFF': 'FF', 'JKFF': 'FF',
-                        'TFF': 'FF', 'SRFF': 'FF', 'COUNTER': 'CNT', 'MUX2': 'MUX'}
+                        'TFF': 'FF', 'SRFF': 'FF', 'COUNTER': 'CNT', 'MUX2': 'MUX',
+                        'NET_LABEL_IN': 'NL', 'NET_LABEL_OUT': 'NL'}
             name = f"{prefixes.get(comp_type, comp_type)}{count}"
 
         units = {'R': 'Ω', 'V': 'V', 'VAC': 'V', 'I': 'A', 'C': 'F', 'L': 'H',
@@ -1603,15 +1736,21 @@ class CircuitScene(QGraphicsScene):
                     'D': 1e-14, 'LED': 0.0, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
                     'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5,
                     'XFMR': 1.0, 'BRIDGE': 0.7,
-                    'LOGIC_STATE': 0.0}  # 0=LOW, 1=HIGH
-        if value == 0.0 and comp_type != 'LOGIC_STATE':
+                    'LOGIC_STATE': 0.0,
+                    'NET_LABEL_IN': 0.0, 'NET_LABEL_OUT': 0.0}
+        if value == 0.0 and comp_type not in ('LOGIC_STATE', 'NET_LABEL_IN', 'NET_LABEL_OUT'):
             value = defaults.get(comp_type, 1.0)
-        elif comp_type == 'LOGIC_STATE':
+        elif comp_type in ('LOGIC_STATE', 'NET_LABEL_IN', 'NET_LABEL_OUT'):
             value = defaults.get(comp_type, 0.0)
 
         item = ComponentItem(comp_type, name, value, unit, node1, node2, node3)
         if comp_type == 'NOT':
             item.dig_inputs = 1
+        if comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
+            # El sheet_label es el nombre de red inalámbrico.
+            # Por defecto 'NET' para que el usuario lo renombre a algo significativo.
+            # Dos net labels con el mismo sheet_label quedan eléctricamente unidos.
+            item.sheet_label = 'NET'
         snap_x = round(pos.x() / GRID_SIZE) * GRID_SIZE
         snap_y = round(pos.y() / GRID_SIZE) * GRID_SIZE
         item.setPos(snap_x, snap_y)
@@ -1793,7 +1932,25 @@ class CircuitScene(QGraphicsScene):
         for idx in range(len(self.wires)):
             union(f"__wire{idx}__p1", f"__wire{idx}__p2")
 
-        # ── 3. Detectar grupos GND ───────────────────────────────────────
+        # ── 3a. Unir pines de net labels con el mismo sheet_label ───────
+        # Esta es la lógica central de los nodos inalámbricos:
+        # todos los net labels (IN u OUT) que comparten sheet_label
+        # se unen en el mismo grupo del Union-Find, igual que si hubiera
+        # un cable físico entre ellos. Funciona en la misma hoja Y entre hojas.
+        label_first_pin: Dict[str, str] = {}  # label → pin_key del primer label visto
+        for comp in self.components:
+            if comp.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') and comp.sheet_label:
+                pin_key = f"{comp.name}__p1"
+                if pin_key not in pins:
+                    continue
+                lbl = comp.sheet_label
+                if lbl not in label_first_pin:
+                    label_first_pin[lbl] = pin_key
+                else:
+                    # Unir este pin con el primer pin que tiene el mismo label
+                    union(label_first_pin[lbl], pin_key)
+
+        # ── 3b. Detectar grupos GND ──────────────────────────────────────
         # Registrar AMBOS pines del componente GND como tierra
         gnd_roots: set = set()
         for comp in self.components:
@@ -1854,6 +2011,9 @@ class CircuitScene(QGraphicsScene):
             # 4º nodo
             if item.comp_type in ComponentItem.FOUR_PIN_TYPES and 'node4' in data:
                 item.node4 = data['node4']
+            # Etiqueta inter-hoja
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') and 'sheet_label' in data:
+                item.sheet_label = data['sheet_label']
             # Campos digitales
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
                 if 'dig_inputs'  in data: item.dig_inputs      = data['dig_inputs']
@@ -1896,7 +2056,47 @@ class ComponentDialog(QDialog):
         layout = QFormLayout(self)
         layout.setSpacing(10)
 
-        self.name_edit = QLineEdit(self.item.name)
+        is_netlabel = self.item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT')
+
+        # ── Net label: diálogo mínimo con solo el nombre de red ──────────
+        # Inicializar todos los widgets opcionales a None para get_data()
+        self.name_edit   = QLineEdit(self.item.name)
+        self.value_spin  = QDoubleSpinBox()
+        self.value_spin.setValue(self.item.value)
+        self.node1_edit  = QLineEdit(self.item.node1)
+        self.node2_edit  = QLineEdit(self.item.node2)
+        self.node3_edit  = None
+        self._extra_node_edits = []
+        self._sheet_label_edit = None
+        self._freq_spin = self._phase_spin = self._mode_combo = None
+        self._led_color_combo = None
+        self._z_mode_combo = self._z_real = self._z_imag = None
+        self._z_mag = self._z_phase = None
+        self._pot_wiper_spin = None
+        self._xfmr_ratio_spin = self._xfmr_imax_spin = None
+        self._node4_edit = None
+        self._dig_inputs_spin = self._dig_bits_spin = self._dig_vref_spin = None
+        self._dig_tpd_spin = self._dig_clk_edit = self._dig_anode_edit = None
+
+        if is_netlabel:
+            kind = 'Entrada' if self.item.comp_type == 'NET_LABEL_IN' else 'Salida'
+            layout.addRow(QLabel(f'<b>Net Label — {kind}</b>'))
+            self._sheet_label_edit = QLineEdit(self.item.sheet_label)
+            self._sheet_label_edit.setPlaceholderText('ej: VCC, CLK, RESET…')
+            layout.addRow('Nombre de red:', self._sheet_label_edit)
+            layout.addRow(QLabel(
+                '<small>Todos los net labels con el mismo nombre<br>'
+                'quedan eléctricamente conectados,<br>'
+                'en la misma hoja o en hojas distintas.</small>'
+            ))
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addRow(buttons)
+            return   # ← salir aquí; el resto del diálogo no aplica a net labels
+
+        # ── Componente normal: diálogo completo ───────────────────────────
         layout.addRow("Nombre:", self.name_edit)
 
         # Etiqueta y rango del valor según tipo
@@ -1918,7 +2118,8 @@ class ComponentDialog(QDialog):
         self.value_spin.setRange(-1e12, 1e12)
         self.value_spin.setDecimals(6)
         self.value_spin.setValue(self.item.value)
-        layout.addRow(value_labels.get(self.item.comp_type, 'Valor:'), self.value_spin)
+        if not is_netlabel:
+            layout.addRow(value_labels.get(self.item.comp_type, 'Valor:'), self.value_spin)
 
         # Etiquetas de nodos según terminales reales del componente
         node_labels = {
@@ -1988,16 +2189,17 @@ class ComponentDialog(QDialog):
             layout.addRow(lbls[3] + ':', self._node4_edit)
             self._extra_node_edits = []
         else:
-            lbl1, lbl2, lbl3 = node_labels.get(self.item.comp_type, ('Nodo +', 'Nodo −', None))
             self.node1_edit = QLineEdit(self.item.node1)
             self.node2_edit = QLineEdit(self.item.node2)
-            layout.addRow(lbl1 + ':', self.node1_edit)
-            layout.addRow(lbl2 + ':', self.node2_edit)
             self.node3_edit = None
-            if lbl3 is not None:
-                self.node3_edit = QLineEdit(self.item.node3)
-                layout.addRow(lbl3 + ':', self.node3_edit)
             self._extra_node_edits = []
+            if not is_netlabel:
+                lbl1, lbl2, lbl3 = node_labels.get(self.item.comp_type, ('Nodo +', 'Nodo −', None))
+                layout.addRow(lbl1 + ':', self.node1_edit)
+                layout.addRow(lbl2 + ':', self.node2_edit)
+                if lbl3 is not None:
+                    self.node3_edit = QLineEdit(self.item.node3)
+                    layout.addRow(lbl3 + ':', self.node3_edit)
 
         # Selector de color para LED
         self._led_color_combo = None
@@ -2233,6 +2435,8 @@ class ComponentDialog(QDialog):
             data['xfmr_ratio'] = self._xfmr_ratio_spin.value()
         if self._xfmr_imax_spin is not None:
             data['xfmr_imax']  = self._xfmr_imax_spin.value()
+        if self._sheet_label_edit is not None:
+            data['sheet_label'] = self._sheet_label_edit.text()
         return data
 
 
@@ -2370,27 +2574,33 @@ class MainWindow(QMainWindow):
 
     # ── Construcción UI ──────────────────────────
     def _build_ui(self):
-        # Escena + Vista
-        self.scene = CircuitScene()
-        self.scene.component_selected.connect(self._on_component_selected)
-        self.scene.status_message.connect(self.statusBar().showMessage)
-        self.scene.logic_state_toggled.connect(self._on_logic_state_toggled)
+        # Sistema de hojas (tabs) — cada hoja tiene su propia escena y vista
+        self._sheets: List[Dict] = []  # [{scene, view, name}]
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.setMovable(True)
+        self.tab_widget.tabCloseRequested.connect(self._close_sheet)
+        self.tab_widget.currentChanged.connect(self._on_sheet_changed)
 
-        self.view = QGraphicsView(self.scene)
-        self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
-        self.view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.view.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        # Botón "+" para agregar hojas
+        add_btn = QPushButton("+")
+        add_btn.setFixedSize(24, 24)
+        add_btn.setToolTip("Agregar nueva hoja")
+        add_btn.clicked.connect(lambda: self._add_sheet())
+        self.tab_widget.setCornerWidget(add_btn, Qt.Corner.TopRightCorner)
 
-        # Zoom con rueda
-        self.view.wheelEvent = self._wheel_zoom
+        # Doble-click en la pestaña para renombrar
+        self.tab_widget.tabBarDoubleClicked.connect(self._rename_sheet)
+
+        # Crear la primera hoja
+        self._add_sheet(name="Hoja 1")
 
         # Panel derecho (propiedades + resultados)
         self._build_right_panel()
 
-        # Layout central: canvas + panel derecho
+        # Layout central: tabs + panel derecho
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.view)
+        splitter.addWidget(self.tab_widget)
         splitter.addWidget(self.right_panel)
         splitter.setSizes([1000, 280])
 
@@ -2404,6 +2614,71 @@ class MainWindow(QMainWindow):
 
         # Status bar
         self.statusBar().showMessage("Listo — Selecciona una categoría para colocar componentes")
+
+    # ── Propiedades: scene y view apuntan a la hoja activa ─────
+    @property
+    def scene(self) -> 'CircuitScene':
+        idx = self.tab_widget.currentIndex()
+        if idx < 0 or idx >= len(self._sheets):
+            return self._sheets[0]['scene']
+        return self._sheets[idx]['scene']
+
+    @property
+    def view(self) -> QGraphicsView:
+        idx = self.tab_widget.currentIndex()
+        if idx < 0 or idx >= len(self._sheets):
+            return self._sheets[0]['view']
+        return self._sheets[idx]['view']
+
+    def _create_scene_view(self) -> Tuple[CircuitScene, QGraphicsView]:
+        scene = CircuitScene()
+        scene.component_selected.connect(self._on_component_selected)
+        scene.status_message.connect(self.statusBar().showMessage)
+        scene.logic_state_toggled.connect(self._on_logic_state_toggled)
+
+        view = QGraphicsView(scene)
+        view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        view.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        view.wheelEvent = self._wheel_zoom
+        return scene, view
+
+    def _add_sheet(self, name: str = ''):
+        if not name:
+            idx = len(self._sheets) + 1
+            name = f"Hoja {idx}"
+        scene, view = self._create_scene_view()
+        sheet = {'scene': scene, 'view': view, 'name': name}
+        self._sheets.append(sheet)
+        tab_idx = self.tab_widget.addTab(view, name)
+        self.tab_widget.setCurrentIndex(tab_idx)
+
+    def _close_sheet(self, index: int):
+        if len(self._sheets) <= 1:
+            self.statusBar().showMessage("No se puede cerrar la última hoja")
+            return
+        reply = QMessageBox.question(
+            self, "Cerrar hoja",
+            f"¿Cerrar \"{self._sheets[index]['name']}\"? Se perderán los componentes.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._sheets.pop(index)
+            self.tab_widget.removeTab(index)
+
+    def _on_sheet_changed(self, index: int):
+        if 0 <= index < len(self._sheets):
+            self.statusBar().showMessage(f"Hoja activa: {self._sheets[index]['name']}")
+
+    def _rename_sheet(self, index: int):
+        if 0 <= index < len(self._sheets):
+            old_name = self._sheets[index]['name']
+            new_name, ok = QInputDialog.getText(
+                self, "Renombrar hoja", "Nuevo nombre:", text=old_name)
+            if ok and new_name.strip():
+                self._sheets[index]['name'] = new_name.strip()
+                self.tab_widget.setTabText(index, new_name.strip())
 
     def _build_right_panel(self):
         self.right_panel = QWidget()
@@ -2530,13 +2805,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_theme_in_ui(self):
         """Re-aplica stylesheet y fuerza redibujo del canvas tras cambiar tema."""
-        # 1) Re-aplicar stylesheet global (lee COLORS al vuelo)
         self._apply_style()
-        # 2) Fondo de la escena
-        self.scene.setBackgroundBrush(QBrush(QColor(COLORS['bg'])))
-        # 3) Forzar repintado de items y viewport
-        self.scene.update()
-        self.view.viewport().update()
+        for sheet in self._sheets:
+            sheet['scene'].setBackgroundBrush(QBrush(QColor(COLORS['bg'])))
+            sheet['scene'].update()
+            sheet['view'].viewport().update()
 
     def _build_component_toolbar(self):
         """Barra secundaria (fila 2): categorías de componentes, herramientas y simulación."""
@@ -2574,8 +2847,10 @@ class MainWindow(QMainWindow):
                 ('XFMR',    'Transformador',         '⌇⌇'),
             ]),
             ("Referencia", [
-                ('GND',  'Tierra',   '⏚'),
-                ('NODE', 'Nodo',     '•'),
+                ('GND',          'Tierra',          '⏚'),
+                ('NODE',         'Nodo',            '•'),
+                ('NET_LABEL_IN',  'Net Label Entrada', '→▷'),
+                ('NET_LABEL_OUT', 'Net Label Salida',  '◁→'),
             ]),
             ("Digital", [
                 ('AND',       'Puerta AND',     '&'),
@@ -2731,16 +3006,76 @@ class MainWindow(QMainWindow):
         pass  # modo automático — no se usa
 
     # ── Simulación automática ─────────────────────────────────────────────
+    def _merge_all_sheets(self) -> Tuple[List[ComponentItem], Dict[str, str]]:
+        """Combina componentes y netlist de todas las hojas para simulación multi-hoja.
+
+        Cada hoja ya resuelve sus propios net labels internamente (via extract_netlist).
+        Este método solo necesita unificar los nets ENTRE hojas distintas cuando el
+        mismo sheet_label aparece en hojas diferentes.
+        """
+        all_components: List[ComponentItem] = []
+        merged_pin_node: Dict[str, str] = {}
+
+        sheet_netlists = []
+        for i, sheet in enumerate(self._sheets):
+            sc = sheet['scene']
+            pn = sc.extract_netlist()
+            prefix = f"_s{i}_"
+            prefixed_pn = {}
+            for pin_id, net_name in pn.items():
+                new_net = net_name if net_name == '0' else prefix + net_name
+                prefixed_pn[pin_id] = new_net
+            sheet_netlists.append(prefixed_pn)
+            all_components.extend(sc.components)
+            merged_pin_node.update(prefixed_pn)
+
+        # ── Unificar nets ENTRE hojas por sheet_label ─────────────────────
+        # Dentro de cada hoja, extract_netlist ya unió los net labels.
+        # Aquí unimos los nets canónicos de cada hoja que comparten label.
+        label_canonical: Dict[str, str] = {}  # label → net canónico global
+
+        for i, sheet in enumerate(self._sheets):
+            pn = sheet_netlists[i]
+            for comp in sheet['scene'].components:
+                if comp.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') and comp.sheet_label:
+                    pin_key = f"{comp.name}__p1"
+                    if pin_key not in pn:
+                        continue
+                    net = pn[pin_key]   # net ya prefijado con _sN_
+                    lbl = comp.sheet_label
+                    if lbl not in label_canonical:
+                        label_canonical[lbl] = net
+                    elif label_canonical[lbl] != net:
+                        # Reemplazar en toda la netlist
+                        target = label_canonical[lbl]
+                        for k in merged_pin_node:
+                            if merged_pin_node[k] == net:
+                                merged_pin_node[k] = target
+
+        return all_components, merged_pin_node
+
     def _toggle_simulation(self, checked: bool):
         """Analiza el circuito y despacha automáticamente al solver correcto."""
         if not checked:
             self._stop_simulation()
             return
 
-        pin_node = self.scene.extract_netlist()
+        # Usar merge siempre que haya net labels (NET_LABEL_IN/OUT),
+        # ya sea en una sola hoja o en varias — actúan como nodos inalámbricos.
+        has_net_labels = any(
+            comp.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT')
+            for sheet in self._sheets
+            for comp in sheet['scene'].components
+        )
+        if has_net_labels:
+            all_comps, pin_node = self._merge_all_sheets()
+        else:
+            pin_node = self.scene.extract_netlist()
+            all_comps = self.scene.components
+
         std_name = DEFAULT_LOGIC_STANDARD
         analyzer = CircuitAnalyzer(logic_standard=std_name)
-        flags = analyzer.analyze(self.scene.components, pin_node)
+        flags = analyzer.analyze(all_comps, pin_node)
 
         self.results_text.setPlainText(flags.summary() + "\n\nAnalizando...")
         from PyQt6.QtWidgets import QApplication
@@ -2811,6 +3146,9 @@ class MainWindow(QMainWindow):
             analyzer = CircuitAnalyzer(logic_standard=std_name)
             flags = analyzer.analyze(self.scene.components, pin_node)
 
+        # Use all components from active sheet for simulation
+        sim_components = self.scene.components
+
         std_name = DEFAULT_LOGIC_STANDARD
         out = ["═══ SIMULACIÓN AUTOMÁTICA ═══", f"  {flags.summary()}", ""]
         if flags.warnings:
@@ -2818,7 +3156,7 @@ class MainWindow(QMainWindow):
 
         # ── Construir componentes analógicos ─────────────────────────────
         analog_comps, build_errors = [], []
-        for item in self.scene.components:
+        for item in sim_components:
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
                 continue
             try:
@@ -2867,7 +3205,7 @@ class MainWindow(QMainWindow):
 
         # ── AC ────────────────────────────────────────────────────────────
         if flags.has_ac and analog_comps:
-            freq = next((it.frequency for it in self.scene.components
+            freq = next((it.frequency for it in sim_components
                          if it.comp_type == "VAC"), 60.0)
             ac = self.solver.solve_ac_single(analog_comps, freq)
             out.append(f"── Fasores AC ({freq} Hz) ──")
@@ -2914,7 +3252,7 @@ class MainWindow(QMainWindow):
             dsim = DigitalSimulator()
             adc_list, dac_list = [], []
             _gmap = {"AND":"AND","OR":"OR","NOT":"NOT","NAND":"NAND","NOR":"NOR","XOR":"XOR"}
-            for item in self.scene.components:
+            for item in sim_components:
                 ct = item.comp_type; tpd = item.dig_tpd_ns * 1e-9
                 try:
                     if ct in _gmap:
@@ -3698,47 +4036,44 @@ class MainWindow(QMainWindow):
     def _new_circuit(self):
         reply = QMessageBox.question(
             self, "Nuevo circuito",
-            "¿Descartar el circuito actual?",
+            "¿Descartar el circuito actual (todas las hojas)?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self._clear_circuit()
+            self._clear_all_sheets()
             self._current_file = None
             self.setWindowTitle("CircuitSim — Simulador de Circuitos")
             self._load_demo_circuit()
 
     def _clear_circuit(self):
+        """Limpia solo la hoja activa."""
         for item in self.scene.components + self.scene.wires:
             self.scene.removeItem(item)
         self.scene.components.clear()
         self.scene.wires.clear()
         self.scene._comp_counter.clear()
         self.results_text.clear()
-        # Limpiar también el archivo actual para no sobreescribir accidentalmente
+
+    def _clear_all_sheets(self):
+        """Elimina todas las hojas y crea una nueva vacía."""
+        for sheet in self._sheets:
+            sc = sheet['scene']
+            for item in sc.components + sc.wires:
+                sc.removeItem(item)
+            sc.components.clear()
+            sc.wires.clear()
+            sc._comp_counter.clear()
+        self._sheets.clear()
+        self.tab_widget.clear()
+        self._add_sheet(name="Hoja 1")
+        self.results_text.clear()
         self._current_file = None
         self.setWindowTitle("CircuitSim — Simulador de Circuitos")
 
-    # ── Guardar (.csin) ──────────────────────────
-    def _save_circuit(self):
-        path = self._current_file
-        # Si ya hay un archivo guardado, sobreescribir directamente sin diálogo
-        if not path:
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Guardar circuito", "",
-                "CircuitSim (*.csin);;Todos los archivos (*)"
-            )
-        if not path:
-            return
-        if not path.endswith('.csin'):
-            path += '.csin'
-
-        data = {
-            'version': '1.0',
-            'components': [],
-            'wires': []
-        }
-
-        for item in self.scene.components:
+    # ── Serialización de una hoja ─────────────────
+    def _serialize_sheet(self, scene: CircuitScene) -> dict:
+        sheet_data = {'components': [], 'wires': []}
+        for item in scene.components:
             entry = {
                 'type':  item.comp_type,
                 'name':  item.name,
@@ -3763,14 +4098,90 @@ class MainWindow(QMainWindow):
                 entry['z_mag']   = item.z_mag
                 entry['z_phase'] = item.z_phase
                 entry['z_mode']  = item.z_mode
-            data['components'].append(entry)
+            if item.comp_type == 'POT':
+                entry['pot_wiper'] = item.pot_wiper
+            if item.comp_type == 'XFMR':
+                entry['xfmr_ratio'] = item.xfmr_ratio
+                entry['xfmr_imax']  = item.xfmr_imax
+            if item.comp_type == 'BRIDGE':
+                entry['bridge_vf'] = item.bridge_vf
+            if item.comp_type in ComponentItem.FOUR_PIN_TYPES:
+                entry['node4'] = item.node4
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
+                entry['sheet_label'] = item.sheet_label
+            sheet_data['components'].append(entry)
 
-        for wire in self.scene.wires:
+        for wire in scene.wires:
             line = wire.line()
-            data['wires'].append({
+            sheet_data['wires'].append({
                 'x1': line.x1(), 'y1': line.y1(),
                 'x2': line.x2(), 'y2': line.y2(),
             })
+        return sheet_data
+
+    def _load_sheet_data(self, scene: CircuitScene, sheet_data: dict):
+        for c in sheet_data.get('components', []):
+            item = scene.place_component(
+                c['type'], QPointF(c['x'], c['y']),
+                name=c['name'], value=c['value'],
+                unit=c.get('unit', ''),
+                node1=c.get('node1', ''),
+                node2=c.get('node2', ''),
+                node3=c.get('node3', '')
+            )
+            angle = c.get('angle', 0)
+            if angle:
+                item._angle = angle
+                item.setRotation(angle)
+            if c['type'] == 'VAC':
+                item.frequency = c.get('frequency', 60.0)
+                item.phase_deg = c.get('phase_deg', 0.0)
+                item.ac_mode   = c.get('ac_mode', 'rms')
+            if c['type'] == 'LED':
+                item.led_color = c.get('led_color', 'red')
+            if c['type'] == 'Z':
+                item.z_real  = c.get('z_real',  100.0)
+                item.z_imag  = c.get('z_imag',  0.0)
+                item.z_mag   = c.get('z_mag',   100.0)
+                item.z_phase = c.get('z_phase', 0.0)
+                item.z_mode  = c.get('z_mode',  'rect')
+            if c['type'] == 'POT' and 'pot_wiper' in c:
+                item.pot_wiper = max(0.0, min(1.0, float(c['pot_wiper'])))
+            if c['type'] == 'XFMR':
+                item.xfmr_ratio = c.get('xfmr_ratio', 2.0)
+                item.xfmr_imax  = c.get('xfmr_imax',  1.0)
+            if c['type'] == 'BRIDGE':
+                item.bridge_vf = c.get('bridge_vf', 0.7)
+            if c['type'] in ComponentItem.FOUR_PIN_TYPES and 'node4' in c:
+                item.node4 = c['node4']
+            if c['type'] in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
+                item.sheet_label = c.get('sheet_label', item.name)
+
+        for w in sheet_data.get('wires', []):
+            wire = WireItem(QPointF(w['x1'], w['y1']), QPointF(w['x2'], w['y2']))
+            scene.addItem(wire)
+            scene.wires.append(wire)
+
+    # ── Guardar (.csin) ──────────────────────────
+    def _save_circuit(self):
+        path = self._current_file
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar circuito", "",
+                "CircuitSim (*.csin);;Todos los archivos (*)"
+            )
+        if not path:
+            return
+        if not path.endswith('.csin'):
+            path += '.csin'
+
+        sheets = []
+        for sheet in self._sheets:
+            sd = self._serialize_sheet(sheet['scene'])
+            sd['name'] = sheet['name']
+            sheets.append(sd)
+
+        data = {'version': '2.0', 'sheets': sheets}
 
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -3781,7 +4192,6 @@ class MainWindow(QMainWindow):
 
     # ── Guardar como (.csin) ─────────────────────
     def _save_circuit_as(self):
-        """Siempre abre el diálogo, permite elegir nuevo nombre/ubicación."""
         path, _ = QFileDialog.getSaveFileName(
             self, "Guardar circuito como", "",
             "CircuitSim (*.csin);;Todos los archivos (*)"
@@ -3790,7 +4200,6 @@ class MainWindow(QMainWindow):
             return
         if not path.endswith('.csin'):
             path += '.csin'
-        # Reusar la lógica de guardado apuntando al nuevo path
         self._current_file = path
         self._save_circuit()
 
@@ -3810,40 +4219,23 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"No se pudo abrir el archivo:\n{e}")
             return
 
-        self._clear_circuit()
+        # Compatibilidad con formato v1 (una sola hoja)
+        if 'sheets' not in data:
+            data = {'version': '2.0', 'sheets': [{
+                'name': 'Hoja 1',
+                'components': data.get('components', []),
+                'wires': data.get('wires', []),
+            }]}
 
-        for c in data.get('components', []):
-            item = self.scene.place_component(
-                c['type'], QPointF(c['x'], c['y']),
-                name=c['name'], value=c['value'],
-                unit=c.get('unit', ''),
-                node1=c.get('node1', ''),
-                node2=c.get('node2', ''),
-                node3=c.get('node3', '')
-            )
-            angle = c.get('angle', 0)
-            if angle:
-                item._angle = angle
-                item.setRotation(angle)
-            # Restaurar atributos de fuente AC
-            if c['type'] == 'VAC':
-                item.frequency = c.get('frequency', 60.0)
-                item.phase_deg = c.get('phase_deg', 0.0)
-                item.ac_mode   = c.get('ac_mode', 'rms')
-            if c['type'] == 'LED':
-                item.led_color = c.get('led_color', 'red')
-            # Restaurar atributos de impedancia
-            if c['type'] == 'Z':
-                item.z_real  = c.get('z_real',  100.0)
-                item.z_imag  = c.get('z_imag',  0.0)
-                item.z_mag   = c.get('z_mag',   100.0)
-                item.z_phase = c.get('z_phase', 0.0)
-                item.z_mode  = c.get('z_mode',  'rect')
+        self._clear_all_sheets()
+        self._sheets.clear()
+        self.tab_widget.clear()
 
-        for w in data.get('wires', []):
-            wire = WireItem(QPointF(w['x1'], w['y1']), QPointF(w['x2'], w['y2']))
-            self.scene.addItem(wire)
-            self.scene.wires.append(wire)
+        for sd in data['sheets']:
+            name = sd.get('name', f'Hoja {len(self._sheets)+1}')
+            self._add_sheet(name=name)
+            scene = self._sheets[-1]['scene']
+            self._load_sheet_data(scene, sd)
 
         self._current_file = path
         self.setWindowTitle(f"CircuitSim — {os.path.basename(path)}")
