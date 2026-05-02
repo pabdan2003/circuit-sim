@@ -196,8 +196,8 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'NODE':
             return QRectF(-8, -8, 16, 16)
         if self.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
-            # Forma: cable (20) + punta de flecha (12) + cuerpo (COMP_W+20) + margen
-            return QRectF(-COMP_W//2 - 20, -COMP_H//2 - 6, COMP_W + 64, COMP_H + 12)
+            # Tamaño similar a GND. Flecha de 30 px y etiqueta encima.
+            return QRectF(-18, -16, 36, 28)
         # Puertas: bounding rect dinámico según altura real
         if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                                'COMPARATOR', 'PWM', 'MUX2'):
@@ -259,11 +259,11 @@ class ComponentItem(QGraphicsItem):
             hw2 = COMP_W // 2
             return QPointF(hw2 + 10, 0), QPointF(hw2 + 10, 0)  # p1=salida, p2=dummy
         if self.comp_type == 'NET_LABEL_IN':
-            # Pin único a la derecha: >--LABEL--[PIN]
-            return QPointF(hw + 22, 0), QPointF(hw + 22, 0)
+            # Pin en la CABEZA de la flecha (lado derecho): ─►●
+            return QPointF(15, 0), QPointF(15, 0)
         if self.comp_type == 'NET_LABEL_OUT':
-            # Pin único a la derecha: [PIN]--LABEL-->
-            return QPointF(hw + 22, 0), QPointF(hw + 22, 0)
+            # Pin en la COLA de la flecha (lado izquierdo): ●─►
+            return QPointF(-15, 0), QPointF(-15, 0)
         return QPointF(-hw - 10, 0), QPointF(hw + 10, 0)
 
     def pin3_position(self) -> QPointF:
@@ -1336,86 +1336,52 @@ class ComponentItem(QGraphicsItem):
             painter.drawEllipse(QPointF(px, py), PIN_RADIUS, PIN_RADIUS)
 
     def _draw_sheet_connector(self, painter, pen_body, pen_wire, body_color):
-        """Net label inalámbrico con forma de flecha estilo EDA.
+        """Net label como flecha pequeña del mismo color que GND, apuntando a la derecha.
 
-        INPUT  (señal que entra al esquema):   >--[LABEL]--o
-               Punta de flecha apuntando a la DERECHA en el extremo izquierdo,
-               cable corto a la derecha donde el usuario conecta sus cables.
-
-        OUTPUT (señal que sale del esquema):   o--[LABEL]-->
-               Punta de flecha apuntando a la DERECHA en el extremo derecho,
-               cable corto a la derecha donde el usuario conecta sus cables.
-
-        El pin de conexión siempre está en el extremo derecho (hw+22, 0).
+        INPUT  (entrada):  ─►●     pin en la CABEZA (extremo derecho)
+        OUTPUT (salida):   ●─►     pin en la COLA   (extremo izquierdo)
         """
-        import math as _m
-        hw = COMP_W // 2      # 30
-        hh = COMP_H // 2      # 15
         is_input = self.comp_type == 'NET_LABEL_IN'
         label = self.sheet_label or self.name
 
-        # Paleta: azul para input, naranja para output
-        col_main  = QColor('#2980b9') if is_input else QColor('#e67e22')
-        col_fill  = col_main.lighter(175)
-        col_arrow = col_main
+        # Mismo color que GND: pen_body (line_color = COLORS['component'])
+        arrow_pen = pen_body
+        arrow_color = arrow_pen.color()
+        tip_sz = 6
 
-        # ── Dimensiones del cuerpo ────────────────────────────────────────
-        # Cuerpo rectangular con el label, va de x=-hw a x=hw
-        body_x  = -hw          # izquierda del rect
-        body_w  = COMP_W       # ancho = 60
-        body_h  = hh * 2       # alto  = 30
-        tip_sz  = 12           # tamaño de la punta de flecha
+        # Flecha de ~30 px de largo (similar al ancho de GND)
+        tail_x = -15
+        head_x =  15
+        pin_x  = head_x if is_input else tail_x
 
-        # ── Cable de conexión (siempre a la derecha) ───────────────────────
-        # Va del borde derecho del cuerpo (hw) hasta el pin (hw+22)
-        painter.setPen(QPen(QColor(COLORS['wire']), 2))
-        painter.drawLine(QPointF(hw, 0), QPointF(hw + 22, 0))
+        # ── Línea + cabeza de la flecha ───────────────────────────────────
+        painter.setPen(arrow_pen)
+        painter.setBrush(QBrush(arrow_color))
+        head_base_x = head_x - tip_sz
+        painter.drawLine(QPointF(tail_x, 0), QPointF(head_base_x, 0))
+        arrow = QPolygonF([
+            QPointF(head_x, 0),                          # punta
+            QPointF(head_base_x, -tip_sz * 0.55),
+            QPointF(head_base_x,  tip_sz * 0.55),
+        ])
+        painter.drawPolygon(arrow)
 
-        # ── Cuerpo rectangular ────────────────────────────────────────────
-        painter.setPen(QPen(col_main, 2))
-        painter.setBrush(QBrush(col_fill))
-        painter.drawRect(QRectF(body_x, -hh, body_w, body_h))
-
-        # ── Punta de flecha ───────────────────────────────────────────────
-        painter.setPen(QPen(col_arrow, 2))
-        painter.setBrush(QBrush(col_arrow))
-
-        if is_input:
-            # Flecha apunta a la DERECHA en el extremo IZQUIERDO del cuerpo
-            # Forma ">": vértice en (body_x, 0), base en la izquierda
-            tip_x = body_x           # punta = borde izquierdo del rect
-            arrow = QPolygonF([
-                QPointF(tip_x,            0),
-                QPointF(tip_x - tip_sz,  -tip_sz * 0.55),
-                QPointF(tip_x - tip_sz,   tip_sz * 0.55),
-            ])
-            painter.drawPolygon(arrow)
-        else:
-            # Flecha apunta a la DERECHA en el extremo DERECHO del cuerpo
-            # Forma "→": vértice en (hw, 0), base a la izquierda del vértice
-            tip_x = hw               # punta = borde derecho del rect (antes del cable)
-            arrow = QPolygonF([
-                QPointF(tip_x,            0),
-                QPointF(tip_x - tip_sz,  -tip_sz * 0.55),
-                QPointF(tip_x - tip_sz,   tip_sz * 0.55),
-            ])
-            painter.drawPolygon(arrow)
-
-        # ── Etiqueta centrada en el cuerpo ────────────────────────────────
-        font = QFont('Consolas', 8, QFont.Weight.Bold)
+        # ── Etiqueta encima de la flecha ──────────────────────────────────
+        font = QFont('Consolas', 7, QFont.Weight.Bold)
         painter.setFont(font)
-        painter.setPen(QPen(col_main.darker(160), 1))
-        # Texto centrado, dejando margen para la flecha en el input
-        text_margin = tip_sz + 4 if is_input else 4
-        text_rect = QRectF(body_x + text_margin, -hh,
-                           body_w - text_margin - 4, body_h)
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter, label)
+        painter.setPen(QPen(QColor(COLORS['text']), 1))
+        text_rect = QRectF(tail_x - 4, -15, (head_x - tail_x) + 8, 11)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter,
+            label,
+        )
 
         # ── Pin de conexión ───────────────────────────────────────────────
         pin_color = QColor(COLORS['pin'])
         painter.setPen(QPen(pin_color, 2))
         painter.setBrush(QBrush(pin_color))
-        painter.drawEllipse(QPointF(hw + 22, 0), PIN_RADIUS, PIN_RADIUS)
+        painter.drawEllipse(QPointF(pin_x, 0), PIN_RADIUS, PIN_RADIUS)
 
     def _draw_labels(self, painter, text_color):
         if self.comp_type in ('GND', 'NODE', 'NET_LABEL_IN', 'NET_LABEL_OUT'):
