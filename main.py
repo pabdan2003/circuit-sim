@@ -7,6 +7,9 @@ import sys
 import math
 import json
 import os
+import re
+import html
+from itertools import combinations
 from typing import Optional, List, Dict, Tuple
 
 from PyQt6.QtWidgets import (
@@ -4245,6 +4248,59 @@ def _qm_minimum_cover(primes, must_cover, num_vars: int):
     return list(selected)
 
 
+def _qm_literal_count(prime: str) -> int:
+    return sum(1 for bit in prime if bit != '-')
+
+
+def _qm_minimum_cover_exact(primes, must_cover, num_vars: int):
+    """Exact cover used by the digital analyzer for stable SOP/POS output."""
+    if not must_cover:
+        return []
+
+    primes = sorted(set(primes), key=lambda p: (_qm_literal_count(p), p))
+    coverage = {
+        p: {m for m in must_cover if _qm_covers(p, m, num_vars)}
+        for p in primes
+    }
+    selected, remaining = set(), set(must_cover)
+
+    while remaining:
+        essential_added = False
+        for m in list(remaining):
+            covers_m = [p for p in primes if m in coverage[p]]
+            if len(covers_m) == 1:
+                p = covers_m[0]
+                selected.add(p)
+                essential_added = True
+                remaining -= coverage[p]
+        if not essential_added:
+            break
+
+    if remaining:
+        candidates = [p for p in primes if coverage[p] & remaining and p not in selected]
+        best_combo = None
+        best_score = None
+        for r in range(1, len(candidates) + 1):
+            found_at_size = False
+            for combo in combinations(candidates, r):
+                covered = set()
+                for p in combo:
+                    covered |= coverage[p]
+                if not remaining <= covered:
+                    continue
+                found_at_size = True
+                score = (r, sum(_qm_literal_count(p) for p in combo), tuple(combo))
+                if best_score is None or score < best_score:
+                    best_combo = combo
+                    best_score = score
+            if found_at_size:
+                break
+        if best_combo:
+            selected.update(best_combo)
+
+    return sorted(selected, key=lambda p: (_qm_literal_count(p), p))
+
+
 def _prime_to_sop_term(prime: str, var_names) -> str:
     parts = []
     for bit, name in zip(prime, var_names):
@@ -4269,32 +4325,157 @@ def _prime_to_pos_term(prime: str, var_names) -> str:
     return '(' + ' + '.join(parts) + ')'
 
 
+def _sop_cover(minterms, dont_cares, num_vars: int):
+    if not minterms:
+        return []
+    if len(set(minterms) | set(dont_cares)) >= 2 ** num_vars and len(minterms) == 2 ** num_vars:
+        return ['-' * num_vars]
+    primes = _qm_prime_implicants(list(set(minterms) | set(dont_cares)), num_vars)
+    return _qm_minimum_cover_exact(primes, list(minterms), num_vars)
+
+
+def _pos_cover(minterms, dont_cares, num_vars: int):
+    all_idx = set(range(2 ** num_vars))
+    maxterms = sorted(all_idx - set(minterms) - set(dont_cares))
+    if not maxterms:
+        return []
+    if len(maxterms) == 2 ** num_vars:
+        return ['-' * num_vars]
+    primes = _qm_prime_implicants(list(set(maxterms) | set(dont_cares)), num_vars)
+    return _qm_minimum_cover_exact(primes, list(maxterms), num_vars)
+
+
 def simplify_sop(minterms, dont_cares, var_names):
     n = len(var_names)
-    if not minterms:
-        return '0'
-    if len(set(minterms) | set(dont_cares)) >= 2 ** n and len(minterms) == 2 ** n:
-        return '1'
-    primes = _qm_prime_implicants(list(set(minterms) | set(dont_cares)), n)
-    cover  = _qm_minimum_cover(primes, list(minterms), n)
+    cover = _sop_cover(minterms, dont_cares, n)
     if not cover:
         return '0'
+    if cover == ['-' * n]:
+        return '1'
     return ' + '.join(_prime_to_sop_term(p, var_names) for p in cover)
 
 
 def simplify_pos(minterms, dont_cares, var_names):
     n = len(var_names)
-    all_idx = set(range(2 ** n))
-    maxterms = sorted(all_idx - set(minterms) - set(dont_cares))
-    if not maxterms:
-        return '1'
-    if len(maxterms) == 2 ** n:
-        return '0'
-    primes = _qm_prime_implicants(list(set(maxterms) | set(dont_cares)), n)
-    cover  = _qm_minimum_cover(primes, list(maxterms), n)
+    cover = _pos_cover(minterms, dont_cares, n)
     if not cover:
         return '1'
-    return ' · '.join(_prime_to_pos_term(p, var_names) for p in cover)
+    if cover == ['-' * n]:
+        return '0'
+    return ' * '.join(_prime_to_pos_term(p, var_names) for p in cover)
+
+
+NOTATION_LABELS = {
+    'math_bar': "Matematica (barrita)",
+    'math_prime': "Matematica alternativa (')",
+    'logic_words': "Logica",
+    'logic_symbols': "Logica alternativa",
+    'program_bool': "Programando con booleanos",
+    'program_bits': "Programando con bits",
+}
+
+
+def _overline(text: str, rich: bool = False) -> str:
+    if rich:
+        return f'<span style="text-decoration: overline;">{html.escape(text)}</span>'
+    return f"bar({text})"
+
+
+def _notation_ops(notation: str, form: str, rich: bool = False):
+    if notation == 'logic_words':
+        return {
+            'not': lambda name: f"¬{name}",
+            'and': ' ∧ ',
+            'or':  ' ∨ ',
+            'sop_join': ' ∨ ',
+            'pos_join': ' ∧ ',
+        }
+    if notation == 'logic_symbols':
+        return {
+            'not': lambda name: f"~{name}",
+            'and': ' ∧ ',
+            'or':  ' ∨ ',
+            'sop_join': ' ∨ ',
+            'pos_join': ' ∧ ',
+        }
+    if notation == 'program_bool':
+        return {
+            'not': lambda name: f"!{name}",
+            'and': ' && ',
+            'or':  ' | ',
+            'sop_join': ' | ',
+            'pos_join': ' && ',
+        }
+    if notation == 'program_bits':
+        return {
+            'not': lambda name: f"~{name}",
+            'and': ' & ',
+            'or':  ' | ',
+            'sop_join': ' | ',
+            'pos_join': ' & ',
+        }
+    if notation == 'math_bar':
+        return {
+            'not': lambda name: _overline(name, rich=rich),
+            'and': '' if form == 'sop' else ' · ',
+            'or':  ' + ',
+            'sop_join': ' + ',
+            'pos_join': ' · ',
+        }
+    return {
+        'not': lambda name: f"{name}'",
+        'and': '' if form == 'sop' else ' · ',
+        'or':  ' + ',
+        'sop_join': ' + ',
+        'pos_join': ' · ',
+    }
+
+
+def _format_sop_cover(cover, var_names, notation: str, rich: bool = False) -> str:
+    n = len(var_names)
+    if not cover:
+        return '0'
+    if cover == ['-' * n]:
+        return '1'
+    ops = _notation_ops(notation, 'sop', rich=rich)
+    terms = []
+    for prime in cover:
+        lits = []
+        for bit, name in zip(prime, var_names):
+            if bit == '0':
+                lits.append(ops['not'](name))
+            elif bit == '1':
+                lits.append(html.escape(name) if rich else name)
+        terms.append(ops['and'].join(lits) if lits else '1')
+    return ops['sop_join'].join(terms)
+
+
+def _format_pos_cover(cover, var_names, notation: str, rich: bool = False) -> str:
+    n = len(var_names)
+    if not cover:
+        return '1'
+    if cover == ['-' * n]:
+        return '0'
+    ops = _notation_ops(notation, 'pos', rich=rich)
+    clauses = []
+    for prime in cover:
+        lits = []
+        for bit, name in zip(prime, var_names):
+            if bit == '0':
+                lits.append(html.escape(name) if rich else name)
+            elif bit == '1':
+                lits.append(ops['not'](name))
+        clauses.append('(' + ops['or'].join(lits) + ')' if lits else '0')
+    return ops['pos_join'].join(clauses)
+
+
+def _gray_codes(bits: int) -> list:
+    if bits <= 0:
+        return ['']
+    codes = ['0', '1']
+    for _ in range(1, bits):
+        codes = ['0' + c for c in codes] + ['1' + c for c in reversed(codes)]
+    return codes
 
 
 class CircuitAnalyzerDialog(QDialog):
@@ -4321,6 +4502,9 @@ class CircuitAnalyzerDialog(QDialog):
         # truth_data[(out_name, row_index)] = '0' | '1' | 'X'
         self.truth_data: dict = {}
         self._last_simplification: dict = {}   # {output_name: {'sop':..., 'pos':...}}
+        self._last_highlight: str = 'sop'
+        self._all_outputs_label = "Todas las salidas"
+        self._notation_id = 'math_prime'
 
         self._build_ui()
 
@@ -4343,7 +4527,8 @@ class CircuitAnalyzerDialog(QDialog):
     # ── Pestaña 1: I/O ────────────────────────────────────────────────────
     def _build_io_tab(self) -> QWidget:
         w = QWidget()
-        h = QHBoxLayout(w)
+        outer = QVBoxLayout(w)
+        h = QHBoxLayout()
 
         def col(title, list_widget, edit_widget, btn_add, btn_rm):
             box = QGroupBox(title)
@@ -4386,23 +4571,41 @@ class CircuitAnalyzerDialog(QDialog):
             "automáticamente las 2<sup>N</sup> filas correspondientes."
             "</small>")
         info.setWordWrap(True)
-        outer = QVBoxLayout()
         outer.addLayout(h)
         outer.addWidget(info)
-        wrap = QWidget(); wrap.setLayout(outer)
-        return wrap
+        return w
+
+    def _parse_variable_names(self, text: str) -> list:
+        names = [n for n in re.split(r'[\s,;]+', text.strip()) if n]
+        valid = []
+        invalid = []
+        for name in names:
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+                valid.append(name)
+            else:
+                invalid.append(name)
+        if invalid:
+            QMessageBox.warning(
+                self, "Nombre invalido",
+                "Usa nombres como A, B, EN, S0 o COUT.")
+        return valid
+
+    def _add_variables(self, edit: QLineEdit, target: list, widget: QListWidget):
+        added = False
+        for name in self._parse_variable_names(edit.text()):
+            if name in self.var_inputs or name in self.var_outputs:
+                QMessageBox.warning(self, "Nombre duplicado",
+                                    f"La variable '{name}' ya existe.")
+                continue
+            target.append(name)
+            widget.addItem(name)
+            added = True
+        if added:
+            edit.clear()
+            self._last_simplification.clear()
 
     def _add_input(self):
-        name = self.in_edit.text().strip()
-        if not name:
-            return
-        if name in self.var_inputs or name in self.var_outputs:
-            QMessageBox.warning(self, "Nombre duplicado",
-                                f"La variable '{name}' ya existe.")
-            return
-        self.var_inputs.append(name)
-        self.inputs_list.addItem(name)
-        self.in_edit.clear()
+        self._add_variables(self.in_edit, self.var_inputs, self.inputs_list)
 
     def _remove_input(self):
         row = self.inputs_list.currentRow()
@@ -4412,18 +4615,10 @@ class CircuitAnalyzerDialog(QDialog):
         self.inputs_list.takeItem(row)
         # Limpiar truth_data inválido (cambia el número de filas)
         self.truth_data.clear()
+        self._last_simplification.clear()
 
     def _add_output(self):
-        name = self.out_edit.text().strip()
-        if not name:
-            return
-        if name in self.var_inputs or name in self.var_outputs:
-            QMessageBox.warning(self, "Nombre duplicado",
-                                f"La variable '{name}' ya existe.")
-            return
-        self.var_outputs.append(name)
-        self.outputs_list.addItem(name)
-        self.out_edit.clear()
+        self._add_variables(self.out_edit, self.var_outputs, self.outputs_list)
 
     def _remove_output(self):
         row = self.outputs_list.currentRow()
@@ -4435,6 +4630,7 @@ class CircuitAnalyzerDialog(QDialog):
         for k in list(self.truth_data.keys()):
             if k[0] == name:
                 del self.truth_data[k]
+        self._last_simplification.clear()
 
     # ── Pestaña 2: Tabla de verdad ────────────────────────────────────────
     def _build_truth_tab(self) -> QWidget:
@@ -4458,10 +4654,12 @@ class CircuitAnalyzerDialog(QDialog):
 
         # Selector de salida a simplificar
         row = QHBoxLayout()
+        self.truth_count_label = QLabel("")
+        row.addWidget(self.truth_count_label)
+        row.addStretch(1)
         row.addWidget(QLabel("Salida a simplificar:"))
         self.output_selector = QComboBox()
         row.addWidget(self.output_selector)
-        row.addStretch(1)
         v.addLayout(row)
 
         # Botones de minimización
@@ -4485,6 +4683,8 @@ class CircuitAnalyzerDialog(QDialog):
             self.truth_table.clear()
             self.truth_table.setRowCount(0)
             self.truth_table.setColumnCount(0)
+            self.truth_count_label.setText("Filas activas: 0/0")
+            self.output_selector.clear()
             return
 
         n_rows = 2 ** n_in
@@ -4524,6 +4724,7 @@ class CircuitAnalyzerDialog(QDialog):
         # Refrescar combo de salida a simplificar
         self.output_selector.blockSignals(True)
         self.output_selector.clear()
+        self.output_selector.addItem(self._all_outputs_label)
         self.output_selector.addItems(self.var_outputs)
         self.output_selector.blockSignals(False)
 
@@ -4551,6 +4752,7 @@ class CircuitAnalyzerDialog(QDialog):
         item.setText(normalized)
         self.truth_table.blockSignals(False)
         self._refresh_hidden_rows()
+        self._last_simplification.clear()
 
     def _refresh_hidden_rows(self):
         """Oculta filas donde TODAS las salidas son don't care (X)."""
@@ -4558,10 +4760,14 @@ class CircuitAnalyzerDialog(QDialog):
         if n_in == 0 or not self.var_outputs:
             return
         n_rows = 2 ** n_in
+        active = 0
         for r in range(n_rows):
             all_x = all(self.truth_data.get((o, r), '0') == 'X'
                         for o in self.var_outputs)
             self.truth_table.setRowHidden(r, all_x)
+            if not all_x:
+                active += 1
+        self.truth_count_label.setText(f"Filas activas: {active}/{n_rows}")
 
     def _gather_terms(self, output_name: str):
         """Devuelve (minterms, dont_cares, maxterms) para la salida dada."""
@@ -4584,16 +4790,23 @@ class CircuitAnalyzerDialog(QDialog):
             QMessageBox.warning(self, "Faltan variables",
                                 "Define al menos una entrada y una salida.")
             return
+        selected = self.output_selector.currentText()
+        outputs = (self.var_outputs if selected in ('', self._all_outputs_label)
+                   else [selected])
         results = {}
-        for o in self.var_outputs:
-            mins, dcs, _ = self._gather_terms(o)
-            sop = simplify_sop(mins, dcs, self.var_inputs)
-            pos = simplify_pos(mins, dcs, self.var_inputs)
+        for o in outputs:
+            mins, dcs, maxs = self._gather_terms(o)
+            sop_cover = _sop_cover(mins, dcs, len(self.var_inputs))
+            pos_cover = _pos_cover(mins, dcs, len(self.var_inputs))
             results[o] = {
-                'sop': sop, 'pos': pos,
-                'minterms': mins, 'dont_cares': dcs,
+                'sop_cover': sop_cover,
+                'pos_cover': pos_cover,
+                'minterms': mins,
+                'maxterms': maxs,
+                'dont_cares': dcs,
             }
         self._last_simplification = results
+        self._last_highlight = mode
         self._populate_eqs_tab(highlight=mode)
         self.tabs.setCurrentIndex(2)   # Saltar a la pestaña Ecuaciones
 
@@ -4607,6 +4820,17 @@ class CircuitAnalyzerDialog(QDialog):
             "<b>·</b> = AND, <b>+</b> = OR.</small>")
         info.setWordWrap(True)
         v.addWidget(info)
+
+        notation_row = QHBoxLayout()
+        notation_row.addWidget(QLabel("Notacion:"))
+        self.notation_selector = QComboBox()
+        for notation_id, label in NOTATION_LABELS.items():
+            self.notation_selector.addItem(label, notation_id)
+        self.notation_selector.setCurrentIndex(1)
+        self.notation_selector.currentIndexChanged.connect(self._on_notation_changed)
+        notation_row.addWidget(self.notation_selector)
+        notation_row.addStretch(1)
+        v.addLayout(notation_row)
 
         self.eqs_text = QTextEdit()
         self.eqs_text.setReadOnly(True)
@@ -4625,6 +4849,11 @@ class CircuitAnalyzerDialog(QDialog):
         v.addLayout(btn_row)
         return w
 
+    def _on_notation_changed(self, _index: int):
+        self._notation_id = self.notation_selector.currentData() or 'math_prime'
+        if self._last_simplification:
+            self._populate_eqs_tab(highlight=self._last_highlight)
+
     def _populate_eqs_tab(self, highlight: str = 'sop'):
         if not self._last_simplification:
             self.eqs_text.setPlainText(
@@ -4633,18 +4862,34 @@ class CircuitAnalyzerDialog(QDialog):
                 "y pulsa Mintérminos (SOP) o Maxtérminos (POS).")
             return
         lines = []
+        notation = self._notation_id
+        rich = notation == 'math_bar'
         for oname, info in self._last_simplification.items():
-            mins = info['minterms']; dcs = info['dont_cares']
+            mins = info['minterms']
+            maxs = info.get('maxterms', [])
+            dcs = info['dont_cares']
+            sop = _format_sop_cover(info['sop_cover'], self.var_inputs, notation, rich=rich)
+            pos = _format_pos_cover(info['pos_cover'], self.var_inputs, notation, rich=rich)
             lines.append(f"── {oname} ──")
             mins_str = ','.join(str(m) for m in mins) or '∅'
+            maxs_str = ','.join(str(m) for m in maxs) or '∅'
             dcs_str  = ','.join(str(d) for d in dcs) if dcs else '∅'
-            lines.append(f"  Σm = ({mins_str})    d = ({dcs_str})")
+            lines.append(f"  Σm = ({mins_str})    ΠM = ({maxs_str})    d = ({dcs_str})")
             mark_sop = '◀' if highlight == 'sop' else ' '
             mark_pos = '◀' if highlight == 'pos' else ' '
-            lines.append(f"  SOP {mark_sop}   {oname} = {info['sop']}")
-            lines.append(f"  POS {mark_pos}   {oname} = {info['pos']}")
+            lines.append(f"  SOP {mark_sop}   {oname} = {sop}")
+            lines.append(f"  POS {mark_pos}   {oname} = {pos}")
             lines.append("")
-        self.eqs_text.setPlainText('\n'.join(lines))
+        if rich:
+            escaped = []
+            for line in lines:
+                escaped.append(line if '<span' in line else html.escape(line))
+            body = '<br>'.join(escaped)
+            self.eqs_text.setHtml(
+                '<div style="font-family: Consolas, monospace; font-size: 11pt; white-space: pre;">'
+                f'{body}</div>')
+        else:
+            self.eqs_text.setPlainText('\n'.join(lines))
 
     def _build_circuit_stub(self):
         QMessageBox.information(
@@ -4661,6 +4906,39 @@ class CircuitAnalyzerDialog(QDialog):
         v = QVBoxLayout(w)
         title = QLabel("<h3>Mapa de Karnaugh</h3>")
         v.addWidget(title)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Salida:"))
+        self.kmap_output_selector = QComboBox()
+        self.kmap_output_selector.currentIndexChanged.connect(self._refresh_kmap)
+        top.addWidget(self.kmap_output_selector)
+        btn_refresh = QPushButton("Actualizar")
+        btn_refresh.clicked.connect(self._refresh_kmap)
+        top.addWidget(btn_refresh)
+        top.addStretch(1)
+        v.addLayout(top)
+
+        self.kmap_summary = QLabel("")
+        self.kmap_summary.setWordWrap(True)
+        v.addWidget(self.kmap_summary)
+
+        self.kmap_table = QTableWidget()
+        self.kmap_table.itemChanged.connect(self._on_kmap_cell_changed)
+        v.addWidget(self.kmap_table)
+
+        btn_row = QHBoxLayout()
+        self.btn_kmap_sop = QPushButton("K-map -> SOP")
+        self.btn_kmap_pos = QPushButton("K-map -> POS")
+        self.btn_kmap_export = QPushButton("Exportar K-map")
+        self.btn_kmap_export.setEnabled(False)
+        self.btn_kmap_sop.clicked.connect(lambda: self._simplify_from_kmap('sop'))
+        self.btn_kmap_pos.clicked.connect(lambda: self._simplify_from_kmap('pos'))
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_kmap_sop)
+        btn_row.addWidget(self.btn_kmap_pos)
+        btn_row.addWidget(self.btn_kmap_export)
+        v.addLayout(btn_row)
+
         msg = QLabel(
             "<p>Próximamente:</p>"
             "<ul>"
@@ -4672,22 +4950,132 @@ class CircuitAnalyzerDialog(QDialog):
             "<li>Exportación a imagen.</li>"
             "</ul>")
         msg.setWordWrap(True)
+        msg.setVisible(False)
         v.addWidget(msg)
+        future = QGroupBox("Opciones futuras")
+        future.setVisible(False)
+        future_row = QHBoxLayout(future)
+        for text in (
+                "Exportar K-map",
+                "K-map -> SOP/POS",
+                "Ecuaciones -> K-map"):
+            btn = QPushButton(text)
+            btn.setEnabled(False)
+            future_row.addWidget(btn)
+        v.addWidget(future)
         v.addStretch(1)
         return w
 
     # ── Cambio de pestaña ─────────────────────────────────────────────────
+    def _sync_kmap_outputs(self):
+        if not hasattr(self, 'kmap_output_selector'):
+            return
+        current = self.kmap_output_selector.currentText()
+        self.kmap_output_selector.blockSignals(True)
+        self.kmap_output_selector.clear()
+        self.kmap_output_selector.addItems(self.var_outputs)
+        if current in self.var_outputs:
+            self.kmap_output_selector.setCurrentText(current)
+        self.kmap_output_selector.blockSignals(False)
+
+    def _kmap_axis_labels(self):
+        n = len(self.var_inputs)
+        row_bits = n // 2
+        col_bits = n - row_bits
+        row_vars = self.var_inputs[:row_bits]
+        col_vars = self.var_inputs[row_bits:]
+        row_codes = _gray_codes(row_bits)
+        col_codes = _gray_codes(col_bits)
+
+        def label(vars_, code):
+            if not vars_:
+                return '1'
+            return ''.join(vars_) + '=' + (code or '0')
+
+        return row_vars, col_vars, row_codes, col_codes, label
+
+    def _refresh_kmap(self):
+        if not hasattr(self, 'kmap_table'):
+            return
+        self._sync_kmap_outputs()
+        n = len(self.var_inputs)
+        output = self.kmap_output_selector.currentText() if self.var_outputs else ''
+
+        self.kmap_table.blockSignals(True)
+        self.kmap_table.clear()
+        if n == 0 or not output:
+            self.kmap_table.setRowCount(0)
+            self.kmap_table.setColumnCount(0)
+            self.kmap_summary.setText("Define al menos una entrada y una salida.")
+            self.kmap_table.blockSignals(False)
+            return
+        if n > 4:
+            self.kmap_table.setRowCount(0)
+            self.kmap_table.setColumnCount(0)
+            self.kmap_summary.setText("La vista inicial de K-map soporta de 1 a 4 variables.")
+            self.kmap_table.blockSignals(False)
+            return
+
+        row_vars, col_vars, row_codes, col_codes, label = self._kmap_axis_labels()
+        self.kmap_table.setRowCount(len(row_codes))
+        self.kmap_table.setColumnCount(len(col_codes))
+        self.kmap_table.setVerticalHeaderLabels([label(row_vars, c) for c in row_codes])
+        self.kmap_table.setHorizontalHeaderLabels([label(col_vars, c) for c in col_codes])
+
+        for r, row_code in enumerate(row_codes):
+            for c, col_code in enumerate(col_codes):
+                bits = row_code + col_code
+                idx = int(bits, 2) if bits else 0
+                val = self.truth_data.get((output, idx), '0')
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setData(Qt.ItemDataRole.UserRole, idx)
+                self.kmap_table.setItem(r, c, item)
+
+        self.kmap_table.resizeColumnsToContents()
+        self.kmap_summary.setText(
+            f"K-map de {output}: filas {', '.join(row_vars) or '1'}; "
+            f"columnas {', '.join(col_vars) or '1'}. Edita celdas con 0, 1 o X.")
+        self.kmap_table.blockSignals(False)
+
+    def _on_kmap_cell_changed(self, item):
+        output = self.kmap_output_selector.currentText()
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if output not in self.var_outputs or idx is None:
+            return
+        text = item.text().strip().lower()
+        if text in ('1', 'true', 'high', 'h'):
+            normalized = '1'
+        elif text in ('x', 'd', 'dc', '-', '?'):
+            normalized = 'X'
+        else:
+            normalized = '0'
+        self.truth_data[(output, int(idx))] = normalized
+        self.kmap_table.blockSignals(True)
+        item.setText(normalized)
+        self.kmap_table.blockSignals(False)
+        self._last_simplification.clear()
+
+    def _simplify_from_kmap(self, mode: str):
+        output = self.kmap_output_selector.currentText()
+        self._rebuild_truth_table()
+        if output in self.var_outputs and hasattr(self, 'output_selector'):
+            self.output_selector.setCurrentText(output)
+        self._simplify_and_show(mode)
+
     def _on_tab_changed(self, idx: int):
         if idx == 1:    # Tabla de verdad
             self._rebuild_truth_table()
         elif idx == 2:  # Ecuaciones (mostrar texto previo si existe)
             if self._last_simplification:
-                self._populate_eqs_tab(highlight='sop')
+                self._populate_eqs_tab(highlight=self._last_highlight)
             else:
                 self.eqs_text.setPlainText(
                     "Aún no se ha minimizado ninguna salida.  Ve a la "
                     "pestaña 'Tabla de Verdad', llena los valores y "
                     "pulsa Mintérminos (SOP) o Maxtérminos (POS).")
+        elif idx == 3:  # Mapa de Karnaugh
+            self._refresh_kmap()
 
 
 # ══════════════════════════════════════════════════════════════
