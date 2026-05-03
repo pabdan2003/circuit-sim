@@ -2,10 +2,10 @@
 Tests del sistema mixto analógico-digital.
 """
 import sys, os
-sys.path.insert(0, '/home/claude')
+sys.path.insert(0, os.path.dirname(__file__))
 
 import numpy as np
-from engine_pkg import (
+from engine import (
     MNASolver, Resistor, VoltageSource, Capacitor, CurrentSource,
     DigitalSimulator, AND, OR, NOT, DFF, BinaryCounter, MUX, ShiftRegister,
     ADC, DAC, ComparatorBridge, PWMBridge, MixedSignalBus,
@@ -177,7 +177,6 @@ check("PWM duty≈50%→V≈1.65V", abs(v_pwm - 1.65) < 0.2, f"V={v_pwm:.3f}")
 # TEST I1: Simulación mixta — RC cargando + ADC muestrea
 # ─────────────────────────────────────────────────────────────
 print("\n[I1] Mixta: RC cargando (τ=1ms) + ADC muestrea al final → code > 0")
-from engine_pkg import MNASolver
 mna = MNASolver()
 analog_comps = [
     VoltageSource("Vin", "in", "0", 5.0),

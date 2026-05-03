@@ -14,22 +14,21 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsLineItem,
     QGraphicsEllipseItem, QGraphicsTextItem, QGraphicsRectItem,
     QToolBar, QLabel, QDockWidget, QTreeWidget, QTreeWidgetItem,
-    QTableWidget, QTableWidgetItem, QSplitter, QDialog, QFormLayout,
-    QLineEdit, QDialogButtonBox, QMessageBox, QStatusBar, QFrame,
+    QTableWidget, QTableWidgetItem, QSplitter, QDialog,
+    QLineEdit, QDialogButtonBox, QMessageBox, QStatusBar,
     QGraphicsPathItem, QPushButton, QComboBox, QDoubleSpinBox,
-    QScrollArea, QGroupBox, QTextEdit, QFileDialog,
-    QListWidget, QListWidgetItem, QTabWidget, QTabBar, QInputDialog
+    QGroupBox, QTextEdit, QFileDialog,
+    QListWidget, QTabWidget, QInputDialog
 )
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPainterPath, QPolygonF,
-    QIcon, QPixmap, QTransform, QAction, QKeySequence
+    QAction
 )
 from PyQt6.QtCore import (
     Qt, QPointF, QRectF, QLineF, pyqtSignal, QObject, QSize
 )
 
 # Motor MNA
-import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor
 from engine import Diode, BJT, MOSFET, OpAmp, Impedance, MNASolver
@@ -37,7 +36,18 @@ from circuit_analyzer import (
     CircuitAnalyzer, ImplicitBridgeDetector,
     LOGIC_STANDARDS, DEFAULT_STANDARD, AnalysisFlags,
 )
-from themes import ThemeManager, BUILTIN_THEMES, DEFAULT_THEME_ID
+from themes import ThemeManager, DEFAULT_THEME_ID
+from ui.component_metadata import (
+    COMPONENT_NODE_LABELS,
+    DEFAULT_NODE_LABELS,
+    DIGITAL_FLIPFLOP_TYPES,
+    DIGITAL_GATE_TYPES,
+    FOUR_PIN_NODE_LABELS,
+)
+from ui.dialogs.component_dialog import ComponentDialog
+from ui.dialogs.component_picker_dialog import ComponentPickerDialog
+from ui.dialogs.power_triangle_dialog import PowerTriangleDialog
+from ui.dialogs.settings_dialog import SettingsDialog
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1638,144 +1648,6 @@ class WireItem(QGraphicsLineItem):
 
 
 # ══════════════════════════════════════════════════════════════
-# DIÁLOGO DE SELECCIÓN DE COMPONENTES (con preview)
-# ══════════════════════════════════════════════════════════════
-class ComponentPickerDialog(QDialog):
-    """
-    Ventana emergente que muestra una lista de componentes de una categoría
-    y una preview gráfica del componente seleccionado.
-    """
-    def __init__(self, category_name: str, components: List[tuple], parent=None):
-        """
-        components: lista de tuplas (comp_type, label, symbol_ascii)
-        """
-        super().__init__(parent)
-        self.setWindowTitle(f"Seleccionar componente — {category_name}")
-        self._components = components
-        self._selected_type = None
-        self._build_ui()
-        self._apply_style()
-
-    def _build_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setSpacing(12)
-
-        # ── Lista de componentes ─────────────────────────────────────────
-        left = QVBoxLayout()
-        self.list_widget = QListWidget()
-        self.list_widget.setFont(QFont('Consolas', 10))
-        for ctype, label, sym in self._components:
-            item = QListWidgetItem(f"{sym}   {label}")
-            item.setData(Qt.ItemDataRole.UserRole, ctype)
-            self.list_widget.addItem(item)
-        self.list_widget.currentRowChanged.connect(self._update_preview)
-        self.list_widget.itemDoubleClicked.connect(self.accept)
-        left.addWidget(self.list_widget)
-
-        btn_row = QHBoxLayout()
-        self.place_btn = QPushButton("Colocar")
-        self.place_btn.setDefault(True)
-        self.place_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Cancelar")
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addStretch()
-        btn_row.addWidget(self.place_btn)
-        btn_row.addWidget(cancel_btn)
-        left.addLayout(btn_row)
-        layout.addLayout(left, 1)
-
-        # ── Preview gráfica ──────────────────────────────────────────────
-        right = QVBoxLayout()
-        preview_title = QLabel("Vista previa")
-        preview_title.setFont(QFont('Consolas', 9, QFont.Weight.Bold))
-        preview_title.setStyleSheet(f"color: {COLORS['component']};")
-        right.addWidget(preview_title)
-
-        self.preview_scene = QGraphicsScene()
-        self.preview_view = QGraphicsView(self.preview_scene)
-        self.preview_view.setFixedSize(280, 220)
-        self.preview_view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.preview_view.setBackgroundBrush(QBrush(QColor(COLORS['bg'])))
-        self.preview_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.preview_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.preview_view.setFrameShape(QFrame.Shape.StyledPanel)
-        right.addWidget(self.preview_view)
-        right.addStretch()
-        layout.addLayout(right, 2)
-
-        self.list_widget.setCurrentRow(0)
-
-    def _update_preview(self, row: int):
-        self.preview_scene.clear()
-        if row < 0 or row >= self.list_widget.count():
-            return
-        ctype = self.list_widget.item(row).data(Qt.ItemDataRole.UserRole)
-        self._selected_type = ctype
-
-        # Valores por defecto para que la preview se vea bien
-        defaults = {
-            'R': 1000.0, 'V': 5.0, 'VAC': 120.0, 'I': 0.001,
-            'C': 1e-6, 'L': 1e-3, 'Z': 0.0,
-            'D': 1e-14, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
-            'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5,
-            'GND': 0.0, 'NODE': 0.0
-        }
-        val = defaults.get(ctype, 1.0)
-        item = ComponentItem(ctype, f"{ctype}1", val, '', '', '')
-        if ctype == 'Z':
-            item.z_real = 100.0
-            item.z_imag = 50.0
-
-        # Deshabilitar interacción en la preview
-        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
-        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, False)
-
-        self.preview_scene.addItem(item)
-        br = item.boundingRect()
-        self.preview_scene.setSceneRect(br.adjusted(-30, -30, 30, 30))
-        self.preview_view.centerOn(item)
-
-    def _apply_style(self):
-        self.setStyleSheet(f"""
-            QDialog {{
-                background: {COLORS['panel']};
-                color: {COLORS['text']};
-            }}
-            QLabel {{
-                color: {COLORS['text']};
-            }}
-            QListWidget {{
-                background: {COLORS['comp_body']};
-                color: {COLORS['text']};
-                border: 1px solid {COLORS['panel_brd']};
-                border-radius: 4px;
-                padding: 4px;
-            }}
-            QListWidget::item {{
-                padding: 6px;
-                border-bottom: 1px solid {COLORS['panel_brd']};
-            }}
-            QListWidget::item:selected {{
-                background: {COLORS['component']};
-                color: white;
-            }}
-            QPushButton {{
-                background: {COLORS['component']};
-                color: white;
-                border-radius: 4px;
-                padding: 6px 16px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['comp_sel']};
-            }}
-        """)
-
-    def get_selected_type(self) -> Optional[str]:
-        return self._selected_type
-
-
-# ══════════════════════════════════════════════════════════════
 # ESCENA DEL CIRCUITO
 # ══════════════════════════════════════════════════════════════
 class CircuitScene(QGraphicsScene):
@@ -2144,7 +2016,7 @@ class CircuitScene(QGraphicsScene):
 
     # ── Editar propiedades ───────────────────────
     def _edit_component(self, item: ComponentItem):
-        dialog = ComponentDialog(item)
+        dialog = ComponentDialog(item, COLORS)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             data = dialog.get_data()
             item.name      = data['name']
@@ -2189,418 +2061,6 @@ class CircuitScene(QGraphicsScene):
                 if 'dig_analog_node' in data: item.dig_analog_node = data['dig_analog_node']
                 if 'dig_input_nodes' in data: item.dig_input_nodes  = data['dig_input_nodes']
             item.update()
-
-
-# ══════════════════════════════════════════════════════════════
-# DIÁLOGO DE PROPIEDADES
-# ══════════════════════════════════════════════════════════════
-class ComponentDialog(QDialog):
-    def __init__(self, item: ComponentItem, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Propiedades — {item.comp_type}")
-        self.setStyleSheet(f"""
-            QDialog {{ background: {COLORS['panel']}; color: {COLORS['text']}; }}
-            QLabel  {{ color: {COLORS['text']}; }}
-            QLineEdit, QDoubleSpinBox {{
-                background: {COLORS['bg']}; color: {COLORS['text']};
-                border: 1px solid {COLORS['panel_brd']}; border-radius: 4px;
-                padding: 4px;
-            }}
-            QPushButton {{
-                background: {COLORS['component']}; color: white;
-                border-radius: 4px; padding: 6px 16px;
-            }}
-            QPushButton:hover {{ background: {COLORS['comp_sel']}; }}
-        """)
-        self.item = item
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QFormLayout(self)
-        layout.setSpacing(10)
-
-        is_netlabel = self.item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT')
-
-        # ── Net label: diálogo mínimo con solo el nombre de red ──────────
-        # Inicializar todos los widgets opcionales a None para get_data()
-        self.name_edit   = QLineEdit(self.item.name)
-        self.value_spin  = QDoubleSpinBox()
-        self.value_spin.setValue(self.item.value)
-        self.node1_edit  = QLineEdit(self.item.node1)
-        self.node2_edit  = QLineEdit(self.item.node2)
-        self.node3_edit  = None
-        self._extra_node_edits = []
-        self._sheet_label_edit = None
-        self._freq_spin = self._phase_spin = self._mode_combo = None
-        self._led_color_combo = None
-        self._z_mode_combo = self._z_real = self._z_imag = None
-        self._z_mag = self._z_phase = None
-        self._pot_wiper_spin = None
-        self._xfmr_ratio_spin = self._xfmr_imax_spin = None
-        self._node4_edit = None
-        self._dig_inputs_spin = self._dig_bits_spin = self._dig_vref_spin = None
-        self._dig_tpd_spin = self._dig_clk_edit = self._dig_anode_edit = None
-
-        if is_netlabel:
-            kind = 'Entrada' if self.item.comp_type == 'NET_LABEL_IN' else 'Salida'
-            layout.addRow(QLabel(f'<b>Net Label — {kind}</b>'))
-            self._sheet_label_edit = QLineEdit(self.item.sheet_label)
-            self._sheet_label_edit.setPlaceholderText('ej: VCC, CLK, RESET…')
-            layout.addRow('Nombre de red:', self._sheet_label_edit)
-            layout.addRow(QLabel(
-                '<small>Todos los net labels con el mismo nombre<br>'
-                'quedan eléctricamente conectados,<br>'
-                'en la misma hoja o en hojas distintas.</small>'
-            ))
-            buttons = QDialogButtonBox(
-                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            buttons.accepted.connect(self.accept)
-            buttons.rejected.connect(self.reject)
-            layout.addRow(buttons)
-            return   # ← salir aquí; el resto del diálogo no aplica a net labels
-
-        # ── Componente normal: diálogo completo ───────────────────────────
-        layout.addRow("Nombre:", self.name_edit)
-
-        # Etiqueta y rango del valor según tipo
-        value_labels = {
-            'R': 'Resistencia (Ω)', 'V': 'Voltaje (V)', 'I': 'Corriente (A)',
-            'C': 'Capacitancia (F)', 'L': 'Inductancia (H)',
-            'POT': 'R total (Ω)',
-            'D': 'Is — Corriente saturación (A)',
-            'LED': 'Valor (no usado — Vf según color)',
-            'BJT_NPN': 'hFE — Ganancia β',
-            'BJT_PNP': 'hFE — Ganancia β',
-            'NMOS': 'Kn — Transconductancia (A/V²)',
-            'PMOS': 'Kp — Transconductancia (A/V²)',
-            'OPAMP': 'A — Ganancia lazo abierto (V/V)',
-            'XFMR':   'V_pri nominal (V) — informativo',
-            'BRIDGE': 'V_f por diodo (V) — informativo',
-        }
-        self.value_spin = QDoubleSpinBox()
-        self.value_spin.setRange(-1e12, 1e12)
-        self.value_spin.setDecimals(6)
-        self.value_spin.setValue(self.item.value)
-        if not is_netlabel:
-            layout.addRow(value_labels.get(self.item.comp_type, 'Valor:'), self.value_spin)
-
-        # Etiquetas de nodos según terminales reales del componente
-        node_labels = {
-            'R':       ('Nodo 1',    'Nodo 2',    None),
-            'POT':     ('Nodo 1',    'Nodo 2 (cursor)', None),
-            'C':       ('Nodo 1',    'Nodo 2',    None),
-            'L':       ('Nodo 1',    'Nodo 2',    None),
-            'V':       ('Nodo + (ánodo)',  'Nodo − (cátodo)', None),
-            'I':       ('Nodo + (salida)', 'Nodo − (entrada)', None),
-            'D':       ('Ánodo (A)', 'Cátodo (K)', None),
-            'LED':     ('Ánodo (A)', 'Cátodo (K)', None),
-            'BJT_NPN': ('Colector (C)', 'Emisor (E)', 'Base (B)'),
-            'BJT_PNP': ('Colector (C)', 'Emisor (E)', 'Base (B)'),
-            'NMOS':    ('Drain (D)',    'Source (S)', 'Gate (G)'),
-            'PMOS':    ('Drain (D)',    'Source (S)', 'Gate (G)'),
-            'OPAMP':   ('Salida (OUT)', 'Entrada − (V−)', 'Entrada + (V+)'),
-        }
-        _dig_gate_types_prop = {'AND','OR','NOT','NAND','NOR','XOR'}
-        _dig_ff_types_prop   = {'DFF','JKFF','TFF','SRFF'}
-
-        if self.item.comp_type in _dig_gate_types_prop:
-            # Puertas: Salida (p1) + N entradas (p2..pN+1)
-            n_in = self.item.dig_inputs if self.item.comp_type != 'NOT' else 1
-            # Nodo salida
-            self.node1_edit = QLineEdit(self.item.node1)
-            layout.addRow('Salida (Y):', self.node1_edit)
-            self.node2_edit = QLineEdit(self.item.node2)
-            layout.addRow('Entrada 1 (A):', self.node2_edit)
-            self.node3_edit = None
-            # Entradas extra — guardadas en item.dig_input_nodes[]
-            self._extra_node_edits = []   # list of QLineEdit, index 0 = Entrada 2
-            if n_in >= 2:
-                # Entrada 2 usa node3
-                _n3_val = self.item.node3 if hasattr(self.item, 'node3') else ''
-                self.node3_edit = QLineEdit(_n3_val)
-                layout.addRow('Entrada 2 (B):', self.node3_edit)
-            for i in range(2, n_in):   # Entradas 3..N usan dig_input_nodes
-                _extra_nodes = getattr(self.item, 'dig_input_nodes', [])
-                _val = _extra_nodes[i-2] if len(_extra_nodes) > i-2 else ''
-                _edit = QLineEdit(_val)
-                layout.addRow(f'Entrada {i+1}:', _edit)
-                self._extra_node_edits.append(_edit)
-        elif self.item.comp_type in _dig_ff_types_prop:
-            lbl1, lbl2, lbl3 = ('Salida Q', 'Dato D / J', 'CLK')
-            self.node1_edit = QLineEdit(self.item.node1)
-            self.node2_edit = QLineEdit(self.item.node2)
-            layout.addRow(lbl1 + ':', self.node1_edit)
-            layout.addRow(lbl2 + ':', self.node2_edit)
-            self.node3_edit = QLineEdit(self.item.node3 if hasattr(self.item,'node3') else '')
-            layout.addRow(lbl3 + ':', self.node3_edit)
-            self._extra_node_edits = []
-        elif self.item.comp_type in ComponentItem.FOUR_PIN_TYPES:
-            # XFMR / BRIDGE: 4 nodos
-            if self.item.comp_type == 'XFMR':
-                lbls = ('Primario + (P1)', 'Primario − (P2)',
-                        'Secundario + (S1)', 'Secundario − (S2)')
-            else:  # BRIDGE
-                lbls = ('AC1 (entrada ~)', 'AC2 (entrada ~)',
-                        'DC + (salida +)', 'DC − (salida −)')
-            self.node1_edit = QLineEdit(self.item.node1)
-            self.node2_edit = QLineEdit(self.item.node2)
-            self.node3_edit = QLineEdit(self.item.node3)
-            self._node4_edit = QLineEdit(self.item.node4)
-            layout.addRow(lbls[0] + ':', self.node1_edit)
-            layout.addRow(lbls[1] + ':', self.node2_edit)
-            layout.addRow(lbls[2] + ':', self.node3_edit)
-            layout.addRow(lbls[3] + ':', self._node4_edit)
-            self._extra_node_edits = []
-        else:
-            self.node1_edit = QLineEdit(self.item.node1)
-            self.node2_edit = QLineEdit(self.item.node2)
-            self.node3_edit = None
-            self._extra_node_edits = []
-            if not is_netlabel:
-                lbl1, lbl2, lbl3 = node_labels.get(self.item.comp_type, ('Nodo +', 'Nodo −', None))
-                layout.addRow(lbl1 + ':', self.node1_edit)
-                layout.addRow(lbl2 + ':', self.node2_edit)
-                if lbl3 is not None:
-                    self.node3_edit = QLineEdit(self.item.node3)
-                    layout.addRow(lbl3 + ':', self.node3_edit)
-
-        # Selector de color para LED
-        self._led_color_combo = None
-        if self.item.comp_type == 'LED':
-            from PyQt6.QtWidgets import QComboBox
-            self._led_color_combo = QComboBox()
-            self._led_color_combo.addItems(['red', 'green', 'blue', 'yellow', 'white', 'orange'])
-            self._led_color_combo.setCurrentText(getattr(self.item, 'led_color', 'red'))
-            layout.addRow('Color del LED:', self._led_color_combo)
-
-        # Campos extra para fuente AC
-        self._freq_spin  = None
-        self._phase_spin = None
-        self._mode_combo = None
-        if self.item.comp_type == 'VAC':
-            from PyQt6.QtWidgets import QComboBox
-            self._mode_combo = QComboBox()
-            self._mode_combo.addItems(['rms', 'peak'])
-            self._mode_combo.setCurrentText(self.item.ac_mode)
-            layout.addRow('Modo amplitud:', self._mode_combo)
-
-            self._freq_spin = QDoubleSpinBox()
-            self._freq_spin.setRange(0.001, 1e9)
-            self._freq_spin.setDecimals(3)
-            self._freq_spin.setSuffix(' Hz')
-            self._freq_spin.setValue(self.item.frequency)
-            layout.addRow('Frecuencia:', self._freq_spin)
-
-            self._phase_spin = QDoubleSpinBox()
-            self._phase_spin.setRange(-360.0, 360.0)
-            self._phase_spin.setDecimals(2)
-            self._phase_spin.setSuffix(' °')
-            self._phase_spin.setValue(self.item.phase_deg)
-            layout.addRow('Fase:', self._phase_spin)
-
-        # ── Campos extra para Impedancia ────────────────────────────────
-        self._z_mode_combo = None
-        self._z_real = self._z_imag = self._z_mag = self._z_phase = None
-        if self.item.comp_type == 'Z':
-            from PyQt6.QtWidgets import QComboBox, QStackedWidget, QWidget, QHBoxLayout
-            self._z_mode_combo = QComboBox()
-            self._z_mode_combo.addItems(['Rectangular (R + jX)', 'Fasorial |Z|∠θ'])
-            self._z_mode_combo.setCurrentIndex(0 if self.item.z_mode == 'rect' else 1)
-            layout.addRow("Modo entrada:", self._z_mode_combo)
-
-            # Página rectangular
-            w_rect = QWidget()
-            l_rect = QHBoxLayout(w_rect)
-            self._z_real = QDoubleSpinBox()
-            self._z_real.setRange(-1e12, 1e12)
-            self._z_real.setDecimals(6)
-            self._z_real.setSuffix(" Ω")
-            self._z_real.setValue(self.item.z_real)
-            self._z_imag = QDoubleSpinBox()
-            self._z_imag.setRange(-1e12, 1e12)
-            self._z_imag.setDecimals(6)
-            self._z_imag.setSuffix(" jΩ")
-            self._z_imag.setValue(self.item.z_imag)
-            l_rect.addWidget(QLabel("Real:"))
-            l_rect.addWidget(self._z_real)
-            l_rect.addWidget(QLabel("Imag:"))
-            l_rect.addWidget(self._z_imag)
-
-            # Página fasorial
-            w_phas = QWidget()
-            l_phas = QHBoxLayout(w_phas)
-            self._z_mag = QDoubleSpinBox()
-            self._z_mag.setRange(0, 1e12)
-            self._z_mag.setDecimals(6)
-            self._z_mag.setSuffix(" Ω")
-            self._z_mag.setValue(self.item.z_mag)
-            self._z_phase = QDoubleSpinBox()
-            self._z_phase.setRange(-360, 360)
-            self._z_phase.setDecimals(2)
-            self._z_phase.setSuffix(" °")
-            self._z_phase.setValue(self.item.z_phase)
-            l_phas.addWidget(QLabel("|Z|:"))
-            l_phas.addWidget(self._z_mag)
-            l_phas.addWidget(QLabel("∠:"))
-            l_phas.addWidget(self._z_phase)
-
-            self._z_stack = QStackedWidget()
-            self._z_stack.addWidget(w_rect)
-            self._z_stack.addWidget(w_phas)
-            layout.addRow(self._z_stack)
-            self._z_mode_combo.currentIndexChanged.connect(self._z_stack.setCurrentIndex)
-
-        # ── Campos extra para POT / XFMR / BRIDGE ────────────────────────
-        self._pot_wiper_spin = None
-        self._xfmr_ratio_spin = None
-        self._xfmr_imax_spin  = None
-
-        if self.item.comp_type == 'POT':
-            self._pot_wiper_spin = QDoubleSpinBox()
-            self._pot_wiper_spin.setRange(0.0, 1.0)
-            self._pot_wiper_spin.setDecimals(3)
-            self._pot_wiper_spin.setSingleStep(0.05)
-            self._pot_wiper_spin.setValue(self.item.pot_wiper)
-            layout.addRow("Cursor (0–1):", self._pot_wiper_spin)
-
-        if self.item.comp_type == 'XFMR':
-            self._xfmr_ratio_spin = QDoubleSpinBox()
-            self._xfmr_ratio_spin.setRange(0.001, 1000.0)
-            self._xfmr_ratio_spin.setDecimals(4)
-            self._xfmr_ratio_spin.setValue(self.item.xfmr_ratio)
-            layout.addRow("Relación n = N1/N2:", self._xfmr_ratio_spin)
-
-            self._xfmr_imax_spin = QDoubleSpinBox()
-            self._xfmr_imax_spin.setRange(0.001, 1e6)
-            self._xfmr_imax_spin.setDecimals(3)
-            self._xfmr_imax_spin.setSuffix(' A')
-            self._xfmr_imax_spin.setValue(self.item.xfmr_imax)
-            layout.addRow("Corriente máx primaria:", self._xfmr_imax_spin)
-
-        # ── Campos para componentes digitales ────────────────────────────
-        self._dig_inputs_spin = None
-        self._dig_bits_spin   = None
-        self._dig_vref_spin   = None
-        self._dig_tpd_spin    = None
-        self._dig_clk_edit    = None
-        self._dig_anode_edit  = None
-
-        dig_gate_types  = {'AND','OR','NOT','NAND','NOR','XOR'}
-        dig_ff_types    = {'DFF','JKFF','TFF','SRFF'}
-        dig_bridge_types= {'ADC_BRIDGE','DAC_BRIDGE','COMPARATOR'}
-        dig_count_types = {'COUNTER','MUX2'}
-
-        if self.item.comp_type in dig_gate_types:
-            if self.item.comp_type != 'NOT':
-                self._dig_inputs_spin = QDoubleSpinBox()
-                self._dig_inputs_spin.setRange(2, 8)
-                self._dig_inputs_spin.setDecimals(0)
-                self._dig_inputs_spin.setValue(self.item.dig_inputs)
-                layout.addRow('Nº entradas:', self._dig_inputs_spin)
-
-            self._dig_tpd_spin = QDoubleSpinBox()
-            self._dig_tpd_spin.setRange(0.001, 1000)
-            self._dig_tpd_spin.setDecimals(3)
-            self._dig_tpd_spin.setSuffix(' ns')
-            self._dig_tpd_spin.setValue(self.item.dig_tpd_ns)
-            layout.addRow('Retardo tpd:', self._dig_tpd_spin)
-
-        elif self.item.comp_type in dig_ff_types:
-            self._dig_clk_edit = QLineEdit(self.item.dig_clk)
-            layout.addRow('Net CLK:', self._dig_clk_edit)
-
-            self._dig_tpd_spin = QDoubleSpinBox()
-            self._dig_tpd_spin.setRange(0.001, 1000)
-            self._dig_tpd_spin.setDecimals(3)
-            self._dig_tpd_spin.setSuffix(' ns')
-            self._dig_tpd_spin.setValue(self.item.dig_tpd_ns)
-            layout.addRow('Retardo tpd:', self._dig_tpd_spin)
-
-        elif self.item.comp_type in dig_bridge_types:
-            self._dig_bits_spin = QDoubleSpinBox()
-            self._dig_bits_spin.setRange(1, 24)
-            self._dig_bits_spin.setDecimals(0)
-            self._dig_bits_spin.setValue(self.item.dig_bits_adc)
-            layout.addRow('Resolución (bits):', self._dig_bits_spin)
-
-            self._dig_vref_spin = QDoubleSpinBox()
-            self._dig_vref_spin.setRange(0.1, 100.0)
-            self._dig_vref_spin.setDecimals(3)
-            self._dig_vref_spin.setSuffix(' V')
-            self._dig_vref_spin.setValue(self.item.dig_vref)
-            layout.addRow('Vref:', self._dig_vref_spin)
-
-            self._dig_anode_edit = QLineEdit(self.item.dig_analog_node)
-            layout.addRow('Nodo analógico MNA:', self._dig_anode_edit)
-
-            self._dig_clk_edit = QLineEdit(self.item.dig_clk)
-            layout.addRow('Net CLK (opcional):', self._dig_clk_edit)
-
-        elif self.item.comp_type in dig_count_types:
-            self._dig_bits_spin = QDoubleSpinBox()
-            self._dig_bits_spin.setRange(1, 32)
-            self._dig_bits_spin.setDecimals(0)
-            self._dig_bits_spin.setValue(self.item.dig_bits)
-            layout.addRow('Bits:', self._dig_bits_spin)
-
-            self._dig_clk_edit = QLineEdit(self.item.dig_clk)
-            layout.addRow('Net CLK:', self._dig_clk_edit)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def get_data(self):
-        data = {
-            'name':      self.name_edit.text(),
-            'value':     self.value_spin.value(),
-            'node1':     self.node1_edit.text(),
-            'node2':     self.node2_edit.text(),
-            'node3':     self.node3_edit.text() if self.node3_edit else '',
-            'frequency': self._freq_spin.value()  if self._freq_spin  else 60.0,
-            'phase_deg': self._phase_spin.value() if self._phase_spin else 0.0,
-            'ac_mode':   self._mode_combo.currentText() if self._mode_combo else 'rms',
-            'led_color': self._led_color_combo.currentText() if self._led_color_combo else 'red',
-        }
-        if self.item.comp_type == 'Z' and self._z_mode_combo is not None:
-            data['z_mode']  = 'rect' if self._z_mode_combo.currentIndex() == 0 else 'phasor'
-            data['z_real']  = self._z_real.value()
-            data['z_imag']  = self._z_imag.value()
-            data['z_mag']   = self._z_mag.value()
-            data['z_phase'] = self._z_phase.value()
-        # Campos digitales
-        if self._dig_inputs_spin is not None:
-            data['dig_inputs']  = int(self._dig_inputs_spin.value())
-        if self._dig_bits_spin is not None:
-            data['dig_bits']    = int(self._dig_bits_spin.value())
-            data['dig_bits_adc']= int(self._dig_bits_spin.value())
-        if self._dig_vref_spin is not None:
-            data['dig_vref']    = self._dig_vref_spin.value()
-        if self._dig_tpd_spin is not None:
-            data['dig_tpd_ns']  = self._dig_tpd_spin.value()
-        if self._dig_clk_edit is not None:
-            data['dig_clk']     = self._dig_clk_edit.text()
-        if self._dig_anode_edit is not None:
-            data['dig_analog_node'] = self._dig_anode_edit.text()
-        # Nodos de entradas extra para puertas con más de 2 entradas
-        if hasattr(self, '_extra_node_edits') and self._extra_node_edits:
-            data['dig_input_nodes'] = [e.text() for e in self._extra_node_edits]
-        # Cuarto nodo (XFMR / BRIDGE)
-        if hasattr(self, '_node4_edit') and self._node4_edit is not None:
-            data['node4'] = self._node4_edit.text()
-        # Wiper del potenciómetro
-        if self._pot_wiper_spin is not None:
-            data['pot_wiper'] = self._pot_wiper_spin.value()
-        # Transformador
-        if self._xfmr_ratio_spin is not None:
-            data['xfmr_ratio'] = self._xfmr_ratio_spin.value()
-        if self._xfmr_imax_spin is not None:
-            data['xfmr_imax']  = self._xfmr_imax_spin.value()
-        if self._sheet_label_edit is not None:
-            data['sheet_label'] = self._sheet_label_edit.text()
-        return data
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3072,7 +2532,8 @@ class MainWindow(QMainWindow):
     # ── Configuración / Tema ──────────────────────────────────────────────
     def _open_settings_dialog(self):
         """Abre el diálogo de configuración."""
-        dlg = SettingsDialog(parent=self,
+        dlg = SettingsDialog(THEME_MANAGER, COLORS,
+                             parent=self,
                              current_theme_id=THEME_MANAGER.load_selection(),
                              on_theme_change=self._apply_theme_change)
         dlg.exec()
@@ -3265,7 +2726,7 @@ class MainWindow(QMainWindow):
     # ── Modos ────────────────────────────────────
     def _show_picker(self, category_name: str, items: List[tuple]):
         """Abre el diálogo de selección y, si se acepta, activa el modo colocación."""
-        dialog = ComponentPickerDialog(category_name, items, self)
+        dialog = ComponentPickerDialog(category_name, items, ComponentItem, COLORS, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             ctype = dialog.get_selected_type()
             if ctype:
@@ -4260,7 +3721,7 @@ class MainWindow(QMainWindow):
     def _show_power_triangle(self):
         if not self._last_ac_result:
             return
-        dlg = PowerTriangleDialog(self._last_ac_result, parent=self)
+        dlg = PowerTriangleDialog(self._last_ac_result, COLORS, parent=self)
         dlg.exec()
 
     def _on_logic_state_toggled(self, item):
@@ -4318,22 +3779,6 @@ class MainWindow(QMainWindow):
         if item is None:
             return
 
-        # Etiquetas de terminales según tipo de componente
-        terminal_labels = {
-            'R':       ('Nodo 1',            'Nodo 2',             None),
-            'POT':     ('Nodo 1',            'Nodo 2 (cursor)',    None),
-            'C':       ('Nodo 1',            'Nodo 2',             None),
-            'L':       ('Nodo 1',            'Nodo 2',             None),
-            'V':       ('Nodo + (ánodo)',    'Nodo − (cátodo)',    None),
-            'I':       ('Nodo + (salida)',   'Nodo − (entrada)',   None),
-            'D':       ('Ánodo (A)',         'Cátodo (K)',         None),
-            'LED':     ('Ánodo (A)',         'Cátodo (K)',         None),
-            'BJT_NPN': ('Colector (C)',      'Emisor (E)',         'Base (B)'),
-            'BJT_PNP': ('Colector (C)',      'Emisor (E)',         'Base (B)'),
-            'NMOS':    ('Drain (D)',         'Source (S)',         'Gate (G)'),
-            'PMOS':    ('Drain (D)',         'Source (S)',         'Gate (G)'),
-            'OPAMP':   ('Salida (OUT)',      'Entrada − (V−)',     'Entrada + (V+)'),
-        }
         # Nodos automáticos desde cables
         pin_node = self.scene.extract_netlist()
 
@@ -4348,10 +3793,7 @@ class MainWindow(QMainWindow):
             ("Rotación", f"{item._angle}°"),
         ]
 
-        _dig_gate_types_tbl = {'AND','OR','NOT','NAND','NOR','XOR'}
-        _dig_ff_types_tbl   = {'DFF','JKFF','TFF','SRFF'}
-
-        if item.comp_type in _dig_gate_types_tbl:
+        if item.comp_type in DIGITAL_GATE_TYPES:
             n_in = item.dig_inputs if item.comp_type != 'NOT' else 1
             rows.append(("Salida (Y)", _node_display(item.node1, f"{item.name}__p1")))
             rows.append(("Entrada 1 (A)", _node_display(item.node2, f"{item.name}__p2")))
@@ -4364,7 +3806,7 @@ class MainWindow(QMainWindow):
                 rows.append((f"Entrada {i+1}", _node_display(_manual, f"{item.name}__p{i+2}")))
             rows.append(("Nº entradas", str(n_in)))
             rows.append(("Retardo tpd", f"{item.dig_tpd_ns} ns"))
-        elif item.comp_type in _dig_ff_types_tbl:
+        elif item.comp_type in DIGITAL_FLIPFLOP_TYPES:
             rows.append(("Salida Q",    _node_display(item.node1, f"{item.name}__p1")))
             rows.append(("Dato D / J",  _node_display(item.node2, f"{item.name}__p2")))
             rows.append(("CLK",         _node_display(
@@ -4372,8 +3814,16 @@ class MainWindow(QMainWindow):
         elif item.comp_type == 'LOGIC_STATE':
             rows.append(("Salida",  _node_display(item.node1, f"{item.name}__p1")))
             rows.append(("Estado",  "1 (HIGH)" if item.value else "0 (LOW)"))
+        elif item.comp_type in FOUR_PIN_NODE_LABELS:
+            lbls = FOUR_PIN_NODE_LABELS[item.comp_type]
+            rows.append((lbls[0], _node_display(item.node1, f"{item.name}__p1")))
+            rows.append((lbls[1], _node_display(item.node2, f"{item.name}__p2")))
+            rows.append((lbls[2], _node_display(
+                item.node3 if hasattr(item, 'node3') else '', f"{item.name}__p3")))
+            rows.append((lbls[3], _node_display(
+                item.node4 if hasattr(item, 'node4') else '', f"{item.name}__p4")))
         else:
-            lbl1, lbl2, lbl3 = terminal_labels.get(item.comp_type, ('Nodo +', 'Nodo −', None))
+            lbl1, lbl2, lbl3 = COMPONENT_NODE_LABELS.get(item.comp_type, DEFAULT_NODE_LABELS)
             rows.append((lbl1, _node_display(item.node1, f"{item.name}__p1")))
             rows.append((lbl2, _node_display(item.node2, f"{item.name}__p2")))
             if lbl3 is not None:
@@ -4700,543 +4150,6 @@ class MainWindow(QMainWindow):
     def _wheel_zoom(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.view.scale(factor, factor)
-
-
-# ══════════════════════════════════════════════════════════════
-# DIÁLOGO DE CONFIGURACIÓN
-# ══════════════════════════════════════════════════════════════
-class SettingsDialog(QDialog):
-    """
-    Ventana de configuración general de la app.
-
-    Está organizada en secciones:
-      • Apariencia → Tema (combo + carpeta de temas externos).
-
-    Pensada para crecer: añadir secciones (Simulación, Atajos, etc.)
-    consiste en agregar nuevos QGroupBox dentro de _build_ui.
-    """
-
-    def __init__(self,
-                 parent=None,
-                 current_theme_id: str = DEFAULT_THEME_ID,
-                 on_theme_change=None):
-        super().__init__(parent)
-        self.setWindowTitle("Configuración")
-        self.setMinimumSize(560, 380)
-        self._current_theme_id = current_theme_id
-        self._on_theme_change  = on_theme_change   # callback(theme_id)
-        self._build_ui()
-
-    # ── Construcción de la UI ──────────────────────────────────────────────
-    def _build_ui(self):
-        from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox,
-                                      QPushButton, QLabel, QComboBox,
-                                      QDialogButtonBox)
-        main = QVBoxLayout(self)
-        main.setSpacing(10)
-
-        # ── Sección: Apariencia / Tema ─────────────────────────────────────
-        gb_theme = QGroupBox("Apariencia")
-        gl = QVBoxLayout(gb_theme)
-
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Tema:"))
-        self.theme_combo = QComboBox()
-        self.theme_combo.setMinimumWidth(240)
-        self.theme_combo.setToolTip(
-            "Cambia el esquema de colores de la app.\n"
-            "Se aplica al instante y se recuerda entre sesiones.")
-        self._populate_theme_combo()
-        self.theme_combo.currentIndexChanged.connect(self._on_combo_changed)
-        row1.addWidget(self.theme_combo)
-        row1.addStretch()
-        gl.addLayout(row1)
-
-        # Descripción del tema seleccionado
-        self.theme_desc = QLabel("")
-        self.theme_desc.setWordWrap(True)
-        self.theme_desc.setFont(QFont('Consolas', 9))
-        self.theme_desc.setStyleSheet(f"color: {COLORS['text_dim']};")
-        gl.addWidget(self.theme_desc)
-
-        # Botones para gestionar temas externos
-        row2 = QHBoxLayout()
-        btn_open = QPushButton("📁  Abrir carpeta de temas")
-        btn_open.setToolTip(
-            "Abre la carpeta donde puedes dejar archivos .json\n"
-            "para añadir tus propios temas.")
-        btn_open.clicked.connect(self._open_themes_folder)
-        row2.addWidget(btn_open)
-
-        btn_reload = QPushButton("🔄  Recargar lista")
-        btn_reload.setToolTip(
-            "Vuelve a escanear las carpetas de temas tras añadir\n"
-            "o quitar archivos .json sin reiniciar la app.")
-        btn_reload.clicked.connect(self._reload_themes)
-        row2.addWidget(btn_reload)
-
-        btn_export = QPushButton("💾  Exportar tema actual…")
-        btn_export.setToolTip(
-            "Guarda el tema seleccionado como plantilla .json para\n"
-            "que puedas modificarlo y crear el tuyo.")
-        btn_export.clicked.connect(self._export_current_theme)
-        row2.addWidget(btn_export)
-
-        row2.addStretch()
-        gl.addLayout(row2)
-
-        # Hint informativo
-        hint = QLabel(
-            "Para añadir un tema instalable por separado, deja un archivo .json\n"
-            "con el formato indicado en themes/README.md dentro de la carpeta\n"
-            "y pulsa «Recargar lista» (o reinicia la app)."
-        )
-        hint.setWordWrap(True)
-        hint.setFont(QFont('Consolas', 8))
-        hint.setStyleSheet(f"color: {COLORS['text_dim']};")
-        gl.addWidget(hint)
-
-        main.addWidget(gb_theme)
-        main.addStretch()
-
-        # ── Botón cerrar ───────────────────────────────────────────────────
-        bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        bbox.rejected.connect(self.accept)
-        bbox.accepted.connect(self.accept)
-        main.addWidget(bbox)
-
-        # Refresca descripción del tema actual
-        self._refresh_theme_description()
-
-    # ── Lógica del combo ───────────────────────────────────────────────────
-    def _populate_theme_combo(self):
-        self.theme_combo.blockSignals(True)
-        self.theme_combo.clear()
-        for entry in THEME_MANAGER.list_themes():
-            label = entry['name']
-            if entry['source'] != 'builtin':
-                label += '  (externo)'
-            self.theme_combo.addItem(label, entry['id'])
-        idx = self.theme_combo.findData(self._current_theme_id)
-        if idx < 0:
-            idx = 0
-        self.theme_combo.setCurrentIndex(idx)
-        self.theme_combo.blockSignals(False)
-
-    def _on_combo_changed(self, _index: int):
-        tid = self.theme_combo.currentData()
-        if not tid or tid == self._current_theme_id:
-            self._refresh_theme_description()
-            return
-        self._current_theme_id = tid
-        if self._on_theme_change:
-            self._on_theme_change(tid)
-        self._refresh_theme_description()
-
-    def _refresh_theme_description(self):
-        tid  = self.theme_combo.currentData()
-        meta = THEME_MANAGER.get_theme_meta(tid) if tid else None
-        if meta is None:
-            self.theme_desc.setText("")
-            return
-        src = ("Origen: built-in" if meta['source'] == 'builtin'
-               else f"Origen: {meta['source']}")
-        desc = meta.get('description', '')
-        self.theme_desc.setText(f"  {desc}\n  {src}" if desc else f"  {src}")
-
-    # ── Acciones ───────────────────────────────────────────────────────────
-    def _open_themes_folder(self):
-        from PyQt6.QtCore import QUrl
-        from PyQt6.QtGui  import QDesktopServices
-        path = THEME_MANAGER.ensure_user_themes_dir()
-        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-
-    def _reload_themes(self):
-        THEME_MANAGER.refresh()
-        self._populate_theme_combo()
-        self._refresh_theme_description()
-        QMessageBox.information(
-            self, "Temas recargados",
-            f"Se descubrieron {len(THEME_MANAGER.list_themes())} temas en total."
-        )
-
-    def _export_current_theme(self):
-        tid = self.theme_combo.currentData()
-        if not tid:
-            return
-        meta = THEME_MANAGER.get_theme_meta(tid)
-        suggested = f"{tid}_copia.json"
-        # Sugerir guardar en la carpeta de temas de usuario
-        default_dir = THEME_MANAGER.ensure_user_themes_dir()
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Exportar tema como plantilla",
-            os.path.join(default_dir, suggested),
-            "Tema JSON (*.json)")
-        if not path:
-            return
-        ok = THEME_MANAGER.export_theme_template(tid, path)
-        if ok:
-            QMessageBox.information(
-                self, "Tema exportado",
-                f"Plantilla guardada en:\n{path}\n\n"
-                "Edita los colores y pulsa «Recargar lista» para verlo en el selector.")
-        else:
-            QMessageBox.warning(
-                self, "Error",
-                f"No se pudo guardar el archivo:\n{path}")
-
-
-# ══════════════════════════════════════════════════════════════
-# DIÁLOGO TRIÁNGULO DE POTENCIA
-# ══════════════════════════════════════════════════════════════
-class PowerTriangleDialog(QDialog):
-    """
-    Ventana emergente con:
-      - Triángulo de potencia dibujado (P, Q, S, ángulo φ)
-      - Tabla de potencias por componente
-      - Corrección de factor de potencia interactiva
-    """
-    def __init__(self, ac_result: dict, parent=None):
-        super().__init__(parent)
-        self.ac_result = ac_result
-        self.setWindowTitle("Triángulo de Potencia")
-        self.setMinimumSize(620, 580)
-        self._build_ui()
-
-    def _build_ui(self):
-        from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox,
-                                      QDoubleSpinBox, QPushButton, QLabel,
-                                      QTextEdit, QSplitter, QComboBox, QSpinBox)
-        main = QVBoxLayout(self)
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-
-        # ── Triángulo ────────────────────────────────────────────────────
-        self.canvas = _PowerTriangleCanvas(self.ac_result['total'])
-        self.canvas.setMinimumHeight(260)
-        splitter.addWidget(self.canvas)
-
-        # ── Corrección de FP ─────────────────────────────────────────────
-        box = QGroupBox("Corrección de Factor de Potencia")
-        box_layout = QHBoxLayout(box)
-
-        box_layout.addWidget(QLabel("FP objetivo:"))
-        self.fp_spin = QDoubleSpinBox()
-        self.fp_spin.setRange(0.01, 1.0)
-        self.fp_spin.setDecimals(3)
-        self.fp_spin.setSingleStep(0.01)
-        self.fp_spin.setValue(1.0)
-        box_layout.addWidget(self.fp_spin)
-
-        # Selector de tipo de FP resultante
-        box_layout.addSpacing(10)
-        box_layout.addWidget(QLabel("Tipo:"))
-        self.target_combo = QComboBox()
-        # (texto visible, valor enviado al solver)
-        self.target_combo.addItem("Auto (mismo dominio)", 'auto')
-        self.target_combo.addItem("Inductivo (Q > 0)",     'inductive')
-        self.target_combo.addItem("Capacitivo (Q < 0)",    'capacitive')
-        self.target_combo.setToolTip(
-            "Auto: mantiene el dominio actual (capacitivo↔capacitivo,\n"
-            "inductivo↔inductivo).\n"
-            "Inductivo: fuerza un Q resultante positivo (puede cruzar\n"
-            "de capacitivo a inductivo agregando un inductor grande).\n"
-            "Capacitivo: fuerza un Q resultante negativo."
-        )
-        box_layout.addWidget(self.target_combo)
-        self.decimals_label = QLabel("Decimales:")
-        self.decimals_spinbox = QSpinBox()
-
-        self.decimals_spinbox.setRange(0, 15)   # mínimo y máximo
-        self.decimals_spinbox.setValue(4)       # valor por defecto
-        
-        box_layout.addWidget(self.decimals_label)
-        box_layout.addWidget(self.decimals_spinbox)
-        self.correct_btn = QPushButton("Calcular corrección")
-        self.correct_btn.clicked.connect(self._on_correct)
-        box_layout.addWidget(self.correct_btn)
-        box_layout.addStretch()
-
-        self.corr_label = QLabel("")
-        self.corr_label.setWordWrap(True)
-        self.corr_label.setFont(QFont('Consolas', 9))
-
-        bottom = QWidget()
-        bl = QVBoxLayout(bottom)
-        bl.addWidget(box)
-        bl.addWidget(self.corr_label)
-        splitter.addWidget(bottom)
-
-        main.addWidget(splitter)
-
-        btn_row = QHBoxLayout()
-        reset_btn = QPushButton("🔍 Restablecer vista")
-        reset_btn.clicked.connect(self.canvas.reset_view)
-        btn_row.addWidget(reset_btn)
-        btn_row.addStretch()
-        close_btn = QPushButton("Cerrar")
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
-        main.addLayout(btn_row)
-
-    def _on_correct(self):
-        from engine import MNASolver
-        solver       = MNASolver()
-        total        = self.ac_result['total']
-        freq         = self.ac_result['frequency']
-        fp_tgt       = self.fp_spin.value()
-        target_type  = self.target_combo.currentData() or 'auto'
-        decsel = self.decimals_spinbox.value()
-        res          = solver.correct_power_factor(
-            total, freq, fp_tgt, target_type=target_type)
-
-        if 'error' in res:
-            self.corr_label.setText(f"⚠ {res['error']}")
-            return
-
-        tipo        = res['type']
-        val         = res['value']
-        Q_corr      = res['Q_corr']
-        fp_new      = res['fp_new']
-        fp_type_new = res.get('fp_type_new', '')
-        note        = res.get('note', '')
-        form        = res['formula']
-        tt_used     = res.get('target_type', 'auto')
-
-        if tipo == 'capacitor':
-            val_str = f"C = {val*1e6:.{decsel}f} µF  (normalizado a 1 Vrms)"
-            emoji   = "⚡ Capacitor"
-        else:
-            val_str = f"L = {val*1e3:.{decsel}f} mH  (normalizado a 1 Vrms)"
-            emoji   = "🔄 Inductor"
-
-        modo_map = {'auto': 'Auto', 'inductive': 'Inductivo',
-                    'capacitive': 'Capacitivo'}
-        modo_str = modo_map.get(tt_used, tt_used)
-
-        text = (
-            f"  Modo objetivo:      {modo_str}\n"
-            f"  Elemento corrector: {emoji} en PARALELO\n"
-            f"  {val_str}\n"
-            f"  Q a compensar:      {Q_corr:.4f} VAR\n"
-            f"  FP resultante:      {fp_new:.4f}  ({fp_type_new})\n"
-            f"  Fórmula:            {form}\n"
-            f"  📌 {note}"
-        )
-        self.corr_label.setText(text)
-        # Actualizar triángulo con la corrección
-        self.canvas.set_correction(res)
-        self.canvas.update()
-
-
-class _PowerTriangleCanvas(QWidget):
-    """Widget que dibuja el triángulo de potencia S, P, Q, ángulo φ.
-    Soporta zoom con rueda del ratón y pan con click+arrastre."""
-
-    def __init__(self, total: dict, parent=None):
-        super().__init__(parent)
-        self.total       = total
-        self._correction = None
-        self._zoom       = 1.0
-        self._pan_x      = 0.0
-        self._pan_y      = 0.0
-        self._dragging   = False
-        self._last_pos   = None
-
-    def set_correction(self, corr: dict):
-        self._correction = corr
-        self.update()
-
-    def wheelEvent(self, event):
-        """Zoom con rueda del ratón centrado en el cursor."""
-        delta = event.angleDelta().y()
-        factor = 1.15 if delta > 0 else 1 / 1.15
-        old_zoom = self._zoom
-        self._zoom *= factor
-        self._zoom = max(0.2, min(self._zoom, 10.0))
-        # Zoom centrado en el cursor
-        mx = event.position().x()
-        my = event.position().y()
-        self._pan_x = mx - (mx - self._pan_x) * (self._zoom / old_zoom)
-        self._pan_y = my - (my - self._pan_y) * (self._zoom / old_zoom)
-        self.update()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._last_pos = event.pos()
-
-    def mouseMoveEvent(self, event):
-        if self._dragging and self._last_pos is not None:
-            dx = event.pos().x() - self._last_pos.x()
-            dy = event.pos().y() - self._last_pos.y()
-            self._pan_x += dx
-            self._pan_y += dy
-            self._last_pos = event.pos()
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = False
-            self._last_pos = None
-
-    def reset_view(self):
-        self._zoom  = 1.0
-        self._pan_x = 0.0
-        self._pan_y = 0.0
-        self.update()
-
-    def paintEvent(self, event):
-        from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QPolygonF
-        import math
-
-        P  = self.total.get('P', 0.0)
-        Q  = self.total.get('Q', 0.0)
-        S  = self.total.get('S', 1.0)
-        fp = self.total.get('fp', 0.0)
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor('#1a1a2e'))
-
-        W = self.width()
-        H = self.height()
-
-        # Escala: S ocupa ~55% del ancho disponible
-        if S < 1e-12:
-            painter.setPen(QPen(QColor('#aaaaaa'), 1))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                             "Sin datos de potencia")
-            return
-
-        base_scale = (W * 0.55) / S
-        scale = base_scale * self._zoom
-
-        # Origen centrado en el widget, ajustado por pan
-        ox = int(W * 0.15) + int(self._pan_x)
-
-        # ── Posicionar oy considerando Q original Y Q corregido ────────────
-        # Si la corrección cruza el dominio (p.ej. capacitivo → inductivo)
-        # necesitamos espacio arriba Y abajo, así que centramos.
-        Q_values = [Q]
-        if self._correction is not None:
-            Q_values.append(self._correction.get('Q_new', Q))
-        has_up   = any(q >  1e-12 for q in Q_values)   # apunta hacia arriba
-        has_down = any(q < -1e-12 for q in Q_values)   # apunta hacia abajo
-
-        if has_up and has_down:
-            # Cruza dominios → centrar verticalmente
-            oy = int(H * 0.5) + int(self._pan_y)
-        elif has_down:
-            # Sólo capacitivo → origen arriba para dejar espacio abajo
-            oy = int(H * 0.35) + int(self._pan_y)
-        else:
-            # Sólo inductivo (o unitario) → origen abajo para dejar espacio arriba
-            oy = int(H * 0.65) + int(self._pan_y)
-
-        # Q>0 inductivo → triángulo hacia ARRIBA (Qy negativo en coords pantalla)
-        # Q<0 capacitivo → triángulo hacia ABAJO  (Qy positivo en coords pantalla)
-        Px = int(P * scale)
-        Qy = int(-Q * scale)   # signo correcto: Q+ → arriba, Q- → abajo
-
-        pen_P   = QPen(QColor('#e74c3c'), 3)   # rojo  — P activa
-        pen_Q   = QPen(QColor('#3498db'), 3)   # azul  — Q reactiva
-        pen_S   = QPen(QColor('#2ecc71'), 3)   # verde — S aparente
-        pen_ax  = QPen(QColor('#444466'), 1)   # gris  — ejes
-        pen_c   = QPen(QColor('#f39c12'), 2, Qt.PenStyle.DashLine)
-
-        font_lbl = QFont('Consolas', 9, QFont.Weight.Bold)
-        font_ax  = QFont('Consolas', 8)
-        painter.setFont(font_lbl)
-
-        def arrow(painter, pen, x1, y1, x2, y2, label='', lside='end'):
-            painter.setPen(pen)
-            painter.drawLine(x1, y1, x2, y2)
-            dx = x2 - x1; dy = y2 - y1
-            L  = math.sqrt(dx*dx + dy*dy)
-            if L < 1: return
-            ux = dx/L; uy = dy/L
-            px = -uy;  py = ux
-            sz = 8
-            tip = QPolygonF([
-                QPointF(x2, y2),
-                QPointF(x2 - sz*ux + sz*0.4*px, y2 - sz*uy + sz*0.4*py),
-                QPointF(x2 - sz*ux - sz*0.4*px, y2 - sz*uy - sz*0.4*py),
-            ])
-            painter.setBrush(QColor(pen.color()))
-            painter.drawPolygon(tip)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            if label:
-                painter.setPen(QPen(pen.color(), 1))
-                if lside == 'end':
-                    painter.drawText(int(x2)+6, int(y2)+5, label)
-                else:
-                    mx = (x1+x2)//2; my = (y1+y2)//2
-                    painter.drawText(mx+6, my-4, label)
-
-        # ── Ejes de referencia ────────────────────────────────────────────
-        ax_len = max(abs(Px), abs(Qy), 60) + 50
-        painter.setFont(font_ax)
-
-        # Eje X (potencia activa — positiva a la derecha)
-        arrow(painter, pen_ax, ox - 20, oy, ox + ax_len, oy, '', 'end')
-        painter.setPen(QPen(QColor('#666688'), 1))
-        painter.drawText(ox + ax_len + 4, oy + 4, "P (W)")
-
-        # Eje Y (potencia reactiva — positiva hacia arriba = Q inductivo)
-        arrow(painter, pen_ax, ox, oy + 20, ox, oy - ax_len, '', 'end')
-        painter.drawText(ox + 4, oy - ax_len - 4, "Q+ inductivo")
-        painter.drawText(ox + 4, oy + 28, "Q− capacitivo")
-
-        # Línea punteada guía en Q− (zona capacitiva)
-        painter.setPen(QPen(QColor('#333355'), 1, Qt.PenStyle.DotLine))
-        painter.drawLine(ox, oy, ox, oy + ax_len)
-
-        painter.setFont(font_lbl)
-
-        # ── Triángulo ─────────────────────────────────────────────────────
-        # P (horizontal)
-        arrow(painter, pen_P, ox, oy, ox + Px, oy,
-              f"P = {P:.2f} W", 'end')
-
-        # Q (vertical desde punta de P — arriba si inductivo, abajo si capacitivo)
-        arrow(painter, pen_Q, ox + Px, oy, ox + Px, oy + Qy,
-              f"Q = {Q:.2f} VAR", 'end')
-
-        # S (hipotenusa desde origen)
-        arrow(painter, pen_S, ox, oy, ox + Px, oy + Qy,
-              f"S = {S:.4f} VA", 'mid')
-
-        # Ángulo φ — signo correcto usando atan2 con Q real
-        phi_rad = math.atan2(Q, P)            # positivo inductivo, negativo capacitivo
-        phi_deg = math.degrees(phi_rad)
-        painter.setPen(QPen(QColor('#f1c40f'), 1))
-        r_arc = 40
-        # Qt drawArc: 0° = 3 o'clock, span positivo = anti-horario (visualmente hacia ARRIBA),
-        # span negativo = horario (visualmente hacia ABAJO).
-        # Como phi_deg > 0 cuando Q es inductivo (vector hacia arriba) y phi_deg < 0
-        # cuando es capacitivo (vector hacia abajo), pasamos phi_deg directamente
-        # para que el arco siga la dirección real del vector Q.
-        start_qt  = 0
-        span_qt   = int(phi_deg * 16)
-        painter.drawArc(ox - r_arc, oy - r_arc, 2*r_arc, 2*r_arc,
-                        start_qt * 16, span_qt)
-        # Etiqueta del ángulo (encima si Q+ inductivo, debajo si Q− capacitivo)
-        label_y = oy - 14 if Q >= 0 else oy + 22
-        painter.drawText(ox + r_arc + 4, label_y,
-                         f"φ = {phi_deg:+.1f}°  fp={fp:.3f}  ({self.total.get('fp_type','')})")
-
-        # Corrección de FP
-        if self._correction:
-            Q_new  = self._correction.get('Q_new', Q)
-            Qy_new = int(-Q_new * scale)
-            arrow(painter, pen_c, ox, oy, ox + Px, oy + Qy_new,
-                  f"S' (fp={self._correction['fp_new']:.3f})", 'mid')
-            painter.setPen(QPen(QColor('#f39c12'), 1, Qt.PenStyle.DashLine))
-            painter.drawLine(ox + Px, oy + Qy, ox + Px, oy + Qy_new)
-            painter.setPen(QPen(QColor('#f39c12'), 1))
-            painter.drawText(ox + Px + 8, (oy + Qy + oy + Qy_new)//2,
-                             f"ΔQ={abs(Q-Q_new):.2f} VAR")
 
 
 # ══════════════════════════════════════════════════════════════

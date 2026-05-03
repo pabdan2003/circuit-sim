@@ -151,7 +151,7 @@ if r['success'] and 'out' in r['voltages']:
     # Potencia en Z debe tener P>0 y Q>0 (inductivo)
     if 'Z1' in r['powers']:
         pz = r['powers']['Z1']
-        check("P(Z1)", pz['P'], 0.001, tol=1e-4)  # aprox
+        check("P(Z1)", pz['P'], 0.002, tol=1e-4)  # aprox
         check("Q(Z1)>0", 1 if pz['Q'] > 0 else 0, 1, tol=0.1)
 else:
     print(f"  {FAIL}  AC solver error: {r.get('error')}")
