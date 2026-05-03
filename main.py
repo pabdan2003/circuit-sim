@@ -20,8 +20,8 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QSplitter, QDialog,
     QLineEdit, QDialogButtonBox, QMessageBox, QStatusBar,
     QGraphicsPathItem, QPushButton, QComboBox, QDoubleSpinBox,
-    QGroupBox, QTextEdit, QFileDialog,
-    QListWidget, QTabWidget, QInputDialog
+    QGroupBox, QTextEdit, QFileDialog, QCheckBox, QFormLayout,
+    QListWidget, QTabWidget, QInputDialog, QStyledItemDelegate
 )
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPainterPath, QPolygonF,
@@ -4308,7 +4308,7 @@ def _prime_to_sop_term(prime: str, var_names) -> str:
             parts.append(f"{name}'")
         elif bit == '1':
             parts.append(name)
-    return ''.join(parts) if parts else '1'
+    return ' · '.join(parts) if parts else '1'
 
 
 def _prime_to_pos_term(prime: str, var_names) -> str:
@@ -4417,14 +4417,14 @@ def _notation_ops(notation: str, form: str, rich: bool = False):
     if notation == 'math_bar':
         return {
             'not': lambda name: _overline(name, rich=rich),
-            'and': '' if form == 'sop' else ' · ',
+            'and': ' · ',
             'or':  ' + ',
             'sop_join': ' + ',
             'pos_join': ' · ',
         }
     return {
         'not': lambda name: f"{name}'",
-        'and': '' if form == 'sop' else ' · ',
+        'and': ' · ',
         'or':  ' + ',
         'sop_join': ' + ',
         'pos_join': ' · ',
@@ -4478,6 +4478,94 @@ def _gray_codes(bits: int) -> list:
     return codes
 
 
+KMAP_GROUPS_ROLE = int(Qt.ItemDataRole.UserRole) + 21
+
+
+class TruthTableSeparatorDelegate(QStyledItemDelegate):
+    def __init__(self, separator_column: int = -1, color: str = '#f5a623',
+                 parent=None):
+        super().__init__(parent)
+        self.separator_column = separator_column
+        self.color = color
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.column() != self.separator_column:
+            return
+        painter.save()
+        pen = QPen(QColor(self.color), 3)
+        painter.setPen(pen)
+        x = option.rect.right()
+        painter.drawLine(x, option.rect.top(), x, option.rect.bottom())
+        painter.restore()
+
+
+class KMapGroupDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        groups = index.data(KMAP_GROUPS_ROLE) or []
+        if groups:
+            painter.save()
+            for i, group in enumerate(groups[:4]):
+                color = QColor(group['color'])
+                color.setAlpha(42)
+                painter.fillRect(option.rect.adjusted(1, 1, -1, -1), color)
+            painter.restore()
+
+        super().paint(painter, option, index)
+
+        if not groups:
+            return
+        painter.save()
+        for i, group in enumerate(groups[:4]):
+            color = QColor(group['color'])
+            color.setAlpha(230)
+            pen = QPen(color, 2)
+            painter.setPen(pen)
+            inset = 2 + i * 3
+            painter.drawRoundedRect(option.rect.adjusted(inset, inset, -inset, -inset),
+                                    4, 4)
+        painter.restore()
+
+
+class AutoBuildCircuitDialog(QDialog):
+    def __init__(self, default_sheet_name: str = "Circuito simplificado",
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Armar circuito automaticamente")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.sheet_name_edit = QLineEdit(default_sheet_name)
+        form.addRow("Nombre de la hoja:", self.sheet_name_edit)
+        layout.addLayout(form)
+
+        self.two_input_only_check = QCheckBox("Usar compuertas unicamente de 2 entradas")
+        self.nand_only_check = QCheckBox("Armar solo usando compuertas NAND")
+        layout.addWidget(self.two_input_only_check)
+        layout.addWidget(self.nand_only_check)
+
+        hint = QLabel(
+            "<small>Estas opciones definen la topologia que usara el generador "
+            "al convertir las ecuaciones minimizadas en una hoja nueva.</small>")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_options(self) -> dict:
+        return {
+            'sheet_name': self.sheet_name_edit.text().strip(),
+            'two_input_only': self.two_input_only_check.isChecked(),
+            'nand_only': self.nand_only_check.isChecked(),
+        }
+
+
 class CircuitAnalyzerDialog(QDialog):
     """Analizador de circuitos digitales.
 
@@ -4505,6 +4593,7 @@ class CircuitAnalyzerDialog(QDialog):
         self._last_highlight: str = 'sop'
         self._all_outputs_label = "Todas las salidas"
         self._notation_id = 'math_prime'
+        self._kmap_groups = []
 
         self._build_ui()
 
@@ -4649,6 +4738,10 @@ class CircuitAnalyzerDialog(QDialog):
         self.truth_table.setEditTriggers(
             QTableWidget.EditTrigger.DoubleClicked |
             QTableWidget.EditTrigger.SelectedClicked)
+        self._truth_delegate = TruthTableSeparatorDelegate(
+            color=COLORS.get('comp_sel', '#f5a623'),
+            parent=self.truth_table)
+        self.truth_table.setItemDelegate(self._truth_delegate)
         self.truth_table.itemChanged.connect(self._on_truth_cell_changed)
         v.addWidget(self.truth_table)
 
@@ -4695,6 +4788,25 @@ class CircuitAnalyzerDialog(QDialog):
         self.truth_table.setColumnCount(n_in + n_out + 1)   # +1 → columna #
         headers = ['#'] + list(self.var_inputs) + list(self.var_outputs)
         self.truth_table.setHorizontalHeaderLabels(headers)
+        self._truth_delegate.separator_column = n_in
+        input_header = QBrush(QColor(COLORS.get('grid', '#16213e')))
+        output_header = QBrush(QColor(COLORS.get('toolbar', '#0f3460')))
+        separator_brush = QBrush(QColor(COLORS.get('comp_sel', '#f5a623')))
+        for c in range(self.truth_table.columnCount()):
+            header_item = self.truth_table.horizontalHeaderItem(c)
+            if header_item is None:
+                continue
+            if c == 0:
+                header_item.setBackground(QBrush(QColor(COLORS.get('panel', '#16213e'))))
+            elif c <= n_in:
+                header_item.setBackground(input_header)
+            else:
+                header_item.setBackground(output_header)
+            header_item.setForeground(QBrush(QColor(COLORS.get('text', '#e0e0e0'))))
+        if n_in > 0:
+            sep_header = self.truth_table.horizontalHeaderItem(n_in)
+            if sep_header is not None:
+                sep_header.setBackground(separator_brush)
 
         for r in range(n_rows):
             # Columna #: índice del mintérmino
@@ -4892,17 +5004,29 @@ class CircuitAnalyzerDialog(QDialog):
             self.eqs_text.setPlainText('\n'.join(lines))
 
     def _build_circuit_stub(self):
+        dlg = AutoBuildCircuitDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        opts = dlg.get_options()
+        if not opts['sheet_name']:
+            QMessageBox.warning(self, "Nombre requerido",
+                                "Indica un nombre para la hoja del circuito.")
+            return
+        self._last_auto_build_options = opts
         QMessageBox.information(
-            self, "Armado automático",
-            "El armado automático del circuito lógico aún no está "
-            "implementado.\n\n"
-            "Esta función generará las puertas (AND/OR/NOT) y las "
-            "colocará en una hoja nueva conectando las entradas a "
-            "los pines correspondientes.")
+            self, "Armado automatico",
+            "Configuracion guardada para el generador:\n\n"
+            f"Hoja: {opts['sheet_name']}\n"
+            f"Solo compuertas de 2 entradas: {'Si' if opts['two_input_only'] else 'No'}\n"
+            f"Solo NAND: {'Si' if opts['nand_only'] else 'No'}\n\n"
+            "El siguiente paso sera conectar estas opciones con la generacion "
+            "fisica de compuertas en el canvas.")
+        return
 
     # ── Pestaña 4: Mapa de Karnaugh (placeholder) ─────────────────────────
     def _build_kmap_tab(self) -> QWidget:
         w = QWidget()
+        self._kmap_tab = w
         v = QVBoxLayout(w)
         title = QLabel("<h3>Mapa de Karnaugh</h3>")
         v.addWidget(title)
@@ -4912,6 +5036,12 @@ class CircuitAnalyzerDialog(QDialog):
         self.kmap_output_selector = QComboBox()
         self.kmap_output_selector.currentIndexChanged.connect(self._refresh_kmap)
         top.addWidget(self.kmap_output_selector)
+        top.addWidget(QLabel("Grupos visibles:"))
+        self.kmap_group_selector = QComboBox()
+        self.kmap_group_selector.addItem("SOP", 'sop')
+        self.kmap_group_selector.addItem("POS", 'pos')
+        self.kmap_group_selector.currentIndexChanged.connect(self._on_kmap_group_mode_changed)
+        top.addWidget(self.kmap_group_selector)
         btn_refresh = QPushButton("Actualizar")
         btn_refresh.clicked.connect(self._refresh_kmap)
         top.addWidget(btn_refresh)
@@ -4923,16 +5053,27 @@ class CircuitAnalyzerDialog(QDialog):
         v.addWidget(self.kmap_summary)
 
         self.kmap_table = QTableWidget()
+        self.kmap_table.setItemDelegate(KMapGroupDelegate(self.kmap_table))
+        self.kmap_table.setMouseTracking(True)
+        self.kmap_table.viewport().setMouseTracking(True)
+        self.kmap_table.cellEntered.connect(self._on_kmap_cell_entered)
         self.kmap_table.itemChanged.connect(self._on_kmap_cell_changed)
         v.addWidget(self.kmap_table)
+
+        self.kmap_group_hint = QLabel("Pasa el cursor sobre una celda agrupada.")
+        self.kmap_group_hint.setTextFormat(Qt.TextFormat.RichText)
+        self.kmap_group_hint.setWordWrap(True)
+        self.kmap_group_hint.setStyleSheet(
+            f"color: {COLORS.get('text_dim', '#7f8c8d')};")
+        v.addWidget(self.kmap_group_hint)
 
         btn_row = QHBoxLayout()
         self.btn_kmap_sop = QPushButton("K-map -> SOP")
         self.btn_kmap_pos = QPushButton("K-map -> POS")
-        self.btn_kmap_export = QPushButton("Exportar K-map")
-        self.btn_kmap_export.setEnabled(False)
+        self.btn_kmap_export = QPushButton("Exportar PNG")
         self.btn_kmap_sop.clicked.connect(lambda: self._simplify_from_kmap('sop'))
         self.btn_kmap_pos.clicked.connect(lambda: self._simplify_from_kmap('pos'))
+        self.btn_kmap_export.clicked.connect(self._export_kmap_png)
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_kmap_sop)
         btn_row.addWidget(self.btn_kmap_pos)
@@ -4994,29 +5135,117 @@ class CircuitAnalyzerDialog(QDialog):
 
         return row_vars, col_vars, row_codes, col_codes, label
 
+    def _kmap_group_mode(self) -> str:
+        if not hasattr(self, 'kmap_group_selector'):
+            return 'sop'
+        return self.kmap_group_selector.currentData() or 'sop'
+
+    def _on_kmap_group_mode_changed(self, _index: int):
+        self._refresh_kmap()
+
+    def _kmap_group_term(self, prime: str, mode: str) -> str:
+        notation = getattr(self, '_notation_id', 'math_prime')
+        rich = notation == 'math_bar'
+        if mode == 'pos':
+            return _format_pos_cover([prime], self.var_inputs, notation, rich=rich)
+        return _format_sop_cover([prime], self.var_inputs, notation, rich=rich)
+
+    def _kmap_group_hint_html(self, groups: list) -> str:
+        parts = []
+        for i, group in enumerate(groups):
+            label = html.escape(f"{group['mode']} grupo {i + 1}: ")
+            term = group['term']
+            if '<span' not in term:
+                term = html.escape(term)
+            parts.append(f"{label}{term}")
+        return '<br>'.join(parts)
+
+    def _build_kmap_groups(self, output: str, mode: str) -> list:
+        if not output or output not in self.var_outputs:
+            return []
+        n = len(self.var_inputs)
+        if n == 0:
+            return []
+
+        mins, dcs, _maxs = self._gather_terms(output)
+        cover = (_pos_cover(mins, dcs, n) if mode == 'pos'
+                 else _sop_cover(mins, dcs, n))
+        colors = [
+            '#f5a623', '#4ecca3', '#e94560', '#6c8cff',
+            '#ff6f91', '#2dd4bf', '#ffd166', '#a78bfa',
+        ]
+        groups = []
+        for i, prime in enumerate(cover):
+            cells = [idx for idx in range(2 ** n)
+                     if _qm_covers(prime, idx, n)]
+            groups.append({
+                'prime': prime,
+                'term': self._kmap_group_term(prime, mode),
+                'cells': cells,
+                'color': colors[i % len(colors)],
+                'mode': mode.upper(),
+            })
+        return groups
+
+    def _on_kmap_cell_entered(self, row: int, col: int):
+        item = self.kmap_table.item(row, col)
+        groups = item.data(KMAP_GROUPS_ROLE) if item else None
+        if not groups:
+            self.kmap_group_hint.setText("Esta celda no pertenece a ningun grupo visible.")
+            return
+        self.kmap_group_hint.setText(self._kmap_group_hint_html(groups))
+
+    def _export_kmap_png(self):
+        if not hasattr(self, 'kmap_table') or self.kmap_table.rowCount() == 0:
+            QMessageBox.warning(self, "Exportar K-map",
+                                "No hay un K-map listo para exportar.")
+            return
+        output = self.kmap_output_selector.currentText() or 'kmap'
+        safe_output = re.sub(r'[^A-Za-z0-9_-]+', '_', output).strip('_') or 'kmap'
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar K-map a PNG", f"{safe_output}_kmap.png",
+            "Imagen PNG (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith('.png'):
+            path += '.png'
+        widget = self.kmap_table
+        ok = widget.grab().save(path, 'PNG')
+        if ok:
+            QMessageBox.information(self, "K-map exportado",
+                                    f"Imagen guardada en:\n{path}")
+        else:
+            QMessageBox.warning(self, "Error",
+                                f"No se pudo guardar la imagen:\n{path}")
+
     def _refresh_kmap(self):
         if not hasattr(self, 'kmap_table'):
             return
         self._sync_kmap_outputs()
         n = len(self.var_inputs)
         output = self.kmap_output_selector.currentText() if self.var_outputs else ''
+        mode = self._kmap_group_mode()
 
         self.kmap_table.blockSignals(True)
         self.kmap_table.clear()
+        self._kmap_groups = []
         if n == 0 or not output:
             self.kmap_table.setRowCount(0)
             self.kmap_table.setColumnCount(0)
             self.kmap_summary.setText("Define al menos una entrada y una salida.")
+            self.kmap_group_hint.setText("Pasa el cursor sobre una celda agrupada.")
             self.kmap_table.blockSignals(False)
             return
         if n > 4:
             self.kmap_table.setRowCount(0)
             self.kmap_table.setColumnCount(0)
             self.kmap_summary.setText("La vista inicial de K-map soporta de 1 a 4 variables.")
+            self.kmap_group_hint.setText("Las agrupaciones visibles estan disponibles hasta 4 variables.")
             self.kmap_table.blockSignals(False)
             return
 
         row_vars, col_vars, row_codes, col_codes, label = self._kmap_axis_labels()
+        self._kmap_groups = self._build_kmap_groups(output, mode)
         self.kmap_table.setRowCount(len(row_codes))
         self.kmap_table.setColumnCount(len(col_codes))
         self.kmap_table.setVerticalHeaderLabels([label(row_vars, c) for c in row_codes])
@@ -5030,12 +5259,18 @@ class CircuitAnalyzerDialog(QDialog):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setData(Qt.ItemDataRole.UserRole, idx)
+                cell_groups = [g for g in self._kmap_groups if idx in g['cells']]
+                item.setData(KMAP_GROUPS_ROLE, cell_groups)
+                if cell_groups:
+                    item.setToolTip(self._kmap_group_hint_html(cell_groups))
                 self.kmap_table.setItem(r, c, item)
 
         self.kmap_table.resizeColumnsToContents()
         self.kmap_summary.setText(
             f"K-map de {output}: filas {', '.join(row_vars) or '1'}; "
-            f"columnas {', '.join(col_vars) or '1'}. Edita celdas con 0, 1 o X.")
+            f"columnas {', '.join(col_vars) or '1'}. "
+            f"Mostrando agrupaciones {mode.upper()} ({len(self._kmap_groups)} grupos).")
+        self.kmap_group_hint.setText("Pasa el cursor sobre una celda agrupada.")
         self.kmap_table.blockSignals(False)
 
     def _on_kmap_cell_changed(self, item):
@@ -5055,9 +5290,14 @@ class CircuitAnalyzerDialog(QDialog):
         item.setText(normalized)
         self.kmap_table.blockSignals(False)
         self._last_simplification.clear()
+        self._refresh_kmap()
 
     def _simplify_from_kmap(self, mode: str):
         output = self.kmap_output_selector.currentText()
+        if hasattr(self, 'kmap_group_selector'):
+            idx = self.kmap_group_selector.findData(mode)
+            if idx >= 0:
+                self.kmap_group_selector.setCurrentIndex(idx)
         self._rebuild_truth_table()
         if output in self.var_outputs and hasattr(self, 'output_selector'):
             self.output_selector.setCurrentText(output)
