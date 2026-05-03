@@ -1975,18 +1975,22 @@ class CircuitScene(QGraphicsScene):
         # todos los net labels (IN u OUT) que comparten sheet_label
         # se unen en el mismo grupo del Union-Find, igual que si hubiera
         # un cable físico entre ellos. Funciona en la misma hoja Y entre hojas.
-        label_first_pin: Dict[str, str] = {}  # label → pin_key del primer label visto
+        label_first_pin: Dict[str, str] = {}  # label/alias → pin_key del primer label visto
         for comp in self.components:
             if comp.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') and comp.sheet_label:
                 pin_key = f"{comp.name}__p1"
                 if pin_key not in pins:
                     continue
-                lbl = comp.sheet_label
-                if lbl not in label_first_pin:
-                    label_first_pin[lbl] = pin_key
-                else:
-                    # Unir este pin con el primer pin que tiene el mismo label
-                    union(label_first_pin[lbl], pin_key)
+                aliases = []
+                for lbl in (comp.sheet_label.strip(), comp.name.strip()):
+                    if lbl and lbl not in aliases:
+                        aliases.append(lbl)
+                for lbl in aliases:
+                    if lbl not in label_first_pin:
+                        label_first_pin[lbl] = pin_key
+                    else:
+                        # Unir este pin con el primer pin que tiene el mismo label
+                        union(label_first_pin[lbl], pin_key)
 
         # ── 3b. Detectar grupos GND ──────────────────────────────────────
         # Registrar AMBOS pines del componente GND como tierra
@@ -2002,11 +2006,27 @@ class CircuitScene(QGraphicsScene):
         for pid in pin_ids:
             groups.setdefault(find(pid), []).append(pid)
 
-        net_counter = 0
+        root_labels: Dict[str, List[str]] = {}
+        for comp in self.components:
+            if comp.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') and comp.sheet_label:
+                pin_key = f"{comp.name}__p1"
+                if pin_key in pins:
+                    lbl = comp.sheet_label.strip()
+                    if lbl:
+                        root = find(pin_key)
+                        root_labels.setdefault(root, [])
+                        if lbl not in root_labels[root]:
+                            root_labels[root].append(lbl)
+
         root_to_name: Dict[str, str] = {}
         for root in groups:
             if root in gnd_roots:
                 root_to_name[root] = '0'
+            elif root in root_labels:
+                # En grupos con net labels, la etiqueta visible es el nombre
+                # electrico real. Asi una salida manual "Y" conecta con una
+                # netlabel "Y" y tambien con el alias interno "OUT_Y".
+                root_to_name[root] = sorted(root_labels[root], key=lambda s: (len(s), s))[0]
             else:
                 # Usar el primer pin del grupo como nombre canónico del net.
                 # Esto hace que el nombre sea estable y único por componente,
@@ -2771,7 +2791,8 @@ class MainWindow(QMainWindow):
             prefix = f"_s{i}_"
             prefixed_pn = {}
             for pin_id, net_name in pn.items():
-                new_net = net_name if net_name == '0' else prefix + net_name
+                new_net = (net_name if net_name == '0' or not net_name.startswith('net_')
+                           else prefix + net_name)
                 prefixed_pn[pin_id] = new_net
             sheet_netlists.append(prefixed_pn)
             all_components.extend(sc.components)
@@ -2790,15 +2811,20 @@ class MainWindow(QMainWindow):
                     if pin_key not in pn:
                         continue
                     net = pn[pin_key]   # net ya prefijado con _sN_
-                    lbl = comp.sheet_label
-                    if lbl not in label_canonical:
-                        label_canonical[lbl] = net
-                    elif label_canonical[lbl] != net:
-                        # Reemplazar en toda la netlist
-                        target = label_canonical[lbl]
-                        for k in merged_pin_node:
-                            if merged_pin_node[k] == net:
-                                merged_pin_node[k] = target
+                    aliases = []
+                    for lbl in (comp.sheet_label.strip(), comp.name.strip()):
+                        if lbl and lbl not in aliases:
+                            aliases.append(lbl)
+                    for lbl in aliases:
+                        if lbl not in label_canonical:
+                            label_canonical[lbl] = net
+                        elif label_canonical[lbl] != net:
+                            # Reemplazar en toda la netlist
+                            target = label_canonical[lbl]
+                            for k in merged_pin_node:
+                                if merged_pin_node[k] == net:
+                                    merged_pin_node[k] = target
+                            net = target
 
         return all_components, merged_pin_node
 
@@ -5003,6 +5029,172 @@ class CircuitAnalyzerDialog(QDialog):
         else:
             self.eqs_text.setPlainText('\n'.join(lines))
 
+    def _safe_generated_name(self, text: str) -> str:
+        safe = re.sub(r'[^A-Za-z0-9_]+', '_', text.strip())
+        safe = safe.strip('_')
+        return safe or 'X'
+
+    def _ensure_auto_build_results(self) -> dict:
+        if self._last_simplification:
+            return self._last_simplification
+        results = {}
+        for output in self.var_outputs:
+            mins, dcs, maxs = self._gather_terms(output)
+            results[output] = {
+                'sop_cover': _sop_cover(mins, dcs, len(self.var_inputs)),
+                'pos_cover': _pos_cover(mins, dcs, len(self.var_inputs)),
+                'minterms': mins,
+                'maxterms': maxs,
+                'dont_cares': dcs,
+            }
+        self._last_simplification = results
+        return results
+
+    def _place_generated_gate(self, scene, gate_type: str, name: str,
+                              x: float, y: float, input_nets: list,
+                              output_net: str):
+        node2 = input_nets[0] if input_nets else '0'
+        node3 = input_nets[1] if len(input_nets) > 1 else ''
+        item = scene.place_component(
+            gate_type, QPointF(x, y), name=name, value=0.0,
+            node1=output_net, node2=node2, node3=node3)
+        item.dig_inputs = 1 if gate_type == 'NOT' else max(1, len(input_nets))
+        item.dig_input_nodes = list(input_nets[2:])
+        item.update()
+        return item
+
+    def _combine_generated_inputs(self, scene, gate_type: str, prefix: str,
+                                  input_nets: list, output_net: str,
+                                  x: float, y: float, two_input_only: bool) -> str:
+        if not input_nets:
+            return ''
+        safe_prefix = self._safe_generated_name(prefix)
+        if len(input_nets) == 1:
+            self._place_generated_gate(
+                scene, gate_type, f"{safe_prefix}_{gate_type}",
+                x, y, input_nets, output_net)
+            return output_net
+        if (not two_input_only) or len(input_nets) <= 2:
+            self._place_generated_gate(
+                scene, gate_type, f"{safe_prefix}_{gate_type}",
+                x, y, input_nets, output_net)
+            return output_net
+
+        current = input_nets[0]
+        for i, next_net in enumerate(input_nets[1:], start=1):
+            is_last = i == len(input_nets) - 1
+            stage_out = output_net if is_last else f"{safe_prefix}_stage_{i}"
+            self._place_generated_gate(
+                scene, gate_type, f"{safe_prefix}_{gate_type}{i}",
+                x + (i - 1) * 110, y, [current, next_net], stage_out)
+            current = stage_out
+        return current
+
+    def _auto_build_sop_circuit(self, opts: dict) -> bool:
+        if opts.get('nand_only'):
+            QMessageBox.warning(
+                self, "Solo NAND",
+                "La generacion solo con NAND todavia no esta conectada. "
+                "Desmarca esa opcion para armar el circuito SOP con AND/OR/NOT.")
+            return False
+
+        owner = self.parent()
+        if owner is None or not hasattr(owner, '_add_sheet'):
+            QMessageBox.warning(self, "Armado automatico",
+                                "No se encontro la ventana principal para crear la hoja.")
+            return False
+
+        results = self._ensure_auto_build_results()
+        if not self.var_inputs or not self.var_outputs:
+            QMessageBox.warning(self, "Faltan variables",
+                                "Define al menos una entrada y una salida.")
+            return False
+
+        owner._add_sheet(opts['sheet_name'])
+        scene = owner.scene
+        two_input_only = bool(opts.get('two_input_only'))
+
+        input_x = -520
+        not_x = -330
+        term_x = -90
+        out_x = 390 if two_input_only else 270
+        label_x = 700 if two_input_only else 520
+        y_step = 80
+
+        used_negated = {
+            var for info in results.values()
+            for prime in info.get('sop_cover', [])
+            for bit, var in zip(prime, self.var_inputs)
+            if bit == '0'
+        }
+        neg_nets = {}
+
+        for i, var in enumerate(self.var_inputs):
+            safe_var = self._safe_generated_name(var)
+            y = i * y_step
+            src = scene.place_component(
+                'LOGIC_STATE', QPointF(input_x, y),
+                name=f"IN_{safe_var}", value=0.0, node1=var)
+            src.update()
+            if var in used_negated:
+                neg_net = f"NOT_{safe_var}"
+                neg_nets[var] = neg_net
+                self._place_generated_gate(
+                    scene, 'NOT', f"NOT_{safe_var}", not_x, y,
+                    [var], neg_net)
+
+        first_output_y = max(len(self.var_inputs) * y_step + 80, 120)
+        for out_index, (output, info) in enumerate(results.items()):
+            safe_out = self._safe_generated_name(output)
+            cover = info.get('sop_cover', [])
+            block_y = first_output_y + out_index * max(180, (len(cover) + 1) * y_step)
+            term_nets = []
+
+            if not cover:
+                const = scene.place_component(
+                    'LOGIC_STATE', QPointF(out_x, block_y),
+                    name=f"CONST0_{safe_out}", value=0.0, node1=output)
+                const.update()
+            elif cover == ['-' * len(self.var_inputs)]:
+                const = scene.place_component(
+                    'LOGIC_STATE', QPointF(out_x, block_y),
+                    name=f"CONST1_{safe_out}", value=1.0, node1=output)
+                const.update()
+            else:
+                for term_index, prime in enumerate(cover):
+                    lits = []
+                    for bit, var in zip(prime, self.var_inputs):
+                        if bit == '1':
+                            lits.append(var)
+                        elif bit == '0':
+                            lits.append(neg_nets.get(var, f"NOT_{self._safe_generated_name(var)}"))
+                    term_y = block_y + term_index * y_step
+                    if len(lits) == 1:
+                        term_nets.append(lits[0])
+                    else:
+                        term_net = f"{safe_out}_T{term_index + 1}"
+                        self._combine_generated_inputs(
+                            scene, 'AND', f"{safe_out}_T{term_index + 1}",
+                            lits, term_net, term_x, term_y, two_input_only)
+                        term_nets.append(term_net)
+
+                final_y = block_y + max(0, (len(term_nets) - 1) * y_step / 2)
+                self._combine_generated_inputs(
+                    scene, 'OR', f"{safe_out}_OUT",
+                    term_nets, output, out_x, final_y, two_input_only)
+
+            out_label = scene.place_component(
+                'NET_LABEL_OUT', QPointF(label_x, block_y),
+                name=f"OUT_{safe_out}", value=0.0, node1=output)
+            out_label.sheet_label = output
+            out_label.update()
+
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-120, -120, 160, 120))
+        if hasattr(owner, 'statusBar'):
+            owner.statusBar().showMessage(
+                f"Circuito generado en la hoja '{opts['sheet_name']}'")
+        return True
+
     def _build_circuit_stub(self):
         dlg = AutoBuildCircuitDialog(parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -5013,15 +5205,10 @@ class CircuitAnalyzerDialog(QDialog):
                                 "Indica un nombre para la hoja del circuito.")
             return
         self._last_auto_build_options = opts
-        QMessageBox.information(
-            self, "Armado automatico",
-            "Configuracion guardada para el generador:\n\n"
-            f"Hoja: {opts['sheet_name']}\n"
-            f"Solo compuertas de 2 entradas: {'Si' if opts['two_input_only'] else 'No'}\n"
-            f"Solo NAND: {'Si' if opts['nand_only'] else 'No'}\n\n"
-            "El siguiente paso sera conectar estas opciones con la generacion "
-            "fisica de compuertas en el canvas.")
-        return
+        if self._auto_build_sop_circuit(opts):
+            QMessageBox.information(
+                self, "Armado automatico",
+                f"Circuito generado en la hoja '{opts['sheet_name']}'.")
 
     # ── Pestaña 4: Mapa de Karnaugh (placeholder) ─────────────────────────
     def _build_kmap_tab(self) -> QWidget:
