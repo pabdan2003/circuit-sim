@@ -1628,18 +1628,45 @@ class ComponentItem(QGraphicsItem):
             x = round(value.x() / GRID_SIZE) * GRID_SIZE
             y = round(value.y() / GRID_SIZE) * GRID_SIZE
             return QPointF(x, y)
+        elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            # NUEVO: Notificar a la escena para actualizar cables
+            if self.scene() and hasattr(self.scene(), 'update_wires_for_component'):
+                self.scene().update_wires_for_component(self)
         return super().itemChange(change, value)
-
 
 # ══════════════════════════════════════════════════════════════
 # ÍTEM DE CABLE (WIRE)
 # ══════════════════════════════════════════════════════════════
 class WireItem(QGraphicsLineItem):
-    def __init__(self, p1: QPointF, p2: QPointF):
+    def __init__(self, p1: QPointF, p2: QPointF,
+                 start_comp=None, start_pin_idx=0,
+                 end_comp=None, end_pin_idx=0):
         super().__init__(QLineF(p1, p2))
         self.setPen(QPen(QColor(COLORS['wire']), 2, Qt.PenStyle.SolidLine,
                          Qt.PenCapStyle.RoundCap))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        # NUEVO: Referencias a componentes conectados
+        self.start_comp = start_comp
+        self.start_pin_idx = start_pin_idx
+        self.end_comp = end_comp
+        self.end_pin_idx = end_pin_idx
+    
+    def update_from_pins(self):
+        """Actualiza la línea según posición actual de los pines"""
+        p1 = self.line().p1()
+        p2 = self.line().p2()
+        
+        if self.start_comp and self.start_comp.scene():
+            pins = self.start_comp.all_pin_positions_scene()
+            if 0 <= self.start_pin_idx < len(pins):
+                p1 = pins[self.start_pin_idx]
+        
+        if self.end_comp and self.end_comp.scene():
+            pins = self.end_comp.all_pin_positions_scene()
+            if 0 <= self.end_pin_idx < len(pins):
+                p2 = pins[self.end_pin_idx]
+        
+        self.setLine(QLineF(p1, p2))
 
     def paint(self, painter, option, widget):
         if self.isSelected():
@@ -1648,8 +1675,7 @@ class WireItem(QGraphicsLineItem):
             self.setPen(QPen(QColor(COLORS['wire']), 2, Qt.PenStyle.SolidLine,
                              Qt.PenCapStyle.RoundCap))
         super().paint(painter, option, widget)
-
-
+        
 # ══════════════════════════════════════════════════════════════
 # ESCENA DEL CIRCUITO
 # ══════════════════════════════════════════════════════════════
@@ -1671,6 +1697,11 @@ class CircuitScene(QGraphicsScene):
         self._mode = 'select'   # 'select' | 'wire' | 'place_{tipo}'
 
         self._comp_counter: Dict[str, int] = {}
+
+        # Estado para arrastre grupal (mover circuito + cables como una unidad)
+        self._group_drag_active: bool = False
+        self._group_drag_start_pos: Optional[QPointF] = None
+        self._group_drag_wires: List[dict] = []
 
     # ── Grid (dibujado en drawBackground para que sea independiente del zoom) ──
     def drawBackground(self, painter: QPainter, rect: QRectF):
@@ -1724,6 +1755,44 @@ class CircuitScene(QGraphicsScene):
                 self.removeItem(self._wire_preview)
                 self._wire_preview = None
             self._wire_start = None
+
+    def _snap_to_pin_or_grid(self, pos: QPointF, threshold: float = 16.0) -> QPointF:
+        """
+        Si el cursor está a menos de `threshold` px de cualquier pin,
+        retorna la posición exacta del pin. Si no, snapea a grilla.
+        """
+        best_dist = threshold
+        best_pt   = None
+        for comp in self.components:
+            for pt in comp.all_pin_positions_scene():
+                dx = pos.x() - pt.x()
+                dy  = pos.y() - pt.y()
+                d  = (dx*dx + dy*dy) ** 0.5
+                if d  < best_dist:
+                    best_dist = d
+                    best_pt   = pt
+        if best_pt is not None:
+            return best_pt
+        return QPointF(round(pos.x()/GRID_SIZE)*GRID_SIZE,
+                        round(pos.y()/GRID_SIZE)*GRID_SIZE)
+
+    def _find_component_at_pin(self, pos: QPointF, threshold: float = 16.0):
+        """Encuentra el componente y índice de pin más cercano a pos"""
+        best_dist = threshold
+        best_comp = None
+        best_pin_idx = 0
+        
+        for comp in self.components:
+            for idx, pt in enumerate(comp.all_pin_positions_scene()):
+                dx = pos.x() - pt.x()
+                dy = pos.y() - pt.y()
+                d = (dx*dx + dy*dy) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best_comp = comp
+                    best_pin_idx = idx
+        
+        return best_comp, best_pin_idx if best_comp else (None, 0)
 
     # ── Colocar componente ───────────────────────
     def place_component(self, comp_type: str, pos: QPointF,
@@ -1785,25 +1854,28 @@ class CircuitScene(QGraphicsScene):
 
     # ── Eventos de mouse ────────────────────────
 
-    def _snap_to_pin_or_grid(self, pos: QPointF, threshold: float = 16.0) -> QPointF:
-        """
-        Si el cursor está a menos de `threshold` px de cualquier pin,
-        retorna la posición exacta del pin. Si no, snapea a grilla.
-        """
+    def _snap_to_pin_or_grid_with_comp(self, pos: QPointF, threshold: float = 16.0):
+        """Igual que _snap_to_pin_or_grid, pero devuelve también (comp, pin_idx)."""
         best_dist = threshold
-        best_pt   = None
+        best_pt = None
+        best_comp = None
+        best_pin_idx = 0
+        
         for comp in self.components:
-            for pt in comp.all_pin_positions_scene():
+            for idx, pt in enumerate(comp.all_pin_positions_scene()):
                 dx = pos.x() - pt.x()
                 dy = pos.y() - pt.y()
-                d  = (dx*dx + dy*dy) ** 0.5
+                d = (dx*dx + dy*dy) ** 0.5
                 if d < best_dist:
                     best_dist = d
-                    best_pt   = pt
+                    best_pt = pt
+                    best_comp = comp
+                    best_pin_idx = idx
+                    
         if best_pt is not None:
-            return best_pt
+            return best_pt, best_comp, best_pin_idx
         return QPointF(round(pos.x()/GRID_SIZE)*GRID_SIZE,
-                       round(pos.y()/GRID_SIZE)*GRID_SIZE)
+                       round(pos.y()/GRID_SIZE)*GRID_SIZE), None, 0
 
     def mousePressEvent(self, event):
         pos = event.scenePos()
@@ -1815,25 +1887,91 @@ class CircuitScene(QGraphicsScene):
             return
 
         if self._mode == 'wire':
-            snap = self._snap_to_pin_or_grid(pos)
+            snap, comp, pin_idx = self._snap_to_pin_or_grid_with_comp(pos)
+            
             if self._wire_start is None:
+                # Buscar componente/pin en posición inicial
+                start_comp, start_pin = self._find_component_at_pin(snap)
                 self._wire_start = snap
+                self._wire_start_comp = start_comp
+                self._wire_start_pin = start_pin or 0
                 self._wire_preview = WireItem(snap, snap)
                 self.addItem(self._wire_preview)
             else:
                 # Finalizar cable
-                wire = WireItem(self._wire_start, snap)
+                end_comp, end_pin = self._find_component_at_pin(snap)
+                wire = WireItem(
+                    self._wire_start, snap,
+                    start_comp=self._wire_start_comp,
+                    start_pin_idx=self._wire_start_pin,
+                    end_comp=end_comp,
+                    end_pin_idx=end_pin or 0
+                )
                 self.addItem(wire)
                 self.wires.append(wire)
+                # Preparar para siguiente cable
+                self._wire_start = snap
+                self._wire_start_comp = end_comp
+                self._wire_start_pin = end_pin or 0
                 if self._wire_preview:
                     self.removeItem(self._wire_preview)
                 self._wire_preview = WireItem(snap, snap)
                 self.addItem(self._wire_preview)
                 self._wire_start = snap
+                self._wire_start_comp = comp
+                self._wire_start_pin = pin_idx
                 self.status_message.emit("Cable colocado")
             return
 
         super().mousePressEvent(event)
+
+        # Preparar arrastre grupal: si el usuario hace click sobre un ítem
+        # ya seleccionado en modo 'select', registramos los cables que deben
+        # trasladarse manualmente junto con los componentes seleccionados.
+        self._group_drag_active = False
+        self._group_drag_start_pos = None
+        self._group_drag_wires = []
+        if (self._mode == 'select'
+                and event.button() == Qt.MouseButton.LeftButton):
+            selected_items = self.selectedItems()
+            clicked_items  = self.items(pos)
+            clicked_selected = next(
+                (it for it in clicked_items if it in selected_items), None)
+            if clicked_selected is not None:
+                selected_comps = {
+                    it for it in selected_items if isinstance(it, ComponentItem)}
+                wires_to_track = {
+                    it for it in selected_items if isinstance(it, WireItem)}
+                for w in self.wires:
+                    if w.start_comp in selected_comps or w.end_comp in selected_comps:
+                        wires_to_track.add(w)
+
+                tracked = []
+                for w in wires_to_track:
+                    line = w.line()
+                    p1_free = (w.start_comp is None)
+                    p2_free = (w.end_comp is None)
+                    p1_in_sel = (w.start_comp in selected_comps)
+                    p2_in_sel = (w.end_comp in selected_comps)
+                    wire_selected = w.isSelected()
+                    # Trasladamos a mano cualquier extremo libre cuyo cable
+                    # forme parte del grupo (ya sea por estar seleccionado
+                    # o por tener su otro extremo unido a un comp del grupo).
+                    translate_p1 = p1_free and (wire_selected or p2_in_sel)
+                    translate_p2 = p2_free and (wire_selected or p1_in_sel)
+                    if translate_p1 or translate_p2:
+                        tracked.append({
+                            'wire': w,
+                            'p1': QPointF(line.p1()),
+                            'p2': QPointF(line.p2()),
+                            'translate_p1': translate_p1,
+                            'translate_p2': translate_p2,
+                        })
+
+                if tracked or selected_comps:
+                    self._group_drag_active = True
+                    self._group_drag_start_pos = QPointF(pos)
+                    self._group_drag_wires = tracked
 
         # Emitir componente seleccionado
         items = self.selectedItems()
@@ -1848,6 +1986,32 @@ class CircuitScene(QGraphicsScene):
             snap = self._snap_to_pin_or_grid(pos)
             self._wire_preview.setLine(QLineF(self._wire_start, snap))
         super().mouseMoveEvent(event)
+
+        # Trasladar extremos libres de cables durante un arrastre grupal,
+        # snapeando el delta a la grilla para mantener alineación con pines.
+        if self._group_drag_active and self._group_drag_wires \
+                and self._group_drag_start_pos is not None:
+            delta = event.scenePos() - self._group_drag_start_pos
+            dx = round(delta.x() / GRID_SIZE) * GRID_SIZE
+            dy = round(delta.y() / GRID_SIZE) * GRID_SIZE
+            for info in self._group_drag_wires:
+                wire = info['wire']
+                p1 = info['p1']
+                p2 = info['p2']
+                new_p1 = QPointF(p1.x() + dx, p1.y() + dy) if info['translate_p1'] else QPointF(p1)
+                new_p2 = QPointF(p2.x() + dx, p2.y() + dy) if info['translate_p2'] else QPointF(p2)
+                wire.setLine(QLineF(new_p1, new_p2))
+                # Si algún extremo está unido a un componente, dejar que el
+                # pin actual gobierne esa coordenada.
+                if not info['translate_p1'] or not info['translate_p2']:
+                    wire.update_from_pins()
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self._group_drag_active:
+            self._group_drag_active = False
+            self._group_drag_start_pos = None
+            self._group_drag_wires = []
 
     def mouseDoubleClickEvent(self, event):
         items = self.items(event.scenePos())
@@ -1891,6 +2055,12 @@ class CircuitScene(QGraphicsScene):
             self._wire_start = None
             self.set_mode('select')
         super().keyPressEvent(event)
+
+    def update_wires_for_component(self, comp: 'ComponentItem'):
+        """Actualiza todos los cables conectados al componente dado."""
+        for wire in self.wires:
+            if wire.start_comp is comp or wire.end_comp is comp:
+                wire.update_from_pins()
 
     # ── Extraccion de netlist por Union-Find ─────
     def extract_netlist(self) -> Dict[str, str]:
@@ -2085,6 +2255,17 @@ class CircuitScene(QGraphicsScene):
                 if 'dig_input_nodes' in data: item.dig_input_nodes  = data['dig_input_nodes']
             item.update()
 
+    def update_wires_for_component(self, comp: 'ComponentItem'):
+        """Actualiza todos los cables conectados al componente dado."""
+        for wire in self.wires:
+            if wire.start_comp is comp:
+                pins = comp.all_pin_positions_scene()
+                if 0 <= wire.start_pin_idx < len(pins):
+                    wire.setLine(QLineF(pins[wire.start_pin_idx], wire.line().p2()))
+            if wire.end_comp is comp:
+                pins = comp.all_pin_positions_scene()
+                if 0 <= wire.end_pin_idx < len(pins):
+                    wire.setLine(QLineF(wire.line().p1(), pins[wire.end_pin_idx]))
 
 # ══════════════════════════════════════════════════════════════
 # Helper: convertir un ComponentItem analógico a objetos del engine
@@ -2300,8 +2481,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Frecuencia CLK = {f:g} Hz")
 
     def _open_circuit_analyzer(self):
-        """Abre el analizador de circuitos digitales (multi-pestaña)."""
-        dlg = CircuitAnalyzerDialog(parent=self)
+        """Abre el analizador de circuitos digitales preservando el estado previo."""
+        state = getattr(self, '_analyzer_state', None)
+        dlg = CircuitAnalyzerDialog(parent=self, initial_state=state)
         dlg.exec()
 
     def _build_tools_button(self):
@@ -4613,7 +4795,7 @@ class CircuitAnalyzerDialog(QDialog):
                               obtener SOP/POS.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_state: dict = None):
         super().__init__(parent)
         self.setWindowTitle("Analizar Circuito Digital")
         self.resize(820, 580)
@@ -4621,16 +4803,78 @@ class CircuitAnalyzerDialog(QDialog):
         # Estado del modelo
         self.var_inputs:  list = ['A', 'B']
         self.var_outputs: list = ['Y']
-        # truth_data[(out_name, row_index)] = '0' | '1' | 'X'
         self.truth_data: dict = {}
-        self._last_simplification: dict = {}   # {output_name: {'sop':..., 'pos':...}}
+        self._last_simplification: dict = {}
         self._last_highlight: str = 'sop'
         self._all_outputs_label = "Todas las salidas"
         self._notation_id = 'math_prime'
         self._kmap_groups = []
-
+        
         self._build_ui()
+        
+        # Restaurar estado si existe
+        if initial_state:
+            self._restore_state(initial_state)
 
+    def _restore_state(self, state: dict):
+        """Restaura variables, tabla, ecuaciones y configuración guardadas."""
+        if not state:
+            return
+
+        # Bloquear señales para evitar reconstrucciones en cascada
+        self.inputs_list.blockSignals(True)
+        self.outputs_list.blockSignals(True)
+        self.notation_selector.blockSignals(True)
+        self.truth_table.blockSignals(True)
+
+        # Recuperar datos
+        self.var_inputs = list(state.get('var_inputs', ['A', 'B']))
+        self.var_outputs = list(state.get('var_outputs', ['Y']))
+        self.truth_data = dict(state.get('truth_data', {}))
+        self._last_simplification = dict(state.get('_last_simplification', {}))
+        self._last_highlight = state.get('_last_highlight', 'sop')
+        self._notation_id = state.get('_notation_id', 'math_prime')
+
+        # Actualizar listas de I/O
+        self.inputs_list.clear()
+        self.inputs_list.addItems(self.var_inputs)
+        self.outputs_list.clear()
+        self.outputs_list.addItems(self.var_outputs)
+
+        # Restaurar notación
+        idx = self.notation_selector.findData(self._notation_id)
+        self.notation_selector.setCurrentIndex(idx if idx >= 0 else 1)
+
+        # Desbloquear
+        self.inputs_list.blockSignals(False)
+        self.outputs_list.blockSignals(False)
+        self.notation_selector.blockSignals(False)
+        self.truth_table.blockSignals(False)
+
+        # Reconstruir UI según datos recuperados
+        if self.var_inputs and self.var_outputs:
+            self._rebuild_truth_table()
+
+        if self._last_simplification:
+            self._populate_eqs_tab(highlight=self._last_highlight)
+            self.tabs.setCurrentIndex(2)  # Saltar a Ecuaciones si hay análisis previo
+
+        if self.tabs.currentIndex() == 3:
+            self._refresh_kmap()
+
+    def closeEvent(self, event):
+        """Guarda automáticamente el estado en MainWindow antes de cerrar."""
+        if self.parent():
+            self.parent()._analyzer_state = {
+                'var_inputs': self.var_inputs,
+                'var_outputs': self.var_outputs,
+                'truth_data': self.truth_data,
+                '_last_simplification': self._last_simplification,
+                '_last_highlight': self._last_highlight,
+                '_notation_id': self._notation_id,
+            }
+        event.accept()
+        
     # ── UI principal ──────────────────────────────────────────────────────
     def _build_ui(self):
         layout = QVBoxLayout(self)
