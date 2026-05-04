@@ -1747,6 +1747,39 @@ class CircuitScene(QGraphicsScene):
         painter.setPen(pen_major)
         painter.drawLines(lines_major)
 
+    # ── Punto de unión (junction dot) ───────────
+    def drawForeground(self, painter: QPainter, rect: QRectF):
+        super().drawForeground(painter, rect)
+
+        # Cuenta extremos LIBRES de cables (sin componente conectado) por
+        # posición snapeada. Cuando concurren más de 3 en un mismo punto
+        # se dibuja un dot tipo pin para indicar la unión cable-cable.
+        SNAP = 5
+        counts: Dict[Tuple[int, int], int] = {}
+        positions: Dict[Tuple[int, int], QPointF] = {}
+        for w in self.wires:
+            line = w.line()
+            if w.start_comp is None:
+                p = line.p1()
+                key = (round(p.x() / SNAP) * SNAP, round(p.y() / SNAP) * SNAP)
+                counts[key] = counts.get(key, 0) + 1
+                positions.setdefault(key, p)
+            if w.end_comp is None:
+                p = line.p2()
+                key = (round(p.x() / SNAP) * SNAP, round(p.y() / SNAP) * SNAP)
+                counts[key] = counts.get(key, 0) + 1
+                positions.setdefault(key, p)
+
+        if not counts:
+            return
+
+        color = QColor(COLORS['pin'])
+        painter.setPen(QPen(color, 2))
+        painter.setBrush(QBrush(color))
+        for key, n in counts.items():
+            if n > 3:
+                painter.drawEllipse(positions[key], PIN_RADIUS, PIN_RADIUS)
+
     # ── Modo ────────────────────────────────────
     def set_mode(self, mode: str):
         self._mode = mode
@@ -1940,34 +1973,82 @@ class CircuitScene(QGraphicsScene):
             if clicked_selected is not None:
                 selected_comps = {
                     it for it in selected_items if isinstance(it, ComponentItem)}
-                wires_to_track = {
+                wires_in_sel = {
                     it for it in selected_items if isinstance(it, WireItem)}
+                wires_to_track = set(wires_in_sel)
                 for w in self.wires:
                     if w.start_comp in selected_comps or w.end_comp in selected_comps:
                         wires_to_track.add(w)
 
-                tracked = []
+                # Mapa de uniones libres entre cables: posición (snap) →
+                # lista de (cable, extremo). Solo extremos sin componente
+                # asociado pueden formar junction "cable-cable".
+                SNAP = 5
+                def _jkey(p: QPointF):
+                    return (round(p.x() / SNAP) * SNAP,
+                            round(p.y() / SNAP) * SNAP)
+                junction_map: Dict[Tuple[int, int], List[Tuple[WireItem, str]]] = {}
+                for w in self.wires:
+                    if w.start_comp is None:
+                        junction_map.setdefault(_jkey(w.line().p1()), []) \
+                            .append((w, 'p1'))
+                    if w.end_comp is None:
+                        junction_map.setdefault(_jkey(w.line().p2()), []) \
+                            .append((w, 'p2'))
+
+                tracked_by_wire: Dict[WireItem, dict] = {}
                 for w in wires_to_track:
                     line = w.line()
                     p1_free = (w.start_comp is None)
                     p2_free = (w.end_comp is None)
                     p1_in_sel = (w.start_comp in selected_comps)
                     p2_in_sel = (w.end_comp in selected_comps)
-                    wire_selected = w.isSelected()
+                    wire_selected = w in wires_in_sel
                     # Trasladamos a mano cualquier extremo libre cuyo cable
                     # forme parte del grupo (ya sea por estar seleccionado
                     # o por tener su otro extremo unido a un comp del grupo).
                     translate_p1 = p1_free and (wire_selected or p2_in_sel)
                     translate_p2 = p2_free and (wire_selected or p1_in_sel)
                     if translate_p1 or translate_p2:
-                        tracked.append({
-                            'wire': w,
+                        tracked_by_wire[w] = {
                             'p1': QPointF(line.p1()),
                             'p2': QPointF(line.p2()),
                             'translate_p1': translate_p1,
                             'translate_p2': translate_p2,
-                        })
+                        }
 
+                # Propagación por uniones: si un extremo libre se traslada,
+                # todos los demás extremos libres en esa misma posición
+                # deben moverse con él para que la unión no se rompa.
+                changed = True
+                while changed:
+                    changed = False
+                    moving_keys = set()
+                    for w, info in tracked_by_wire.items():
+                        if info['translate_p1']:
+                            moving_keys.add(_jkey(info['p1']))
+                        if info['translate_p2']:
+                            moving_keys.add(_jkey(info['p2']))
+                    for key in moving_keys:
+                        for (w, end) in junction_map.get(key, []):
+                            if w not in tracked_by_wire:
+                                line = w.line()
+                                tracked_by_wire[w] = {
+                                    'p1': QPointF(line.p1()),
+                                    'p2': QPointF(line.p2()),
+                                    'translate_p1': False,
+                                    'translate_p2': False,
+                                }
+                            info = tracked_by_wire[w]
+                            if end == 'p1' and not info['translate_p1']:
+                                info['translate_p1'] = True
+                                changed = True
+                            if end == 'p2' and not info['translate_p2']:
+                                info['translate_p2'] = True
+                                changed = True
+
+                tracked = [{'wire': w, **info}
+                           for w, info in tracked_by_wire.items()]
                 if tracked or selected_comps:
                     self._group_drag_active = True
                     self._group_drag_start_pos = QPointF(pos)
