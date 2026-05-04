@@ -112,9 +112,9 @@ class CurrentSource(Component):
         nn  = node_map.get(self.n_neg)
 
         if np_ is not None:
-            I[np_] += self.I_val
+            I[np_] -= self.I_val  # Sale del nodo positivo (KCL: corrientes salientes = 0)
         if nn is not None:
-            I[nn] -= self.I_val
+            I[nn] += self.I_val   # Entra al nodo negativo
 
 
 # ──────────────────────────────────────────────

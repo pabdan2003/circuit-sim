@@ -133,8 +133,17 @@ class ComponentDialog(QDialog):
             self._extra_node_edits = []
             lbl1, lbl2, lbl3 = COMPONENT_NODE_LABELS.get(
                 self.item.comp_type, DEFAULT_NODE_LABELS)
-            layout.addRow(lbl1 + ':', self.node1_edit)
-            layout.addRow(lbl2 + ':', self.node2_edit)
+    
+            # Para fuentes, invertir el orden visual porque:
+            # node1 = pin izquierdo = negativo (−)
+            # node2 = pin derecho = positivo (+)
+            if self.item.comp_type in ('V', 'VAC', 'I'):
+                layout.addRow("Nodo +" + ':', self.node2_edit)  # Nodo +
+                layout.addRow("Nodo -" + ':', self.node1_edit)  # Nodo −
+            else:
+                layout.addRow(lbl1 + ':', self.node1_edit)
+                layout.addRow(lbl2 + ':', self.node2_edit)
+    
             if lbl3 is not None:
                 self.node3_edit = QLineEdit(self.item.node3)
                 layout.addRow(lbl3 + ':', self.node3_edit)

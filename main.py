@@ -731,7 +731,7 @@ class ComponentItem(QGraphicsItem):
         # Símbolo + / − / ~  o flecha
         painter.setPen(QPen(QColor(COLORS['component']), 2))
         if self.comp_type == 'V':
-            painter.drawText(QRectF(-r+4, -r+4, r-4, r*2-8), Qt.AlignmentFlag.AlignCenter, '+')
+            painter.drawText(QRectF(4, -r+4, r-4, r*2-8), Qt.AlignmentFlag.AlignCenter, '+')
         elif self.comp_type == 'VAC':
             # Onda sinusoidal dentro del círculo
             path = QPainterPath()
@@ -2126,9 +2126,9 @@ def build_engine_components_for_item(item, pin_node):
                                   R_total=max(item.value, 1.0),
                                   wiper=item.pot_wiper)]
         if ct == 'V':
-            return [VoltageSource(item.name, n1, n2, item.value)]
+            return [VoltageSource(item.name, n2, n1, item.value)]
         if ct == 'VAC':
-            return [VoltageSourceAC(item.name, n1, n2,
+            return [VoltageSourceAC(item.name, n2, n1,
                                     amplitude=item.value, frequency=item.frequency,
                                     phase_deg=item.phase_deg, mode=item.ac_mode)]
         if ct == 'I':
@@ -3852,9 +3852,17 @@ class MainWindow(QMainWindow):
             rows.append((lbls[3], _node_display(
                 item.node4 if hasattr(item, 'node4') else '', f"{item.name}__p4")))
         else:
-            lbl1, lbl2, lbl3 = COMPONENT_NODE_LABELS.get(item.comp_type, DEFAULT_NODE_LABELS)
-            rows.append((lbl1, _node_display(item.node1, f"{item.name}__p1")))
-            rows.append((lbl2, _node_display(item.node2, f"{item.name}__p2")))
+            lbl1, lbl2, lbl3 = COMPONENT_NODE_LABELS.get(
+                item.comp_type, DEFAULT_NODE_LABELS)
+    
+            # Para fuentes, invertir el orden de visualización
+            # porque node1=pin izquierdo=negativo, node2=pin derecho=positivo
+            if item.comp_type in ('V', 'VAC', 'I'):
+                rows.append(("Nodo +", _node_display(item.node2, f"{item.name}__p2")))  # Nodo +
+                rows.append(("Nodo -", _node_display(item.node1, f"{item.name}__p1")))  # Nodo −
+            else:
+                rows.append((lbl1, _node_display(item.node1, f"{item.name}__p1")))
+                rows.append((lbl2, _node_display(item.node2, f"{item.name}__p2")))
             if lbl3 is not None:
                 rows.append((lbl3, _node_display(
                     item.node3 if hasattr(item,'node3') else '', f"{item.name}__p3")))
@@ -3875,7 +3883,7 @@ class MainWindow(QMainWindow):
     def _load_demo_circuit(self):
         """Carga un divisor de voltaje de ejemplo."""
         s = self.scene
-        s.place_component('V',   QPointF(-120,   0), 'V1', 10.0, 'V',  'A', '0')
+        s.place_component('V',   QPointF(-120,   0), 'V1', 10.0, 'V',  '0', 'A')
         s.place_component('R',   QPointF(   0, -80), 'R1', 1000.0, 'Ω', 'A', 'B')
         s.place_component('R',   QPointF(   0,  80), 'R2', 1000.0, 'Ω', 'B', '0')
         s.place_component('GND', QPointF(-120,  80), 'GND1')
