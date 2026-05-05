@@ -174,6 +174,11 @@ class ComponentItem(QGraphicsItem):
         self.dig_analog_node: str = ''
         # Nodos de entradas extra (entrada 3, 4, ... N) para puertas multi-entrada
         self.dig_input_nodes: list = []   # ['net_A', 'net_B', ...]
+        # Máscara de negación por entrada (alineada con la lista total de
+        # entradas: [entrada1, entrada2, ...]). Si una posición es True el
+        # valor de esa entrada se invierte antes de evaluar la compuerta y
+        # se dibuja un bubble (círculo) sobre el pin de entrada.
+        self.dig_input_neg: list = []
 
         # ── Atributos analógicos extendidos ─────────────────────────────────
         # Potenciómetro: posición del cursor (0.0 a 1.0). El valor base se
@@ -205,9 +210,11 @@ class ComponentItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
 
-    def rotate_90(self):
-        """Rota el componente 90° en sentido horario."""
-        self._angle = (self._angle + 90) % 360
+    def rotate_90(self, delta: int = 90):
+        """Rota el componente `delta` grados (positivo = horario,
+        negativo = antihorario). El valor por defecto mantiene la API
+        original para llamadas existentes."""
+        self._angle = (self._angle + delta) % 360
         self.setRotation(self._angle)
         self.update()
 
@@ -1226,6 +1233,13 @@ class ComponentItem(QGraphicsItem):
         painter.setPen(pen_wire)
         pin_ys = self._gate_pin_ys()
 
+        # Diámetro del bubble en entradas negadas; igual al de salida.
+        bubble_d_in = bubble_d
+        neg_mask = list(getattr(self, 'dig_input_neg', []) or [])
+
+        def _is_neg(i: int) -> bool:
+            return i < len(neg_mask) and bool(neg_mask[i])
+
         # Para AND/NAND/NOT el lateral es vertical → cable termina en x=-hw.
         # Para OR/NOR/XOR el back es cóncavo (curva Bezier cuadrática), por
         # lo que x varía según y. Cada cable debe terminar EXACTAMENTE sobre
@@ -1239,15 +1253,30 @@ class ComponentItem(QGraphicsItem):
             # Para XOR los cables conectan a la curva EXTERIOR (más a la izq).
             outer_offset = 5 if ct == 'XOR' else 0
             back_bulge_eff = body_w * 0.25     # mismo back_bulge que el path
-            for y in pin_ys:
+            input_back_xs = []
+            for i, y in enumerate(pin_ys):
                 t      = (y + hh) / (2 * hh) if hh > 0 else 0.5
                 back_x = -hw - outer_offset + 2 * t * (1 - t) * back_bulge_eff
-                painter.drawLine(QPointF(-hw - 10, y), QPointF(back_x, y))
+                input_back_xs.append(back_x)
+                end_x = back_x - bubble_d_in if _is_neg(i) else back_x
+                painter.drawLine(QPointF(-hw - 10, y), QPointF(end_x, y))
         else:
-            for y in pin_ys:
-                painter.drawLine(QPointF(-hw - 10, y), QPointF(-hw, y))
+            input_back_xs = [-hw] * len(pin_ys)
+            for i, y in enumerate(pin_ys):
+                end_x = -hw - bubble_d_in if _is_neg(i) else -hw
+                painter.drawLine(QPointF(-hw - 10, y), QPointF(end_x, y))
 
         painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+
+        # ── Bubbles de inversión en entradas negadas ──────────────────────
+        if any(_is_neg(i) for i in range(len(pin_ys))):
+            painter.setPen(pen_body)
+            painter.setBrush(QBrush(body_color))
+            for i, y in enumerate(pin_ys):
+                if _is_neg(i):
+                    cx = input_back_xs[i] - bubble_d_in / 2
+                    painter.drawEllipse(QPointF(cx, y),
+                                        bubble_d_in / 2, bubble_d_in / 2)
 
         # ── Pines (puntos de conexión) ────────────────────────────────────
         pin_color = QColor(COLORS['pin'])
@@ -1684,6 +1713,10 @@ class CircuitScene(QGraphicsScene):
     status_message       = pyqtSignal(str)
     logic_state_toggled  = pyqtSignal(object)   # emitido cuando LOGIC_STATE cambia
 
+    # Portapapeles compartido entre escenas (todas las hojas) — guarda un
+    # snapshot de la selección.
+    _clipboard: Optional[dict] = None
+
     def __init__(self):
         super().__init__()
         self.setSceneRect(-1000, -1000, 2000, 2000)
@@ -1702,6 +1735,10 @@ class CircuitScene(QGraphicsScene):
         self._group_drag_active: bool = False
         self._group_drag_start_pos: Optional[QPointF] = None
         self._group_drag_wires: List[dict] = []
+
+        # Stack de Ctrl+Z (undo). Cada entrada es un snapshot serializado.
+        self._undo_stack: List[dict] = []
+        self._undo_max: int = 50
 
     # ── Grid (dibujado en drawBackground para que sea independiente del zoom) ──
     def drawBackground(self, painter: QPainter, rect: QRectF):
@@ -1915,6 +1952,7 @@ class CircuitScene(QGraphicsScene):
 
         if self._mode.startswith('place_'):
             comp_type = self._mode.split('_', 1)[1]
+            self.push_undo()
             self.place_component(comp_type, pos)
             self.status_message.emit(f"Componente {comp_type} colocado en ({pos.x():.0f}, {pos.y():.0f})")
             return
@@ -1933,6 +1971,7 @@ class CircuitScene(QGraphicsScene):
             else:
                 # Finalizar cable
                 end_comp, end_pin = self._find_component_at_pin(snap)
+                self.push_undo()
                 wire = WireItem(
                     self._wire_start, snap,
                     start_comp=self._wire_start_comp,
@@ -2050,6 +2089,8 @@ class CircuitScene(QGraphicsScene):
                 tracked = [{'wire': w, **info}
                            for w, info in tracked_by_wire.items()]
                 if tracked or selected_comps:
+                    # Snapshot previo al drag → Ctrl+Z revierte posiciones.
+                    self.push_undo()
                     self._group_drag_active = True
                     self._group_drag_start_pos = QPointF(pos)
                     self._group_drag_wires = tracked
@@ -2100,6 +2141,7 @@ class CircuitScene(QGraphicsScene):
             if isinstance(item, ComponentItem):
                 if item.comp_type == 'LOGIC_STATE':
                     # Toggle 0↔1 con doble-click
+                    self.push_undo()
                     item.value = 0.0 if item.value else 1.0
                     item.update()
                     self.logic_state_toggled.emit(item)
@@ -2107,6 +2149,7 @@ class CircuitScene(QGraphicsScene):
                 if item.comp_type == 'CLK':
                     # Doble-click conmuta manualmente y detiene la oscilación
                     # automática (entra en modo manual como un LOGIC_STATE).
+                    self.push_undo()
                     item.clk_running = False
                     item.value = 0.0 if item.value else 1.0
                     item.update()
@@ -2117,19 +2160,47 @@ class CircuitScene(QGraphicsScene):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
-            for item in self.selectedItems():
-                if isinstance(item, ComponentItem) and item in self.components:
-                    self.components.remove(item)
-                elif isinstance(item, WireItem) and item in self.wires:
-                    self.wires.remove(item)
-                self.removeItem(item)
-        elif event.key() == Qt.Key.Key_R:
-            for item in self.selectedItems():
-                if isinstance(item, ComponentItem):
-                    item.rotate_90()
-            self.status_message.emit("Componente rotado 90 grados (R para seguir rotando)")
-        elif event.key() == Qt.Key.Key_Escape:
+        mod = event.modifiers()
+        has_ctrl = bool(mod & Qt.KeyboardModifier.ControlModifier)
+        key = event.key()
+
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            sel = list(self.selectedItems())
+            if sel:
+                self.push_undo()
+                for item in sel:
+                    if isinstance(item, ComponentItem) and item in self.components:
+                        self.components.remove(item)
+                    elif isinstance(item, WireItem) and item in self.wires:
+                        self.wires.remove(item)
+                    self.removeItem(item)
+                self.status_message.emit("Selección eliminada")
+        elif has_ctrl and key == Qt.Key.Key_Z:
+            if self.undo():
+                self.status_message.emit("Acción deshecha (Ctrl+Z)")
+            else:
+                self.status_message.emit("Nada que deshacer")
+        elif has_ctrl and key == Qt.Key.Key_C:
+            if self.copy_selected():
+                self.status_message.emit("Selección copiada (Ctrl+C)")
+        elif has_ctrl and key == Qt.Key.Key_X:
+            if self.cut_selected():
+                self.status_message.emit("Selección cortada (Ctrl+X)")
+        elif has_ctrl and key == Qt.Key.Key_V:
+            if self.paste():
+                self.status_message.emit("Pegado (Ctrl+V)")
+            else:
+                self.status_message.emit("Portapapeles vacío")
+        elif has_ctrl and key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            # Ctrl++ → rotar 90° a la derecha (horario).
+            # Aceptamos también Ctrl+= para teclados donde + requiere Shift.
+            if self.rotate_selected(delta=90):
+                self.status_message.emit("Rotado 90° a la derecha (Ctrl++)")
+        elif has_ctrl and key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+            # Ctrl+- → rotar 90° a la izquierda (antihorario).
+            if self.rotate_selected(delta=-90):
+                self.status_message.emit("Rotado 90° a la izquierda (Ctrl+-)")
+        elif key == Qt.Key.Key_Escape:
             if self._wire_preview:
                 self.removeItem(self._wire_preview)
                 self._wire_preview = None
@@ -2142,6 +2213,200 @@ class CircuitScene(QGraphicsScene):
         for wire in self.wires:
             if wire.start_comp is comp or wire.end_comp is comp:
                 wire.update_from_pins()
+
+    # ── Serialización para undo / clipboard ─────────────────────────────
+
+    # Atributos opcionales que persistimos por componente. Para mantener el
+    # snapshot pequeño, sólo se guardan si el componente los tiene.
+    _SNAP_ATTRS = (
+        'sheet_label', 'pot_wiper', 'led_color',
+        'frequency', 'phase_deg', 'ac_mode',
+        'z_real', 'z_imag', 'z_mag', 'z_phase', 'z_mode',
+        'xfmr_ratio', 'xfmr_imax', 'bridge_vf',
+        'node4', 'clk_running',
+        'dig_inputs', 'dig_tpd_ns', 'dig_clk', 'dig_analog_node',
+        'dig_bits', 'dig_bits_adc', 'dig_vref',
+    )
+
+    def _serialize_component(self, c: 'ComponentItem') -> dict:
+        e = {
+            'type':  c.comp_type, 'name': c.name, 'value': c.value,
+            'unit':  c.unit, 'node1': c.node1, 'node2': c.node2,
+            'node3': c.node3,
+            'x':     c.pos().x(), 'y': c.pos().y(),
+            'angle': c._angle,
+        }
+        for attr in self._SNAP_ATTRS:
+            if hasattr(c, attr):
+                e[attr] = getattr(c, attr)
+        if hasattr(c, 'dig_input_nodes'):
+            e['dig_input_nodes'] = list(c.dig_input_nodes or [])
+        if hasattr(c, 'dig_input_neg'):
+            e['dig_input_neg'] = list(c.dig_input_neg or [])
+        return e
+
+    def _serialize_wire(self, w: WireItem,
+                        comp_filter: Optional[set] = None) -> dict:
+        line = w.line()
+        sn = w.start_comp.name if (
+            w.start_comp and (comp_filter is None
+                              or w.start_comp.name in comp_filter)) else None
+        en = w.end_comp.name if (
+            w.end_comp and (comp_filter is None
+                            or w.end_comp.name in comp_filter)) else None
+        return {
+            'x1': line.x1(), 'y1': line.y1(),
+            'x2': line.x2(), 'y2': line.y2(),
+            'start': sn, 'spi': w.start_pin_idx,
+            'end':   en, 'epi': w.end_pin_idx,
+        }
+
+    def _snapshot(self) -> dict:
+        """Estado serializado completo de la hoja, listo para undo."""
+        return {
+            'components': [self._serialize_component(c) for c in self.components],
+            'wires':      [self._serialize_wire(w) for w in self.wires],
+            'counter':    dict(self._comp_counter),
+        }
+
+    def _instantiate_component(self, c: dict,
+                               offset_x: float = 0.0, offset_y: float = 0.0,
+                               keep_name: bool = True) -> 'ComponentItem':
+        item = self.place_component(
+            c['type'],
+            QPointF(c['x'] + offset_x, c['y'] + offset_y),
+            name=(c['name'] if keep_name else ''),
+            value=c.get('value', 0.0),
+            unit=c.get('unit', ''),
+            node1=c.get('node1', ''),
+            node2=c.get('node2', ''),
+            node3=c.get('node3', ''))
+        angle = c.get('angle', 0)
+        if angle:
+            item._angle = angle
+            item.setRotation(angle)
+        for attr in self._SNAP_ATTRS:
+            if attr in c:
+                setattr(item, attr, c[attr])
+        if 'dig_input_nodes' in c:
+            item.dig_input_nodes = list(c['dig_input_nodes'])
+        if 'dig_input_neg' in c:
+            item.dig_input_neg = list(c['dig_input_neg'])
+        item.update()
+        return item
+
+    def _clear_all(self):
+        """Vacía la escena (componentes + cables) preparando un restore."""
+        for it in list(self.components):
+            if it.scene() is self:
+                self.removeItem(it)
+        self.components.clear()
+        for w in list(self.wires):
+            if w.scene() is self:
+                self.removeItem(w)
+        self.wires.clear()
+        self._comp_counter.clear()
+
+    def _restore(self, snap: dict):
+        """Reemplaza el contenido actual con el del snapshot."""
+        self._clear_all()
+        name_to_comp: Dict[str, ComponentItem] = {}
+        for c in snap.get('components', []):
+            item = self._instantiate_component(c, keep_name=True)
+            name_to_comp[c['name']] = item
+        for w in snap.get('wires', []):
+            sc = name_to_comp.get(w['start']) if w.get('start') else None
+            ec = name_to_comp.get(w['end'])   if w.get('end')   else None
+            wire = WireItem(
+                QPointF(w['x1'], w['y1']), QPointF(w['x2'], w['y2']),
+                start_comp=sc, start_pin_idx=w.get('spi', 0),
+                end_comp=ec,   end_pin_idx=w.get('epi', 0))
+            self.addItem(wire)
+            self.wires.append(wire)
+        # Restaurar contador de nombres para no chocar con autogenerados
+        self._comp_counter = dict(snap.get('counter', {}))
+        self.update()
+
+    # ── Undo (Ctrl+Z) ───────────────────────────────────────────────────
+    def push_undo(self):
+        """Captura el estado actual y lo apila para Ctrl+Z. Llamar ANTES
+        de cualquier mutación del canvas."""
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > self._undo_max:
+            self._undo_stack.pop(0)
+
+    def undo(self) -> bool:
+        if not self._undo_stack:
+            return False
+        snap = self._undo_stack.pop()
+        self._restore(snap)
+        # Cualquier estado de drag en curso queda invalidado tras un restore.
+        self._group_drag_active = False
+        self._group_drag_wires = []
+        self.component_selected.emit(None)
+        return True
+
+    # ── Copy / Cut / Paste (Ctrl+C / Ctrl+X / Ctrl+V) ───────────────────
+    def copy_selected(self) -> bool:
+        sel = self.selectedItems()
+        sel_comps = [it for it in sel if isinstance(it, ComponentItem)]
+        sel_wires = [it for it in sel if isinstance(it, WireItem)]
+        if not sel_comps and not sel_wires:
+            return False
+        sel_names = {c.name for c in sel_comps}
+        comps = [self._serialize_component(c) for c in sel_comps]
+        wires = [self._serialize_wire(w, comp_filter=sel_names)
+                 for w in sel_wires]
+        CircuitScene._clipboard = {'components': comps, 'wires': wires}
+        return True
+
+    def cut_selected(self) -> bool:
+        if not self.copy_selected():
+            return False
+        self.push_undo()
+        for it in list(self.selectedItems()):
+            if isinstance(it, ComponentItem) and it in self.components:
+                self.components.remove(it)
+            elif isinstance(it, WireItem) and it in self.wires:
+                self.wires.remove(it)
+            self.removeItem(it)
+        return True
+
+    def paste(self, offset_x: float = GRID_SIZE * 2,
+              offset_y: float = GRID_SIZE * 2) -> bool:
+        cb = CircuitScene._clipboard
+        if not cb or (not cb.get('components') and not cb.get('wires')):
+            return False
+        self.push_undo()
+        self.clearSelection()
+        name_map: Dict[str, ComponentItem] = {}
+        for c in cb['components']:
+            item = self._instantiate_component(
+                c, offset_x=offset_x, offset_y=offset_y, keep_name=False)
+            name_map[c['name']] = item
+            item.setSelected(True)
+        for w in cb['wires']:
+            sc = name_map.get(w['start']) if w.get('start') else None
+            ec = name_map.get(w['end'])   if w.get('end')   else None
+            wire = WireItem(
+                QPointF(w['x1'] + offset_x, w['y1'] + offset_y),
+                QPointF(w['x2'] + offset_x, w['y2'] + offset_y),
+                start_comp=sc, start_pin_idx=w.get('spi', 0),
+                end_comp=ec,   end_pin_idx=w.get('epi', 0))
+            self.addItem(wire)
+            self.wires.append(wire)
+            wire.setSelected(True)
+        return True
+
+    def rotate_selected(self, delta: int = 90) -> bool:
+        items = [it for it in self.selectedItems()
+                 if isinstance(it, ComponentItem)]
+        if not items:
+            return False
+        self.push_undo()
+        for it in items:
+            it.rotate_90(delta=delta)
+        return True
 
     # ── Extraccion de netlist por Union-Find ─────
     def extract_netlist(self) -> Dict[str, str]:
@@ -2292,6 +2557,8 @@ class CircuitScene(QGraphicsScene):
     def _edit_component(self, item: ComponentItem):
         dialog = ComponentDialog(item, COLORS)
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Snapshot pre-edición para que Ctrl+Z revierta los cambios.
+            self.push_undo()
             data = dialog.get_data()
             item.name      = data['name']
             item.value     = data['value']
@@ -2334,6 +2601,14 @@ class CircuitScene(QGraphicsScene):
                 if 'dig_clk'     in data: item.dig_clk          = data['dig_clk']
                 if 'dig_analog_node' in data: item.dig_analog_node = data['dig_analog_node']
                 if 'dig_input_nodes' in data: item.dig_input_nodes  = data['dig_input_nodes']
+                if 'dig_input_neg'   in data: item.dig_input_neg   = data['dig_input_neg']
+                # Normalizar la máscara de negación al nº actual de entradas
+                if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                    n_in_now = 1 if item.comp_type == 'NOT' else max(1, item.dig_inputs)
+                    neg = list(getattr(item, 'dig_input_neg', []) or [])
+                    if len(neg) < n_in_now:
+                        neg.extend([False] * (n_in_now - len(neg)))
+                    item.dig_input_neg = neg[:n_in_now]
             item.update()
 
     def update_wires_for_component(self, comp: 'ComponentItem'):
@@ -3302,7 +3577,9 @@ class MainWindow(QMainWindow):
                         n_in = max(1, item.dig_inputs)
                         dsim.add(Gate(item.name, _gmap[ct],
                                       [f"{item.name}_I{i}" for i in range(n_in)],
-                                      f"{item.name}_Y", t_pd=tpd))
+                                      f"{item.name}_Y", t_pd=tpd,
+                                      input_invert=list(
+                                          getattr(item, 'dig_input_neg', []) or [])))
                     elif ct == "DFF":
                         dsim.add(DFF(item.name, d=f"{item.name}_D", clk=item.dig_clk,
                                      q=f"{item.name}_Q", qn=f"{item.name}_Qn", t_pd=tpd))
@@ -3606,6 +3883,7 @@ class MainWindow(QMainWindow):
         for item in gate_items:
             n_in = max(1, item.dig_inputs)
             input_logics = []
+            neg_mask = list(getattr(item, 'dig_input_neg', []) or [])
             for i in range(n_in):
                 if i == 0:
                     node = (item.node2.strip()
@@ -3623,7 +3901,12 @@ class MainWindow(QMainWindow):
                     v = 0.0
                 else:
                     v = dc_voltages.get(node, 0.0)
-                input_logics.append(1 if v >= std.Vih else 0)
+                bit = 1 if v >= std.Vih else 0
+                # Si la entrada está marcada como negada (bubble), se invierte
+                # antes de evaluar la función de la compuerta.
+                if i < len(neg_mask) and neg_mask[i]:
+                    bit = 1 - bit
+                input_logics.append(bit)
             y = int(_funcs[item.comp_type](input_logics))
             out_node = item.node1.strip() or pin_node.get(f'{item.name}__p1', '')
             v_out = std.Voh if y else std.Vol
@@ -3710,6 +3993,24 @@ class MainWindow(QMainWindow):
             n_qn = pin_node.get(f'{item.name}__p6', '')
             if n_qn and n_qn not in ('0', 'gnd', 'GND'):
                 dc_voltages[n_qn] = std.Voh if (1 - q_new) else std.Vol
+
+            # Refrescar LEDs cuyo ánodo cae sobre Q o Q̄ del flip-flop. Sin
+            # esto, el LED quedaría apagado aunque la salida del FF esté en
+            # alto, porque la actualización de led_on se hacía sólo en el
+            # bucle de compuertas.
+            for led in _all:
+                if led.comp_type != 'LED':
+                    continue
+                led_anode = (led.node1.strip()
+                             or pin_node.get(f'{led.name}__p1', ''))
+                if not led_anode:
+                    continue
+                if led_anode == n_q:
+                    led.led_on = bool(q_new)
+                    led.update()
+                elif led_anode == n_qn:
+                    led.led_on = bool(1 - q_new)
+                    led.update()
 
             # Repintar el componente para reflejar el círculo de memoria
             item.update()
@@ -3900,7 +4201,9 @@ class MainWindow(QMainWindow):
                     n_in = max(1, item.dig_inputs)
                     ins  = [f'{item.name}_I{i}' for i in range(n_in)]
                     dsim.add(Gate(item.name, _gate_map[ct], ins,
-                                  f'{item.name}_Y', t_pd=tpd))
+                                  f'{item.name}_Y', t_pd=tpd,
+                                  input_invert=list(
+                                      getattr(item, 'dig_input_neg', []) or [])))
                 elif ct == 'DFF':
                     dsim.add(DFF(item.name,
                                  d=f'{item.name}_D', clk=item.dig_clk,
@@ -4237,6 +4540,10 @@ class MainWindow(QMainWindow):
                 entry['sheet_label'] = item.sheet_label
             if item.comp_type == 'CLK':
                 entry['clk_running'] = item.clk_running
+            if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                neg = list(getattr(item, 'dig_input_neg', []) or [])
+                if any(neg):
+                    entry['dig_input_neg'] = neg
             sheet_data['components'].append(entry)
 
         for wire in scene.wires:
@@ -4286,6 +4593,8 @@ class MainWindow(QMainWindow):
                 item.sheet_label = c.get('sheet_label', item.name)
             if c['type'] == 'CLK':
                 item.clk_running = bool(c.get('clk_running', False))
+            if c['type'] in ComponentItem.DIGITAL_TYPES and 'dig_input_neg' in c:
+                item.dig_input_neg = list(c['dig_input_neg'])
 
         for w in sheet_data.get('wires', []):
             wire = WireItem(QPointF(w['x1'], w['y1']), QPointF(w['x2'], w['y2']))
@@ -4943,17 +5252,31 @@ class CircuitAnalyzerDialog(QDialog):
         if self.tabs.currentIndex() == 3:
             self._refresh_kmap()
 
-    def closeEvent(self, event):
-        """Guarda automáticamente el estado en MainWindow antes de cerrar."""
+    def _persist_state_to_parent(self):
+        """Vuelca el estado actual del analizador en MainWindow para que la
+        próxima apertura lo restaure. Se llama desde todos los caminos de
+        cierre (Cerrar, Esc, X de la ventana, accept) para no depender solo
+        de closeEvent (que no se dispara en reject)."""
         if self.parent():
             self.parent()._analyzer_state = {
-                'var_inputs': self.var_inputs,
-                'var_outputs': self.var_outputs,
-                'truth_data': self.truth_data,
-                '_last_simplification': self._last_simplification,
+                'var_inputs': list(self.var_inputs),
+                'var_outputs': list(self.var_outputs),
+                'truth_data': dict(self.truth_data),
+                '_last_simplification': dict(self._last_simplification),
                 '_last_highlight': self._last_highlight,
                 '_notation_id': self._notation_id,
             }
+
+    def done(self, result):
+        # done() es invocado por accept(), reject() y close(); cubre todos
+        # los caminos de cierre del diálogo.
+        self._persist_state_to_parent()
+        super().done(result)
+
+    def closeEvent(self, event):
+        # Redundante con done() pero garantiza guardado si el sistema cierra
+        # la ventana sin pasar por done() (raro, pero defensivo).
+        self._persist_state_to_parent()
         event.accept()
         
     # ── UI principal ──────────────────────────────────────────────────────
@@ -5419,17 +5742,98 @@ class CircuitAnalyzerDialog(QDialog):
             stage_out = output_net if is_last else f"{safe_prefix}_stage_{i}"
             self._place_generated_gate(
                 scene, gate_type, f"{safe_prefix}_{gate_type}{i}",
-                x + (i - 1) * 110, y, [current, next_net], stage_out)
+                x + (i - 1) * 120, y, [current, next_net], stage_out)
             current = stage_out
         return current
 
+    # ── Helper de layout para evitar solapamientos y choques de pines ───
+    def _compute_auto_layout(self, results: dict, two_input_only: bool):
+        """Calcula columnas, y_step y lanes de tronco para el armado
+        automático (SOP y NAND).
+
+        Garantiza:
+          - y_step ≥ altura de la compuerta más alta + 1 grid (sin solapes)
+          - lanes de variable y de inversor SIEMPRE caen entre la columna
+            de origen y la columna de destino, sin tocar la x del pin del
+            inversor / NOT (que rompía Union-Find creando cortocircuitos)
+        """
+        n_vars = max(2, len(self.var_inputs))
+        max_lits = max(
+            (sum(1 for b in p if b in ('0', '1'))
+             for info in results.values()
+             for p in info.get('sop_cover', [])),
+            default=2)
+        max_terms = max(
+            (len(info.get('sop_cover', []))
+             for info in results.values()),
+            default=1)
+
+        # Altura de gate por nº de entradas: (n-1)*GRID_SIZE + 40.
+        # En modo two_input_only todos los gates colocados son de 2 entradas
+        # (cascada), así que la altura máxima viene de los gates en el path
+        # principal, que es 2.
+        if two_input_only:
+            max_n = 2
+        else:
+            max_n = max(2, max_lits, max_terms)
+        gate_h = (max_n - 1) * GRID_SIZE + 40
+        y_step = max(80, gate_h + GRID_SIZE)
+
+        # Variables negadas distintas (cada una requiere su propio inversor
+        # y, por tanto, una lane en el siguiente zone).
+        used_negated_count = max(2, sum(
+            1 for var in self.var_inputs
+            if any(p[i] == '0' for info in results.values()
+                   for p in info.get('sop_cover', [])
+                   for i, _ in enumerate([var])
+                   if i < len(self.var_inputs))))
+        # Calcular número real de inversores por variable única usada
+        neg_var_set = set()
+        for info in results.values():
+            for p in info.get('sop_cover', []):
+                for bit, var in zip(p, self.var_inputs):
+                    if bit == '0':
+                        neg_var_set.add(var)
+        n_neg = max(1, len(neg_var_set))
+
+        input_x = -540
+        src_snap = round((input_x + 15) / GRID_SIZE) * GRID_SIZE  # típicamente -520
+
+        # Ancho mínimo del canal entre input y inversor: 1 lane por variable
+        # (entre source pin y INV_input_pin, ambos exclusivos).
+        # range(src+G, inv_in, G) debe contener al menos n_vars elementos
+        # → inv_in - (src+G) ≥ n_vars*G → inv_in ≥ src + (n_vars+1)*G
+        inv_x_min = src_snap + (n_vars + 2) * GRID_SIZE + 40
+        inv_x = max(-360, inv_x_min)
+        inv_x = round(inv_x / GRID_SIZE) * GRID_SIZE
+
+        inv_out_x = inv_x + 40
+        # Mismo razonamiento para canal inversor → término
+        term_x_min = inv_out_x + (n_neg + 2) * GRID_SIZE + 40
+        term_x = max(-100, term_x_min)
+        term_x = round(term_x / GRID_SIZE) * GRID_SIZE
+
+        # out_x y label_x se computan luego según modo (cascade añade más).
+        return {
+            'input_x': input_x, 'inv_x': inv_x, 'term_x': term_x,
+            'y_step': y_step, 'src_snap': src_snap,
+            'n_vars': n_vars, 'n_neg': n_neg,
+            'max_lits': max_lits, 'max_terms': max_terms,
+        }
+
+    def _make_trunk_lanes(self, src_x: float, dest_in_x: float,
+                          n_needed: int) -> List[float]:
+        """Devuelve hasta `n_needed` valores x (alineados a GRID_SIZE) en el
+        rango (src_x, dest_in_x), excluyendo los extremos para no chocar con
+        pines en esas columnas."""
+        start = int(src_x + GRID_SIZE)
+        stop  = int(dest_in_x)
+        lanes = list(range(start, stop, GRID_SIZE))
+        return lanes[:n_needed] if len(lanes) >= n_needed else lanes
+
     def _auto_build_sop_circuit(self, opts: dict) -> bool:
         if opts.get('nand_only'):
-            QMessageBox.warning(
-                self, "Solo NAND",
-                "La generacion solo con NAND todavia no esta conectada. "
-                "Desmarca esa opcion para armar el circuito SOP con AND/OR/NOT.")
-            return False
+            return self._auto_build_nand_circuit(opts)
 
         owner = self.parent()
         if owner is None or not hasattr(owner, '_add_sheet'):
@@ -5447,12 +5851,29 @@ class CircuitAnalyzerDialog(QDialog):
         scene = owner.scene
         two_input_only = bool(opts.get('two_input_only'))
 
-        input_x = -520
-        not_x = -330
-        term_x = -90
-        out_x = 390 if two_input_only else 270
-        label_x = 700 if two_input_only else 520
-        y_step = 80
+        # Layout adaptativo: y_step según altura máxima de gate; columnas
+        # con suficiente canal para n lanes de tronco sin chocar con pines.
+        L = self._compute_auto_layout(results, two_input_only)
+        input_x   = L['input_x']
+        not_x     = L['inv_x']
+        term_x    = L['term_x']
+        y_step    = L['y_step']
+        src_snap  = L['src_snap']
+        max_lits  = L['max_lits']
+        max_terms = L['max_terms']
+
+        # out_x debe quedar a la derecha del último gate de la cascada AND
+        # (en two_input_only) para que su cuerpo no pise el AND final.
+        # Cada etapa de cascada usa 120 px; la última etapa de un término
+        # con n literales está en term_x + (n-2)*120.
+        if two_input_only:
+            and_w  = max(0, max_lits  - 2) * 120 + 60
+            or_w   = max(0, max_terms - 2) * 120 + 60
+            out_x   = term_x + and_w + 200
+            label_x = out_x   + or_w  + 280
+        else:
+            out_x   = term_x + 200
+            label_x = out_x  + 280
 
         used_negated = {
             var for info in results.values()
@@ -5460,73 +5881,554 @@ class CircuitAnalyzerDialog(QDialog):
             for bit, var in zip(prime, self.var_inputs)
             if bit == '0'
         }
-        neg_nets = {}
+        # Orden estable de variables negadas para asignar lanes
+        neg_var_order = [v for v in self.var_inputs if v in used_negated]
+        neg_nets: Dict[str, str] = {}
 
+        # Lanes (x del bus tronco) por zona, evitando columnas de pines.
+        var_lanes = self._make_trunk_lanes(
+            src_snap, not_x - 40, len(self.var_inputs))
+        inv_out_x = not_x + 40
+        neg_lanes = self._make_trunk_lanes(
+            inv_out_x, term_x - 40, max(1, len(neg_var_order)))
+
+        # Mapas para el cableado posterior:
+        #   net_source[net]    = (pin_pos, comp, pin_idx)  → quien produce el net
+        #   net_consumers[net] = [(pin_pos, comp, pin_idx), ...]  → quienes lo leen
+        #   net_trunk_x[net]   = x del bus tronco (asignado para nets con varios consumidores)
+        net_source: Dict[str, Tuple[QPointF, ComponentItem, int]] = {}
+        net_consumers: Dict[str, List[Tuple[QPointF, ComponentItem, int]]] = {}
+        net_trunk_x: Dict[str, float] = {}
+
+        def _add_consumer(net: str, pin_pos: QPointF,
+                          comp: ComponentItem, pin_idx: int):
+            net_consumers.setdefault(net, []).append((pin_pos, comp, pin_idx))
+
+        # ── Inputs como NET_LABEL_IN (sheet_label = nombre de la variable) ──
         for i, var in enumerate(self.var_inputs):
             safe_var = self._safe_generated_name(var)
             y = i * y_step
-            src = scene.place_component(
-                'LOGIC_STATE', QPointF(input_x, y),
+            in_label = scene.place_component(
+                'NET_LABEL_IN', QPointF(input_x, y),
                 name=f"IN_{safe_var}", value=0.0, node1=var)
-            src.update()
+            in_label.sheet_label = var
+            in_label.update()
+            pins = in_label.all_pin_positions_scene()
+            net_source[var] = (pins[0], in_label, 0)
+            # Bus tronco asignado desde la lista de lanes válidas (excluyen
+            # columnas de pines para no provocar Union-Find espurio).
+            if i < len(var_lanes):
+                net_trunk_x[var] = var_lanes[i]
+
             if var in used_negated:
                 neg_net = f"NOT_{safe_var}"
                 neg_nets[var] = neg_net
-                self._place_generated_gate(
-                    scene, 'NOT', f"NOT_{safe_var}", not_x, y,
-                    [var], neg_net)
+                ng = self._place_generated_gate(
+                    scene, 'NOT', f"NOT_{safe_var}", not_x, y, [var], neg_net)
+                ng_pins = ng.all_pin_positions_scene()
+                net_source[neg_net] = (ng_pins[0], ng, 0)        # salida
+                _add_consumer(var, ng_pins[1], ng, 1)            # entrada
+                neg_idx = neg_var_order.index(var)
+                if neg_idx < len(neg_lanes):
+                    net_trunk_x[neg_net] = neg_lanes[neg_idx]
 
+        # ── Bloques de salida: AND de términos + OR + NET_LABEL_OUT ────────
         first_output_y = max(len(self.var_inputs) * y_step + 80, 120)
         for out_index, (output, info) in enumerate(results.items()):
             safe_out = self._safe_generated_name(output)
             cover = info.get('sop_cover', [])
             block_y = first_output_y + out_index * max(180, (len(cover) + 1) * y_step)
-            term_nets = []
+
+            # NET_LABEL_OUT: consumidor del net 'output'
+            out_label = scene.place_component(
+                'NET_LABEL_OUT', QPointF(label_x, block_y),
+                name=f"OUT_{safe_out}", value=0.0, node1=output)
+            out_label.sheet_label = output
+            out_label.update()
+            out_label_pin = out_label.all_pin_positions_scene()[0]
+            _add_consumer(output, out_label_pin, out_label, 0)
 
             if not cover:
                 const = scene.place_component(
                     'LOGIC_STATE', QPointF(out_x, block_y),
                     name=f"CONST0_{safe_out}", value=0.0, node1=output)
                 const.update()
+                net_source[output] = (const.all_pin_positions_scene()[0], const, 0)
             elif cover == ['-' * len(self.var_inputs)]:
                 const = scene.place_component(
                     'LOGIC_STATE', QPointF(out_x, block_y),
                     name=f"CONST1_{safe_out}", value=1.0, node1=output)
                 const.update()
+                net_source[output] = (const.all_pin_positions_scene()[0], const, 0)
             else:
+                term_nets: List[str] = []
                 for term_index, prime in enumerate(cover):
-                    lits = []
+                    lits: List[str] = []
                     for bit, var in zip(prime, self.var_inputs):
                         if bit == '1':
                             lits.append(var)
                         elif bit == '0':
-                            lits.append(neg_nets.get(var, f"NOT_{self._safe_generated_name(var)}"))
+                            lits.append(neg_nets.get(
+                                var, f"NOT_{self._safe_generated_name(var)}"))
                     term_y = block_y + term_index * y_step
+                    if not lits:
+                        continue
                     if len(lits) == 1:
+                        # Literal solo: pasa directo a la entrada del OR
                         term_nets.append(lits[0])
                     else:
                         term_net = f"{safe_out}_T{term_index + 1}"
-                        self._combine_generated_inputs(
+                        self._place_combiner_gates(
                             scene, 'AND', f"{safe_out}_T{term_index + 1}",
-                            lits, term_net, term_x, term_y, two_input_only)
+                            lits, term_net, term_x, term_y, two_input_only,
+                            net_source, net_consumers)
                         term_nets.append(term_net)
 
-                final_y = block_y + max(0, (len(term_nets) - 1) * y_step / 2)
-                self._combine_generated_inputs(
-                    scene, 'OR', f"{safe_out}_OUT",
-                    term_nets, output, out_x, final_y, two_input_only)
+                if term_nets:
+                    final_y = block_y + max(0, (len(term_nets) - 1) * y_step / 2)
+                    self._place_combiner_gates(
+                        scene, 'OR', f"{safe_out}_OUT",
+                        term_nets, output, out_x, final_y, two_input_only,
+                        net_source, net_consumers)
+                else:
+                    const = scene.place_component(
+                        'LOGIC_STATE', QPointF(out_x, block_y),
+                        name=f"CONST0_{safe_out}", value=0.0, node1=output)
+                    const.update()
+                    net_source[output] = (
+                        const.all_pin_positions_scene()[0], const, 0)
 
-            out_label = scene.place_component(
-                'NET_LABEL_OUT', QPointF(label_x, block_y),
-                name=f"OUT_{safe_out}", value=0.0, node1=output)
-            out_label.sheet_label = output
-            out_label.update()
+        # ── Cableado de todos los nets ─────────────────────────────────────
+        self._route_all_nets(scene, net_source, net_consumers, net_trunk_x)
 
         scene.setSceneRect(scene.itemsBoundingRect().adjusted(-120, -120, 160, 120))
         if hasattr(owner, 'statusBar'):
             owner.statusBar().showMessage(
                 f"Circuito generado en la hoja '{opts['sheet_name']}'")
         return True
+
+    def _place_combiner_gates(self, scene, gate_type: str, prefix: str,
+                              input_nets: list, output_net: str,
+                              x: float, y: float, two_input_only: bool,
+                              net_source: dict, net_consumers: dict):
+        """Coloca uno o varios gates que combinan input_nets → output_net y
+        registra en net_source / net_consumers los pines reales para que el
+        cableado posterior pueda conectarlos.
+
+        - Si two_input_only es False (o len(input_nets) ≤ 2): un único gate.
+        - Si two_input_only es True con > 2 entradas: cascada de gates de 2.
+        """
+        if not input_nets:
+            return
+        safe_prefix = self._safe_generated_name(prefix)
+
+        if (not two_input_only) or len(input_nets) <= 2:
+            gate = self._place_generated_gate(
+                scene, gate_type, f"{safe_prefix}_{gate_type}",
+                x, y, input_nets, output_net)
+            pins = gate.all_pin_positions_scene()
+            net_source[output_net] = (pins[0], gate, 0)
+            n_in = 1 if gate_type == 'NOT' else max(1, len(input_nets))
+            for i in range(n_in):
+                in_net = input_nets[i] if i < len(input_nets) else input_nets[0]
+                net_consumers.setdefault(in_net, []).append(
+                    (pins[i + 1], gate, i + 1))
+            return
+
+        # Cascada: cada etapa toma (acumulado, siguiente) y produce stage_i;
+        # la última etapa produce output_net.
+        current_net = input_nets[0]
+        for i, next_net in enumerate(input_nets[1:], start=1):
+            is_last = i == len(input_nets) - 1
+            stage_out = output_net if is_last else f"{safe_prefix}_stage_{i}"
+            gate = self._place_generated_gate(
+                scene, gate_type, f"{safe_prefix}_{gate_type}{i}",
+                x + (i - 1) * 120, y, [current_net, next_net], stage_out)
+            pins = gate.all_pin_positions_scene()
+            net_source[stage_out] = (pins[0], gate, 0)
+            net_consumers.setdefault(current_net, []).append(
+                (pins[1], gate, 1))
+            net_consumers.setdefault(next_net, []).append(
+                (pins[2], gate, 2))
+            current_net = stage_out
+
+    def _route_all_nets(self, scene,
+                        net_source: dict, net_consumers: dict,
+                        net_trunk_x: dict):
+        """Coloca cables ortogonales para conectar cada net source con sus
+        consumidores. Para nets con un único consumidor se usa una ruta L/Z
+        directa; para nets con varios consumidores se usa un bus tronco
+        vertical en x = net_trunk_x[net] (o un punto medio si no se asignó).
+        """
+        for net, source in net_source.items():
+            consumers = net_consumers.get(net, [])
+            if not consumers:
+                continue
+            trunk_x = net_trunk_x.get(net)
+            if trunk_x is None:
+                # Punto medio entre la fuente y el consumidor más cercano
+                min_dest_x = min(c[0].x() for c in consumers)
+                trunk_x = (source[0].x() + min_dest_x) / 2
+            self._route_net(scene, source, consumers, trunk_x)
+
+    def _route_net(self, scene, source, consumers, trunk_x: float):
+        """Crea WireItems en el escenario para enlazar source→consumidores.
+
+        Estrategia: tronco vertical en `trunk_x`. La fuente se conecta con un
+        cable horizontal hasta el tronco; el tronco se descompone en
+        segmentos verticales entre cada y de junction (fuente/destinos);
+        cada destino recibe un cable horizontal corto desde el tronco. Todos
+        los puntos de unión son extremos de cable, lo que garantiza que el
+        Union-Find del netlist los detecte como conectados.
+        """
+        src_pin, src_comp, src_pin_idx = source
+        trunk_x = round(trunk_x / GRID_SIZE) * GRID_SIZE
+        src_y = src_pin.y()
+        cons_ys = [c[0].y() for c in consumers]
+
+        # Atajo: un único consumidor, mismo y, x distinto → un cable directo
+        if (len(consumers) == 1
+                and abs(consumers[0][0].y() - src_y) < 0.5
+                and abs(consumers[0][0].x() - src_pin.x()) > 0.5):
+            dp, dc, dpi = consumers[0]
+            wire = WireItem(
+                QPointF(src_pin), QPointF(dp),
+                start_comp=src_comp, start_pin_idx=src_pin_idx,
+                end_comp=dc, end_pin_idx=dpi)
+            scene.addItem(wire)
+            scene.wires.append(wire)
+            return
+
+        junction_ys = sorted(set([src_y] + cons_ys))
+
+        # 1) Stub de la fuente al tronco
+        if abs(src_pin.x() - trunk_x) > 0.5:
+            wire = WireItem(
+                QPointF(src_pin), QPointF(trunk_x, src_y),
+                start_comp=src_comp, start_pin_idx=src_pin_idx)
+            scene.addItem(wire)
+            scene.wires.append(wire)
+
+        # 2) Tronco vertical: segmentos consecutivos entre y's de junction
+        for y_a, y_b in zip(junction_ys, junction_ys[1:]):
+            if abs(y_a - y_b) > 0.5:
+                wire = WireItem(QPointF(trunk_x, y_a),
+                                QPointF(trunk_x, y_b))
+                scene.addItem(wire)
+                scene.wires.append(wire)
+
+        # 3) Stubs del tronco a cada consumidor
+        for (dp, dc, dpi) in consumers:
+            if abs(dp.x() - trunk_x) > 0.5:
+                wire = WireItem(
+                    QPointF(trunk_x, dp.y()), QPointF(dp),
+                    end_comp=dc, end_pin_idx=dpi)
+                scene.addItem(wire)
+                scene.wires.append(wire)
+
+    # ── Armado SOP usando ÚNICAMENTE compuertas NAND ───────────────────
+    def _auto_build_nand_circuit(self, opts: dict) -> bool:
+        """Genera el mismo SOP pero con NAND como única compuerta.
+
+        Identidades usadas:
+          - NOT(x)  = NAND(x, x)
+          - AND(...) → para cada término: T_i' = NAND(literales),
+                       y luego Y = NAND(T1', T2', ..., Tn')
+                       (De Morgan:  Σ T_i = NAND(T_i') )
+          - Literal negado X' se obtiene con NAND(X, X)
+
+        En modo two_input_only se cascadea sólo con NAND de 2 entradas:
+          término  : NAND, [INV (NAND-NAND), NAND]+   →  T_i'
+          salida   : NAND, [INV (NAND-NAND), NAND]+   →  Y
+        """
+        owner = self.parent()
+        if owner is None or not hasattr(owner, '_add_sheet'):
+            QMessageBox.warning(self, "Armado automatico",
+                                "No se encontro la ventana principal para crear la hoja.")
+            return False
+
+        results = self._ensure_auto_build_results()
+        if not self.var_inputs or not self.var_outputs:
+            QMessageBox.warning(self, "Faltan variables",
+                                "Define al menos una entrada y una salida.")
+            return False
+
+        owner._add_sheet(opts['sheet_name'])
+        scene = owner.scene
+        two_input_only = bool(opts.get('two_input_only'))
+
+        # Layout adaptativo (mismo helper que la versión SOP).
+        L = self._compute_auto_layout(results, two_input_only)
+        input_x  = L['input_x']
+        inv_x    = L['inv_x']
+        term_x   = L['term_x']
+        y_step   = L['y_step']
+        src_snap = L['src_snap']
+        max_lits = L['max_lits']
+        max_terms = L['max_terms']
+
+        # Reserva horizontal para cascadas de NAND (2-input only ensancha mucho).
+        term_stages = max(1, 2 * max_lits - 3) if two_input_only else 1
+        out_stages  = max(1, 2 * max_terms - 3) if two_input_only else 1
+        stage_step  = 120
+        out_x   = term_x + (term_stages * stage_step) + 80
+        label_x = out_x   + (out_stages  * stage_step) + 80
+
+        used_negated = {
+            var for info in results.values()
+            for prime in info.get('sop_cover', [])
+            for bit, var in zip(prime, self.var_inputs)
+            if bit == '0'
+        }
+        neg_var_order = [v for v in self.var_inputs if v in used_negated]
+        inv_nets: Dict[str, str] = {}
+
+        net_source: Dict[str, Tuple[QPointF, ComponentItem, int]] = {}
+        net_consumers: Dict[str, List[Tuple[QPointF, ComponentItem, int]]] = {}
+        net_trunk_x: Dict[str, float] = {}
+
+        def _add_consumer(net: str, pin_pos: QPointF,
+                          comp: ComponentItem, pin_idx: int):
+            net_consumers.setdefault(net, []).append((pin_pos, comp, pin_idx))
+
+        # Lanes de tronco por zona (excluyen columnas de pines)
+        var_lanes = self._make_trunk_lanes(
+            src_snap, inv_x - 40, len(self.var_inputs))
+        inv_out_x = inv_x + 40
+        neg_lanes = self._make_trunk_lanes(
+            inv_out_x, term_x - 40, max(1, len(neg_var_order)))
+
+        # ── Inputs como NET_LABEL_IN ──────────────────────────────────
+        for i, var in enumerate(self.var_inputs):
+            safe_var = self._safe_generated_name(var)
+            y = i * y_step
+            in_label = scene.place_component(
+                'NET_LABEL_IN', QPointF(input_x, y),
+                name=f"IN_{safe_var}", value=0.0, node1=var)
+            in_label.sheet_label = var
+            in_label.update()
+            pins = in_label.all_pin_positions_scene()
+            net_source[var] = (pins[0], in_label, 0)
+            if i < len(var_lanes):
+                net_trunk_x[var] = var_lanes[i]
+
+            if var in used_negated:
+                inv_net = f"NOT_{safe_var}"
+                inv_nets[var] = inv_net
+                ng = self._place_generated_gate(
+                    scene, 'NAND', f"INV_{safe_var}",
+                    inv_x, y, [var, var], inv_net)
+                ng_pins = ng.all_pin_positions_scene()
+                net_source[inv_net] = (ng_pins[0], ng, 0)
+                _add_consumer(var, ng_pins[1], ng, 1)
+                _add_consumer(var, ng_pins[2], ng, 2)
+                neg_idx = neg_var_order.index(var)
+                if neg_idx < len(neg_lanes):
+                    net_trunk_x[inv_net] = neg_lanes[neg_idx]
+
+        # ── Bloques por salida ────────────────────────────────────────
+        first_output_y = max(len(self.var_inputs) * y_step + 80, 120)
+        for out_index, (output, info) in enumerate(results.items()):
+            safe_out = self._safe_generated_name(output)
+            cover = info.get('sop_cover', [])
+            block_y = first_output_y + out_index * max(180, (len(cover) + 1) * y_step)
+
+            out_label = scene.place_component(
+                'NET_LABEL_OUT', QPointF(label_x, block_y),
+                name=f"OUT_{safe_out}", value=0.0, node1=output)
+            out_label.sheet_label = output
+            out_label.update()
+            _add_consumer(output, out_label.all_pin_positions_scene()[0], out_label, 0)
+
+            if not cover:
+                const = scene.place_component(
+                    'LOGIC_STATE', QPointF(out_x, block_y),
+                    name=f"CONST0_{safe_out}", value=0.0, node1=output)
+                const.update()
+                net_source[output] = (const.all_pin_positions_scene()[0], const, 0)
+                continue
+            if cover == ['-' * len(self.var_inputs)]:
+                const = scene.place_component(
+                    'LOGIC_STATE', QPointF(out_x, block_y),
+                    name=f"CONST1_{safe_out}", value=1.0, node1=output)
+                const.update()
+                net_source[output] = (const.all_pin_positions_scene()[0], const, 0)
+                continue
+
+            term_inv_nets: List[str] = []
+            for term_index, prime in enumerate(cover):
+                lits: List[str] = []
+                for bit, var in zip(prime, self.var_inputs):
+                    if bit == '1':
+                        lits.append(var)
+                    elif bit == '0':
+                        lits.append(inv_nets.get(
+                            var, f"NOT_{self._safe_generated_name(var)}"))
+                if not lits:
+                    continue
+                term_y = block_y + term_index * y_step
+                term_inv_net = f"{safe_out}_T{term_index + 1}_inv"
+                self._place_nand_term(
+                    scene, f"{safe_out}_T{term_index + 1}",
+                    lits, term_inv_net, term_x, term_y, two_input_only,
+                    net_source, net_consumers)
+                term_inv_nets.append(term_inv_net)
+
+            if term_inv_nets:
+                final_y = block_y + max(0, (len(term_inv_nets) - 1) * y_step / 2)
+                self._place_nand_or(
+                    scene, f"{safe_out}_OUT",
+                    term_inv_nets, output, out_x, final_y, two_input_only,
+                    net_source, net_consumers)
+            else:
+                const = scene.place_component(
+                    'LOGIC_STATE', QPointF(out_x, block_y),
+                    name=f"CONST0_{safe_out}", value=0.0, node1=output)
+                const.update()
+                net_source[output] = (const.all_pin_positions_scene()[0], const, 0)
+
+        self._route_all_nets(scene, net_source, net_consumers, net_trunk_x)
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-120, -120, 160, 120))
+        if hasattr(owner, 'statusBar'):
+            owner.statusBar().showMessage(
+                f"Circuito NAND generado en la hoja '{opts['sheet_name']}'")
+        return True
+
+    def _place_nand_term(self, scene, prefix: str, lits: list,
+                         term_inv_net: str, x: float, y: float,
+                         two_input_only: bool,
+                         net_source: dict, net_consumers: dict):
+        """Coloca NAND(s) que producen term_inv_net = (∏ lits)'.
+
+        - 1 literal:  NAND(l, l) actúa como inversor → l'.
+        - 2 literales y/o no two_input_only: un único NAND multi-entrada.
+        - 2 input only con n>=3 literales: cascada
+            q1   = NAND(l1, l2)               → (l1·l2)'
+            buf2 = NAND(q1, q1)               → l1·l2          (inversor)
+            q3   = NAND(buf2, l3)             → (l1·l2·l3)'
+            buf4 = NAND(q3, q3)               → l1·l2·l3       (inversor)
+            ...
+            qN   = NAND(buf_{N-1}, l_n)       → (Π lits)'  ≡ term_inv_net
+        """
+        if not lits:
+            return
+        safe_prefix = self._safe_generated_name(prefix)
+        stage_step = 120
+
+        if (not two_input_only) or len(lits) <= 2:
+            actual_inputs = [lits[0], lits[0]] if len(lits) == 1 else lits
+            gate = self._place_generated_gate(
+                scene, 'NAND', f"{safe_prefix}_NAND",
+                x, y, actual_inputs, term_inv_net)
+            pins = gate.all_pin_positions_scene()
+            net_source[term_inv_net] = (pins[0], gate, 0)
+            for i, in_net in enumerate(actual_inputs):
+                net_consumers.setdefault(in_net, []).append(
+                    (pins[i + 1], gate, i + 1))
+            return
+
+        # Cascada 2-input
+        q_net = f"{safe_prefix}_q1"
+        gate = self._place_generated_gate(
+            scene, 'NAND', f"{safe_prefix}_NAND1",
+            x, y, [lits[0], lits[1]], q_net)
+        pins = gate.all_pin_positions_scene()
+        net_source[q_net] = (pins[0], gate, 0)
+        net_consumers.setdefault(lits[0], []).append((pins[1], gate, 1))
+        net_consumers.setdefault(lits[1], []).append((pins[2], gate, 2))
+
+        stage = 1
+        for k in range(2, len(lits)):
+            # Inversor NAND-NAND para "deshacer" el NAND previo
+            buf_net = f"{safe_prefix}_buf{stage + 1}"
+            gate = self._place_generated_gate(
+                scene, 'NAND', f"{safe_prefix}_INV{stage + 1}",
+                x + stage * stage_step, y, [q_net, q_net], buf_net)
+            pins = gate.all_pin_positions_scene()
+            net_source[buf_net] = (pins[0], gate, 0)
+            net_consumers.setdefault(q_net, []).append((pins[1], gate, 1))
+            net_consumers.setdefault(q_net, []).append((pins[2], gate, 2))
+            stage += 1
+
+            is_last = (k == len(lits) - 1)
+            next_q = term_inv_net if is_last else f"{safe_prefix}_q{stage + 1}"
+            gate = self._place_generated_gate(
+                scene, 'NAND', f"{safe_prefix}_NAND{stage + 1}",
+                x + stage * stage_step, y, [buf_net, lits[k]], next_q)
+            pins = gate.all_pin_positions_scene()
+            net_source[next_q] = (pins[0], gate, 0)
+            net_consumers.setdefault(buf_net, []).append((pins[1], gate, 1))
+            net_consumers.setdefault(lits[k], []).append((pins[2], gate, 2))
+            q_net = next_q
+            stage += 1
+
+    def _place_nand_or(self, scene, prefix: str, term_inv_nets: list,
+                       output_net: str, x: float, y: float,
+                       two_input_only: bool,
+                       net_source: dict, net_consumers: dict):
+        """OR final por De Morgan: output_net = NAND(T1', T2', ..., Tn').
+
+        - 1 término: NAND(T', T') = T (inversor).
+        - 2 términos y/o no two_input_only: un único NAND multi-entrada.
+        - 2 input only con n>=3 términos: cascada
+            acc1  = NAND(T1', T2')              → T1+T2
+            inv2  = NAND(acc1, acc1)            → (T1+T2)'
+            acc3  = NAND(inv2, T3')             → T1+T2+T3
+            inv4  = NAND(acc3, acc3)            → ...'
+            ...
+            accN  = NAND(inv_{N-1}, Tn')        → Y
+        """
+        if not term_inv_nets:
+            return
+        safe_prefix = self._safe_generated_name(prefix)
+        stage_step = 120
+
+        if (not two_input_only) or len(term_inv_nets) <= 2:
+            actual_inputs = (
+                [term_inv_nets[0], term_inv_nets[0]]
+                if len(term_inv_nets) == 1 else term_inv_nets)
+            gate = self._place_generated_gate(
+                scene, 'NAND', f"{safe_prefix}_NAND",
+                x, y, actual_inputs, output_net)
+            pins = gate.all_pin_positions_scene()
+            net_source[output_net] = (pins[0], gate, 0)
+            for i, in_net in enumerate(actual_inputs):
+                net_consumers.setdefault(in_net, []).append(
+                    (pins[i + 1], gate, i + 1))
+            return
+
+        acc_net = f"{safe_prefix}_acc1"
+        gate = self._place_generated_gate(
+            scene, 'NAND', f"{safe_prefix}_NAND1",
+            x, y, [term_inv_nets[0], term_inv_nets[1]], acc_net)
+        pins = gate.all_pin_positions_scene()
+        net_source[acc_net] = (pins[0], gate, 0)
+        net_consumers.setdefault(term_inv_nets[0], []).append((pins[1], gate, 1))
+        net_consumers.setdefault(term_inv_nets[1], []).append((pins[2], gate, 2))
+
+        stage = 1
+        for k in range(2, len(term_inv_nets)):
+            inv_net = f"{safe_prefix}_inv{stage + 1}"
+            gate = self._place_generated_gate(
+                scene, 'NAND', f"{safe_prefix}_INV{stage + 1}",
+                x + stage * stage_step, y, [acc_net, acc_net], inv_net)
+            pins = gate.all_pin_positions_scene()
+            net_source[inv_net] = (pins[0], gate, 0)
+            net_consumers.setdefault(acc_net, []).append((pins[1], gate, 1))
+            net_consumers.setdefault(acc_net, []).append((pins[2], gate, 2))
+            stage += 1
+
+            is_last = (k == len(term_inv_nets) - 1)
+            next_acc = output_net if is_last else f"{safe_prefix}_acc{stage + 1}"
+            gate = self._place_generated_gate(
+                scene, 'NAND', f"{safe_prefix}_NAND{stage + 1}",
+                x + stage * stage_step, y, [inv_net, term_inv_nets[k]], next_acc)
+            pins = gate.all_pin_positions_scene()
+            net_source[next_acc] = (pins[0], gate, 0)
+            net_consumers.setdefault(inv_net, []).append((pins[1], gate, 1))
+            net_consumers.setdefault(term_inv_nets[k], []).append((pins[2], gate, 2))
+            acc_net = next_acc
+            stage += 1
 
     def _build_circuit_stub(self):
         dlg = AutoBuildCircuitDialog(parent=self)

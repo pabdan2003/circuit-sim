@@ -267,7 +267,8 @@ class Gate(DigitalComponent):
 
     def __init__(self, name: str, gate_type: str,
                  inputs: List[str], output: str,
-                 t_pd: float = 1e-9):
+                 t_pd: float = 1e-9,
+                 input_invert: Optional[List[bool]] = None):
         super().__init__(name, inputs, [output], t_pd)
         gt = gate_type.upper()
         if gt not in self._FUNCS:
@@ -275,9 +276,18 @@ class Gate(DigitalComponent):
         self.gate_type = gt
         self.output    = output
         self._func     = self._FUNCS[gt]
+        # Máscara opcional de negación por entrada (alineada con `inputs`).
+        # True ⇒ esa entrada se invierte antes de aplicar la función.
+        self._input_invert = list(input_invert) if input_invert else []
 
     def evaluate(self, t, nets):
         vals = [self._get(nets, inp) for inp in self.inputs]
+        if self._input_invert:
+            vals = [
+                (1 - int(bool(v))) if (i < len(self._input_invert)
+                                       and self._input_invert[i]) else v
+                for i, v in enumerate(vals)
+            ]
         out  = int(self._func(vals))
         return [self._emit(t, self.output, out)]
 

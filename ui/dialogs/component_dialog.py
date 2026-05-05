@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QStackedWidget, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QStackedWidget,
+    QWidget,
 )
 
 from ui.component_metadata import (
@@ -91,21 +92,41 @@ class ComponentDialog(QDialog):
 
         if self.item.comp_type in DIGITAL_GATE_TYPES:
             n_in = self.item.dig_inputs if self.item.comp_type != 'NOT' else 1
+            neg_existing = list(getattr(self.item, 'dig_input_neg', []) or [])
+            while len(neg_existing) < n_in:
+                neg_existing.append(False)
+            self._dig_input_neg_checks: list = []
+
+            def _make_input_row(idx: int, label: str, line_edit: QLineEdit):
+                row = QWidget()
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.addWidget(line_edit, 1)
+                cb = QCheckBox('Negar')
+                cb.setToolTip(
+                    'Si está marcado, esta entrada se invierte (se dibuja un\n'
+                    'círculo en el pin como en una compuerta NOT) antes de\n'
+                    'evaluar la compuerta.')
+                cb.setChecked(bool(neg_existing[idx]))
+                rl.addWidget(cb)
+                self._dig_input_neg_checks.append(cb)
+                layout.addRow(label, row)
+
             self.node1_edit = QLineEdit(self.item.node1)
             layout.addRow('Salida (Y):', self.node1_edit)
             self.node2_edit = QLineEdit(self.item.node2)
-            layout.addRow('Entrada 1 (A):', self.node2_edit)
+            _make_input_row(0, 'Entrada 1 (A):', self.node2_edit)
             self.node3_edit = None
             self._extra_node_edits = []
             if n_in >= 2:
                 n3_val = self.item.node3 if hasattr(self.item, 'node3') else ''
                 self.node3_edit = QLineEdit(n3_val)
-                layout.addRow('Entrada 2 (B):', self.node3_edit)
+                _make_input_row(1, 'Entrada 2 (B):', self.node3_edit)
             for i in range(2, n_in):
                 extra_nodes = getattr(self.item, 'dig_input_nodes', [])
                 val = extra_nodes[i - 2] if len(extra_nodes) > i - 2 else ''
                 edit = QLineEdit(val)
-                layout.addRow(f'Entrada {i+1}:', edit)
+                _make_input_row(i, f'Entrada {i+1}:', edit)
                 self._extra_node_edits.append(edit)
         elif self.item.comp_type in DIGITAL_FLIPFLOP_TYPES:
             self.node1_edit = QLineEdit(self.item.node1)
@@ -354,6 +375,9 @@ class ComponentDialog(QDialog):
             data['dig_analog_node'] = self._dig_anode_edit.text()
         if hasattr(self, '_extra_node_edits') and self._extra_node_edits:
             data['dig_input_nodes'] = [e.text() for e in self._extra_node_edits]
+        if hasattr(self, '_dig_input_neg_checks') and self._dig_input_neg_checks:
+            data['dig_input_neg'] = [
+                cb.isChecked() for cb in self._dig_input_neg_checks]
         if hasattr(self, '_node4_edit') and self._node4_edit is not None:
             data['node4'] = self._node4_edit.text()
         if self._pot_wiper_spin is not None:
