@@ -21,11 +21,11 @@ from PyQt6.QtWidgets import (
     QLineEdit, QDialogButtonBox, QMessageBox, QStatusBar,
     QGraphicsPathItem, QPushButton, QComboBox, QDoubleSpinBox,
     QGroupBox, QTextEdit, QFileDialog, QCheckBox, QFormLayout,
-    QListWidget, QTabWidget, QInputDialog, QStyledItemDelegate
+    QListWidget, QTabWidget, QInputDialog, QStyledItemDelegate, QMenu
 )
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPainterPath, QPolygonF,
-    QAction
+    QAction, QTransform
 )
 from PyQt6.QtCore import (
     Qt, QPointF, QRectF, QLineF, pyqtSignal, QObject, QSize
@@ -50,6 +50,7 @@ from ui.component_metadata import (
 from ui.dialogs.component_dialog import ComponentDialog
 from ui.dialogs.component_picker_dialog import ComponentPickerDialog
 from ui.dialogs.power_triangle_dialog import PowerTriangleDialog
+from ui.dialogs.resistor_calc_dialog import ResistorCalcDialog
 from ui.dialogs.settings_dialog import SettingsDialog
 
 
@@ -148,6 +149,8 @@ class ComponentItem(QGraphicsItem):
         self.ac_mode:   str   = 'rms'   # 'rms' o 'peak'
         self.result_voltage: Optional[float] = None
         self._angle = 0  # rotación en grados (0, 90, 180, 270)
+        self._flip_x: bool = False  # invertir en eje X (horizontal)
+        self._flip_y: bool = False  # invertir en eje Y (vertical)
         # Estado LED
         self.led_color: str  = 'red'   # color del LED
         self.led_on:    bool = False    # encendido si conduce suficiente corriente
@@ -210,13 +213,37 @@ class ComponentItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
 
+    def _apply_transform(self):
+        """Aplica rotación y flips combinados como una única QTransform.
+        El orden es: primero los flips (escala -1), luego la rotación.
+        Esto mantiene la posición del componente intacta."""
+        t = QTransform()
+        t.rotate(self._angle)
+        sx = -1.0 if self._flip_x else 1.0
+        sy = -1.0 if self._flip_y else 1.0
+        if sx != 1.0 or sy != 1.0:
+            t.scale(sx, sy)
+        self.setTransform(t)
+        self.update()
+        # Actualizar cables conectados a este componente tras la transformación
+        if self.scene() and hasattr(self.scene(), 'update_wires_for_component'):
+            self.scene().update_wires_for_component(self)
+
     def rotate_90(self, delta: int = 90):
         """Rota el componente `delta` grados (positivo = horario,
-        negativo = antihorario). El valor por defecto mantiene la API
-        original para llamadas existentes."""
+        negativo = antihorario)."""
         self._angle = (self._angle + delta) % 360
-        self.setRotation(self._angle)
-        self.update()
+        self._apply_transform()
+
+    def flip_x(self):
+        """Invierte el componente en el eje X (espejo horizontal)."""
+        self._flip_x = not self._flip_x
+        self._apply_transform()
+
+    def flip_y(self):
+        """Invierte el componente en el eje Y (espejo vertical)."""
+        self._flip_y = not self._flip_y
+        self._apply_transform()
 
     def pin_positions_scene(self) -> Tuple[QPointF, QPointF]:
         """Retorna posición de los pines en coordenadas de ESCENA (considera rotación)."""
@@ -246,11 +273,9 @@ class ComponentItem(QGraphicsItem):
             return QRectF(-gw - 10 - margin, -gh - margin,
                           (gw + 10) * 2 + margin * 2, gh * 2 + margin * 2)
         if self.comp_type == 'XFMR':
-            # 80×80, primario izq y secundario der
-            return QRectF(-50, -45, 100, 100)
+            return QRectF(-70, -35, 140, 80)
         if self.comp_type == 'BRIDGE':
-            # Diamante 80×80
-            return QRectF(-50, -50, 100, 100)
+            return QRectF(-70, -70, 140, 140)
         return QRectF(-COMP_W//2 - 10, -COMP_H//2 - 20, COMP_W + 20, COMP_H + 40)
 
     def pin_positions(self) -> Tuple[QPointF, QPointF]:
@@ -268,12 +293,12 @@ class ComponentItem(QGraphicsItem):
             return QPointF(hw + 10, 0), QPointF(-hw - 10, hh_op // 2)
         # ── Transformador: p1=PRI+ (sup-izq), p2=PRI- (inf-izq) ─────────
         if self.comp_type == 'XFMR':
-            return QPointF(-50, -25), QPointF(-50, 25)
+            return QPointF(-60, -20), QPointF(-60, 20)
         # ── Puente rectificador (diamante):
         #     p1 = AC1 (izq),  p2 = AC2 (der)
         #     p3 = DC+ (sup),  p4 = DC− (inf)
         if self.comp_type == 'BRIDGE':
-            return QPointF(-50, 0), QPointF(50, 0)
+            return QPointF(-60, 0), QPointF(60, 0)
         # ── Puertas lógicas: usar _gate_geometry para coincidir exactamente ──
         if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                                'COMPARATOR', 'PWM'):
@@ -344,10 +369,10 @@ class ComponentItem(QGraphicsItem):
             return QPointF(-gw - 10, ys[1] if len(ys) > 1 else 0)
         # Transformador: p3 = SEC+ (sup-der)
         if self.comp_type == 'XFMR':
-            return QPointF(50, -25)
+            return QPointF(60, -20)
         # Puente: p3 = DC+ (sup)
         if self.comp_type == 'BRIDGE':
-            return QPointF(0, -50)
+            return QPointF(0, -60)
         return QPointF(0, 0)
 
     def pin3_position_scene(self) -> QPointF:
@@ -361,9 +386,9 @@ class ComponentItem(QGraphicsItem):
           DFF/JKFF/TFF/SRFF → SET (parte superior, arriba del centro)
         """
         if self.comp_type == 'XFMR':
-            return QPointF(50, 25)
+            return QPointF(60, 20)
         if self.comp_type == 'BRIDGE':
-            return QPointF(0, 50)
+            return QPointF(0, 60)
         if self.comp_type in self.FLIPFLOP_TYPES:
             hh_f = COMP_H // 2 + 8
             return QPointF(0, -hh_f - 10)
@@ -576,53 +601,50 @@ class ComponentItem(QGraphicsItem):
         import math as _m
         # ── Cables a los 4 pines ──────────────────────────────────────────
         painter.setPen(pen_wire)
-        # Primario (izq): bobina entre y=-25 y y=25 a x=-30
-        painter.drawLine(QPointF(-50, -25), QPointF(-30, -25))   # p1 → top de bobina
-        painter.drawLine(QPointF(-50,  25), QPointF(-30,  25))   # p2 → bot de bobina
-        # Secundario (der): bobina a x=30
-        painter.drawLine(QPointF(30, -25), QPointF(50, -25))     # p3 → top
-        painter.drawLine(QPointF(30,  25), QPointF(50,  25))     # p4 → bot
+        # Primario (izq): pines a (±60, ±20), bobina a x=-40
+        painter.drawLine(QPointF(-60, -20), QPointF(-40, -20))   # p1 → top de bobina
+        painter.drawLine(QPointF(-60,  20), QPointF(-40,  20))   # p2 → bot de bobina
+        # Secundario (der): bobina a x=40
+        painter.drawLine(QPointF(40, -20), QPointF(60, -20))     # p3 → top
+        painter.drawLine(QPointF(40,  20), QPointF(60,  20))     # p4 → bot
 
         # ── Bobinas (semicírculos apilados) ───────────────────────────────
         painter.setPen(QPen(QColor(COLORS['component']), 1.8))
         # Primario: 4 lazos a la izquierda (abren hacia la derecha)
         path_p = QPainterPath()
-        path_p.moveTo(-30, -25)
+        path_p.moveTo(-40, -20)
         for i in range(4):
-            cy = -25 + i*12 + 6
-            # Semicírculo de radio 6 abriendo hacia la derecha (+90 a -90)
-            path_p.arcTo(QRectF(-36, cy - 6, 12, 12), 90, -180)
+            cy = -20 + i*10 + 5
+            path_p.arcTo(QRectF(-45, cy - 5, 10, 10), 90, -180)
         painter.drawPath(path_p)
         # Secundario: 4 lazos a la derecha (abren hacia la izquierda)
         path_s = QPainterPath()
-        path_s.moveTo(30, -25)
+        path_s.moveTo(40, -20)
         for i in range(4):
-            cy = -25 + i*12 + 6
-            path_s.arcTo(QRectF(24, cy - 6, 12, 12), 90, 180)
+            cy = -20 + i*10 + 5
+            path_s.arcTo(QRectF(35, cy - 5, 10, 10), 90, 180)
         painter.drawPath(path_s)
 
         # ── Núcleo de hierro: dos líneas verticales paralelas ─────────────
         painter.setPen(QPen(QColor(COLORS['text']), 1.4))
-        painter.drawLine(QPointF(-3, -28), QPointF(-3, 28))
-        painter.drawLine(QPointF( 3, -28), QPointF( 3, 28))
+        painter.drawLine(QPointF(-3, -22), QPointF(-3, 22))
+        painter.drawLine(QPointF( 3, -22), QPointF( 3, 22))
 
         # ── Etiqueta de relación ──────────────────────────────────────────
         painter.setFont(QFont('Consolas', 7))
         painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
-        # Mostrar n = ratio
-        n   = self.xfmr_ratio
-        # Formato pretty para 1:n o n:1
+        n = self.xfmr_ratio
         if n >= 1:
             label = f"{n:.1f}:1"
         else:
             label = f"1:{1/n:.1f}"
-        painter.drawText(QRectF(-30, 32, 60, 10),
+        painter.drawText(QRectF(-30, 24, 60, 10),
                          Qt.AlignmentFlag.AlignCenter, label)
         # Indicar polaridad con un punto en la parte superior de cada bobina
         painter.setPen(QPen(QColor(COLORS['component']), 1))
         painter.setBrush(QColor(COLORS['component']))
-        painter.drawEllipse(QPointF(-22, -30), 1.8, 1.8)
-        painter.drawEllipse(QPointF( 22, -30), 1.8, 1.8)
+        painter.drawEllipse(QPointF(-32, -24), 1.8, 1.8)
+        painter.drawEllipse(QPointF( 32, -24), 1.8, 1.8)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def _draw_bridge_rectifier(self, painter, pen_body, pen_wire, body_color):
@@ -644,25 +666,23 @@ class ComponentItem(QGraphicsItem):
         # AC1 (izq), AC2 (der), DC+ (sup), DC- (inf)
         # Conectores cortos a los vértices del diamante
         painter.setPen(pen_wire)
-        painter.drawLine(QPointF(-50, 0),  QPointF(-30, 0))   # AC1
-        painter.drawLine(QPointF(30, 0),   QPointF(50, 0))    # AC2
-        painter.drawLine(QPointF(0, -50),  QPointF(0, -30))   # DC+
-        painter.drawLine(QPointF(0,  30),  QPointF(0,  50))   # DC−
+        painter.drawLine(QPointF(-60, 0),  QPointF(-40, 0))   # AC1
+        painter.drawLine(QPointF(40, 0),   QPointF(60, 0))    # AC2
+        painter.drawLine(QPointF(0, -60),  QPointF(0, -40))   # DC+
+        painter.drawLine(QPointF(0,  40),  QPointF(0,  60))   # DC−
 
         # ── Diamante ──────────────────────────────────────────────────────
         painter.setPen(pen_body)
         painter.setBrush(QBrush(body_color))
         diamond = QPolygonF([
-            QPointF(0, -30),   # top  (DC+)
-            QPointF(30,  0),   # right (AC2)
-            QPointF(0,  30),   # bot  (DC-)
-            QPointF(-30, 0),   # left (AC1)
+            QPointF(0, -40),   # top  (DC+)
+            QPointF(40,  0),   # right (AC2)
+            QPointF(0,  40),   # bot  (DC-)
+            QPointF(-40, 0),   # left (AC1)
         ])
         painter.drawPolygon(diamond)
 
         # ── 4 diodos dentro del diamante ──────────────────────────────────
-        # Cada diodo: triángulo + raya. Los 4 apuntan hacia DC+ (excepto los
-        # de DC- que apuntan desde DC- hacia los nodos AC).
         painter.setPen(QPen(QColor(COLORS['component']), 1.5))
         painter.setBrush(QBrush(QColor(COLORS['component'])))
 
@@ -674,38 +694,34 @@ class ComponentItem(QGraphicsItem):
             L  = _m.hypot(dx, dy) or 1.0
             ux, uy = dx/L, dy/L
             px, py = -uy, ux
-            # Centro del diodo
             cx = (p_from.x() + p_to.x()) / 2
             cy = (p_from.y() + p_to.y()) / 2
-            # Triángulo (apuntando a p_to)
-            sz = 5
+            sz = 6
             tri = QPolygonF([
-                QPointF(cx + sz*ux,            cy + sz*uy),
+                QPointF(cx + sz*ux,             cy + sz*uy),
                 QPointF(cx - sz*ux + sz*0.7*px, cy - sz*uy + sz*0.7*py),
                 QPointF(cx - sz*ux - sz*0.7*px, cy - sz*uy - sz*0.7*py),
             ])
             painter.drawPolygon(tri)
-            # Raya en la cabeza del triángulo (cátodo)
             tip_x = cx + sz*ux
             tip_y = cy + sz*uy
             painter.drawLine(
                 QPointF(tip_x + 0.7*sz*px, tip_y + 0.7*sz*py),
                 QPointF(tip_x - 0.7*sz*px, tip_y - 0.7*sz*py))
 
-        # Brazos del puente: AC1→DC+ (D1), AC2→DC+ (D2), DC-→AC1 (D3), DC-→AC2 (D4)
-        draw_diode_arrow(painter, QPointF(-30, 0), QPointF(0, -30))   # D1: AC1→DC+
-        draw_diode_arrow(painter, QPointF(30, 0),  QPointF(0, -30))   # D2: AC2→DC+
-        draw_diode_arrow(painter, QPointF(0, 30),  QPointF(-30, 0))   # D3: DC-→AC1
-        draw_diode_arrow(painter, QPointF(0, 30),  QPointF(30, 0))    # D4: DC-→AC2
+        draw_diode_arrow(painter, QPointF(-40, 0), QPointF(0, -40))   # D1: AC1→DC+
+        draw_diode_arrow(painter, QPointF(40, 0),  QPointF(0, -40))   # D2: AC2→DC+
+        draw_diode_arrow(painter, QPointF(0, 40),  QPointF(-40, 0))   # D3: DC-→AC1
+        draw_diode_arrow(painter, QPointF(0, 40),  QPointF(40, 0))    # D4: DC-→AC2
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
         # Etiquetas de pines
         painter.setFont(QFont('Consolas', 6))
         painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
-        painter.drawText(QRectF(-50, -8, 18, 10),  Qt.AlignmentFlag.AlignCenter, '~')
-        painter.drawText(QRectF(32,  -8, 18, 10),  Qt.AlignmentFlag.AlignCenter, '~')
-        painter.drawText(QRectF(-12, -50, 24, 10), Qt.AlignmentFlag.AlignCenter, '+')
-        painter.drawText(QRectF(-12,  40, 24, 10), Qt.AlignmentFlag.AlignCenter, '−')
+        painter.drawText(QRectF(-60, -8, 18, 10),  Qt.AlignmentFlag.AlignCenter, '~')
+        painter.drawText(QRectF(42,  -8, 18, 10),  Qt.AlignmentFlag.AlignCenter, '~')
+        painter.drawText(QRectF(-12, -60, 24, 10), Qt.AlignmentFlag.AlignCenter, '+')
+        painter.drawText(QRectF(-12,  50, 24, 10), Qt.AlignmentFlag.AlignCenter, '−')
 
     def _draw_capacitor(self, painter, pen_body, pen_wire):
         painter.setPen(pen_wire)
@@ -2196,17 +2212,20 @@ class CircuitScene(QGraphicsScene):
             # Aceptamos también Ctrl+= para teclados donde + requiere Shift.
             if self.rotate_selected(delta=90):
                 self.status_message.emit("Rotado 90° a la derecha (Ctrl++)")
+            event.accept()
         elif has_ctrl and key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
             # Ctrl+- → rotar 90° a la izquierda (antihorario).
             if self.rotate_selected(delta=-90):
                 self.status_message.emit("Rotado 90° a la izquierda (Ctrl+-)")
+            event.accept()
         elif key == Qt.Key.Key_Escape:
             if self._wire_preview:
                 self.removeItem(self._wire_preview)
                 self._wire_preview = None
             self._wire_start = None
             self.set_mode('select')
-        super().keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
 
     def update_wires_for_component(self, comp: 'ComponentItem'):
         """Actualiza todos los cables conectados al componente dado."""
@@ -2235,6 +2254,8 @@ class CircuitScene(QGraphicsScene):
             'node3': c.node3,
             'x':     c.pos().x(), 'y': c.pos().y(),
             'angle': c._angle,
+            'flip_x': c._flip_x,
+            'flip_y': c._flip_y,
         }
         for attr in self._SNAP_ATTRS:
             if hasattr(c, attr):
@@ -2282,9 +2303,13 @@ class CircuitScene(QGraphicsScene):
             node2=c.get('node2', ''),
             node3=c.get('node3', ''))
         angle = c.get('angle', 0)
-        if angle:
+        flip_x = bool(c.get('flip_x', False))
+        flip_y = bool(c.get('flip_y', False))
+        if angle or flip_x or flip_y:
             item._angle = angle
-            item.setRotation(angle)
+            item._flip_x = flip_x
+            item._flip_y = flip_y
+            item._apply_transform()
         for attr in self._SNAP_ATTRS:
             if attr in c:
                 setattr(item, attr, c[attr])
@@ -2408,6 +2433,65 @@ class CircuitScene(QGraphicsScene):
             it.rotate_90(delta=delta)
         return True
 
+    def flip_selected_x(self) -> bool:
+        items = [it for it in self.selectedItems()
+                 if isinstance(it, ComponentItem)]
+        if not items:
+            return False
+        self.push_undo()
+        for it in items:
+            it.flip_x()
+        return True
+
+    def flip_selected_y(self) -> bool:
+        items = [it for it in self.selectedItems()
+                 if isinstance(it, ComponentItem)]
+        if not items:
+            return False
+        self.push_undo()
+        for it in items:
+            it.flip_y()
+        return True
+
+    # ── Menú contextual (click derecho sobre un componente) ──
+    def contextMenuEvent(self, event):
+        items = self.items(event.scenePos())
+        comp = next((it for it in items if isinstance(it, ComponentItem)), None)
+        if comp is None:
+            super().contextMenuEvent(event)
+            return
+
+        # Si el componente clickeado no estaba seleccionado, seleccionarlo
+        # (y limpiar la selección anterior) para que las acciones del menú
+        # operen sobre él.
+        if not comp.isSelected():
+            for it in self.selectedItems():
+                it.setSelected(False)
+            comp.setSelected(True)
+
+        menu = QMenu()
+        act_props    = menu.addAction("Propiedades…")
+        menu.addSeparator()
+        act_rot_left  = menu.addAction("Rotar 90° izquierda")
+        act_rot_right = menu.addAction("Rotar 90° derecha")
+        menu.addSeparator()
+        act_flip_x = menu.addAction("Invertir en eje X")
+        act_flip_y = menu.addAction("Invertir en eje Y")
+
+        chosen = menu.exec(event.screenPos())
+        if chosen is None:
+            return
+        if chosen is act_props:
+            self._edit_component(comp)
+        elif chosen is act_rot_left:
+            self.rotate_selected(delta=-90)
+        elif chosen is act_rot_right:
+            self.rotate_selected(delta=90)
+        elif chosen is act_flip_x:
+            self.flip_selected_x()
+        elif chosen is act_flip_y:
+            self.flip_selected_y()
+
     # ── Extraccion de netlist por Union-Find ─────
     def extract_netlist(self) -> Dict[str, str]:
         """
@@ -2415,8 +2499,7 @@ class CircuitScene(QGraphicsScene):
         Union-Find: une pines conectados por cables en el mismo nodo.
         GND se mapea al nodo 0. Retorna {CompNombre__p1: net_X, ...}
         """
-        # Cambia esto de GRID_SIZE a un valor pequeño
-        SNAP = 5
+        SNAP = 12
 
         # ── 1. Registrar pines de componentes ───────────────────────────
         pins = {}
@@ -2740,18 +2823,33 @@ def build_engine_components_for_item(item, pin_node):
 # VENTANA PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
+    # ── Constantes de simulación live ────────────────────────────────
+    _LIVE_TIME_SCALE         = 0.1   # 10x slow-motion (a 60 Hz: 1 ciclo cada ~167 ms reales)
+    _LIVE_TICK_MS            = 50    # 20 Hz refresh visual
+    _LIVE_PANEL_REFRESH_TICKS = 5    # Texto del panel cada N ticks (~250 ms)
+    _DC_TICK_MS              = 200   # Intervalo del tick DC (igual que antes)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CircuitSim — Simulador de Circuitos")
         self.resize(1280, 800)
         self.solver = MNASolver()
         self._sim_running = False
+        self._sim_mode    = 'idle'   # 'idle' | 'dc_tick' | 'live_transient'
         self._sim_all_comps = None
         self._sim_pin_node = None
+
+        # Estado live transient (rellenado en _start_live_transient)
+        self._live_state       = None   # dict {x, cap_states, ind_states, t}
+        self._live_components  = None   # lista de componentes del motor
+        self._live_pin_node    = None
+        self._live_freq        = 60.0
+        self._live_tick_count  = 0
+
         # Timer para simulación continua (actualiza LEDs y canvas en vivo)
         from PyQt6.QtCore import QTimer
         self._sim_timer = QTimer(self)
-        self._sim_timer.setInterval(200)   # ms entre actualizaciones
+        self._sim_timer.setInterval(self._DC_TICK_MS)
         self._sim_timer.timeout.connect(self._tick_simulation)
 
         # ── Reloj global para componentes CLK ──────────────────────────────
@@ -2765,6 +2863,111 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_style()
         self._load_demo_circuit()
+        self._install_global_shortcuts()
+
+    # ── Atajos globales (funcionan sin importar qué widget tenga foco) ──
+    def _install_global_shortcuts(self):
+        """Atajos a nivel de aplicación.
+
+        Ctrl+C/X/V/Z se registran como `QShortcut` (funcionan bien con el
+        parser de strings de Qt). La ROTACIÓN (Ctrl++ / Ctrl+-) se maneja
+        con un `eventFilter` instalado sobre la `QApplication` porque las
+        combinaciones con `+` y `-` confunden al parser de QKeySequence
+        en algunos backends y dependiendo del layout del teclado pueden
+        no disparar el QShortcut. El event filter ve los eventos al
+        nivel más bajo y los enruta a la escena activa.
+        """
+        from PyQt6.QtGui import QShortcut, QKeySequence
+
+        def _msg(text):
+            self.statusBar().showMessage(text)
+
+        def _bind_string(seq, fn):
+            sh = QShortcut(QKeySequence(seq), self)
+            sh.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sh.activated.connect(fn)
+
+        def do_copy():
+            sc = self.scene
+            if sc is not None and sc.copy_selected():
+                _msg("Selección copiada (Ctrl+C)")
+
+        def do_cut():
+            sc = self.scene
+            if sc is not None and sc.cut_selected():
+                _msg("Selección cortada (Ctrl+X)")
+
+        def do_paste():
+            sc = self.scene
+            if sc is None:
+                return
+            if sc.paste():
+                _msg("Pegado (Ctrl+V)")
+            else:
+                _msg("Portapapeles vacío")
+
+        def do_undo():
+            sc = self.scene
+            if sc is None:
+                return
+            if sc.undo():
+                _msg("Acción deshecha (Ctrl+Z)")
+            else:
+                _msg("Nada que deshacer")
+
+        _bind_string("Ctrl+C", do_copy)
+        _bind_string("Ctrl+X", do_cut)
+        _bind_string("Ctrl+V", do_paste)
+        _bind_string("Ctrl+Z", do_undo)
+
+        # Rotación: event filter a nivel de QApplication.
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """Captura Ctrl+- y Ctrl++ ANTES de que ningún widget procese el
+        evento. Devuelve True para consumirlo y evitar duplicación.
+        """
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.KeyPress:
+            mods = event.modifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                k = event.key()
+                if k in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+                    sc = self.scene
+                    if sc is not None and sc.rotate_selected(delta=-90):
+                        self.statusBar().showMessage(
+                            "Rotado 90° a la izquierda (Ctrl+-)")
+                    return True
+                if k in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+                    sc = self.scene
+                    if sc is not None and sc.rotate_selected(delta=90):
+                        self.statusBar().showMessage(
+                            "Rotado 90° a la derecha (Ctrl++)")
+                    return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        """Segunda red de seguridad: si por algún motivo el event filter
+        no recibe el evento (envío sintético desde QTest, etc.), aún
+        capturamos las rotaciones aquí."""
+        mod = event.modifiers()
+        if mod & Qt.KeyboardModifier.ControlModifier:
+            sc = self.scene
+            if sc is not None:
+                k = event.key()
+                if k in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+                    if sc.rotate_selected(delta=-90):
+                        self.statusBar().showMessage(
+                            "Rotado 90° a la izquierda (Ctrl+-)")
+                    event.accept()
+                    return
+                if k in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+                    if sc.rotate_selected(delta=90):
+                        self.statusBar().showMessage(
+                            "Rotado 90° a la derecha (Ctrl++)")
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
 
     # ── CLK (oscilador global) ────────────────────────────────────────────
     def _update_clk_timer_interval(self):
@@ -2842,6 +3045,11 @@ class MainWindow(QMainWindow):
         dlg = CircuitAnalyzerDialog(parent=self, initial_state=state)
         dlg.exec()
 
+    def _open_resistor_calculator(self):
+        """Abre la calculadora de código de colores de resistencias."""
+        dlg = ResistorCalcDialog(colors=COLORS, parent=self)
+        dlg.exec()
+
     def _build_tools_button(self):
         """Construye el QToolButton 'Herramientas' con menú desplegable.
         Aparece justo después del botón '+ Hoja' en la toolbar principal.
@@ -2858,6 +3066,9 @@ class MainWindow(QMainWindow):
         act_analyze = QAction("Analizar Circuito…", self)
         act_analyze.triggered.connect(self._open_circuit_analyzer)
         menu.addAction(act_analyze)
+        act_resistor_calc = QAction("Código de colores…", self)
+        act_resistor_calc.triggered.connect(self._open_resistor_calculator)
+        menu.addAction(act_resistor_calc)
         btn.setMenu(menu)
         # Mostrar el menú también al pasar el cursor (hover)
         btn.installEventFilter(self)
@@ -3050,8 +3261,10 @@ class MainWindow(QMainWindow):
             ("+ Hoja",       "Ctrl+T", lambda: self._add_sheet()),
             ("__TOOLS__", None, None),                    # placeholder Herramientas
             ("Limpiar",      "Ctrl+L", self._clear_circuit),
-            ("Zoom +",       "Ctrl+=", lambda: self.view.scale(1.2, 1.2)),
-            ("Zoom −",       "Ctrl+-", lambda: self.view.scale(1/1.2, 1/1.2)),
+            # Zoom: sin atajo para no chocar con la rotación Ctrl++/Ctrl+-.
+            # El zoom sigue disponible vía botón en la toolbar y Ctrl+rueda.
+            ("Zoom +",       None,     lambda: self.view.scale(1.2, 1.2)),
+            ("Zoom −",       None,     lambda: self.view.scale(1/1.2, 1/1.2)),
             ("Restablecer",  "Ctrl+0", self._reset_zoom),
         ]
         for name, shortcut, fn in actions:
@@ -3129,11 +3342,12 @@ class MainWindow(QMainWindow):
         # ── Categorías de componentes ────────────────────────────────────
         categories = [
             ("Pasivos", [
-                ('R',   'Resistor',      '━┤ZZZ├━'),
-                ('POT', 'Potenciómetro', '━┤Z↗├━'),
-                ('C',   'Capacitor',     '━┤  ├━'),
-                ('L',   'Inductor',      '━⌒⌒⌒━'),
-                ('Z',   'Impedancia',    '━┤▭├━'),
+                ('R',    'Resistor',      '━┤ZZZ├━'),
+                ('POT',  'Potenciómetro', '━┤Z↗├━'),
+                ('C',    'Capacitor',     '━┤  ├━'),
+                ('L',    'Inductor',      '━⌒⌒⌒━'),
+                ('Z',    'Impedancia',    '━┤▭├━'),
+                ('XFMR', 'Transformador', '⌇⌇'),
             ]),
             ("Fuentes", [
                 ('V',   'Fuente VDC',  '━(+)━'),
@@ -3149,7 +3363,6 @@ class MainWindow(QMainWindow):
                 ('NMOS',    'MOSFET N',              '━[N]━'),
                 ('PMOS',    'MOSFET P',              '━[P]━'),
                 ('OPAMP',   'Op-Amp',                '━[▷]━'),
-                ('XFMR',    'Transformador',         '⌇⌇'),
             ]),
             ("Referencia", [
                 ('GND',          'Tierra',          '⏚'),
@@ -3208,7 +3421,7 @@ class MainWindow(QMainWindow):
 
         # ── Simulación ─────────────────────────────────────────────────────
         # Estándar lógico fijo: CMOS 5 V (no expuesto en la UI)
-        self.run_btn = QPushButton("▶  SIMULAR AUTO")
+        self.run_btn = QPushButton("▶  SIMULAR")
         self.run_btn.setFont(QFont('Consolas', 10, QFont.Weight.Bold))
         self.run_btn.setFixedHeight(28)
         self.run_btn.setCheckable(True)
@@ -3395,30 +3608,30 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
 
-        # Circuitos con puentes ADC/DAC explícitos o fronteras implícitas reales
-        # → co-simulación transitoria (one-shot)
-        _needs_transient = (
-            flags.has_bridges
-            or bool(flags.implicit_boundary_nodes)
-            or (flags.has_dc and flags.has_ac)
-        )
-        if _needs_transient:
+        # ── Despacho por modo ────────────────────────────────────────────
+        # 1. Mixto (puentes ADC/DAC explícitos o fronteras implícitas):
+        #    one-shot mixto. La co-simulación digital-analógica no se
+        #    reanuda en vivo por ahora.
+        # 2. Cualquier `has_ac` (con o sin DC, lineal o no-lineal):
+        #    live transient continuo (estilo Multisim interactivo).
+        # 3. Solo DC o digital: tick DC continuo (más rápido — el sistema
+        #    converge al instante en cada paso, no necesita transient).
+        if flags.has_bridges or bool(flags.implicit_boundary_nodes):
             self.run_btn.setChecked(False)
-            self.run_btn.setText("▶  SIMULAR AUTO")
+            self.run_btn.setText("▶  SIMULAR")
             self._run_simulation_auto(flags, pin_node)
-        elif flags.has_ac and not flags.has_dc:
-            self.run_btn.setChecked(False)
-            self.run_btn.setText("▶  SIMULAR AUTO")
-            self._run_simulation_ac()
+        elif flags.has_ac:
+            self._start_live_transient(flags, pin_node)
         elif flags.has_dc or flags.has_digital:
-            # DC puro, digital puro, o digital+DC sin fronteras → simulación continua
             self._sim_running = True
+            self._sim_mode    = 'dc_tick'
             self.run_btn.setText("■  DETENER")
+            self._sim_timer.setInterval(self._DC_TICK_MS)
             self._sim_timer.start()
             self._run_simulation_dc()
         else:
             self.run_btn.setChecked(False)
-            self.run_btn.setText("▶  SIMULAR AUTO")
+            self.run_btn.setText("▶  SIMULAR")
             self.results_text.setPlainText(
                 "⚠  No se encontraron componentes para simular.\n"
                 "Añade componentes al canvas y conéctalos a tierra.")
@@ -3426,11 +3639,19 @@ class MainWindow(QMainWindow):
     def _stop_simulation(self):
         """Detiene la simulación y apaga todos los LEDs en todas las hojas."""
         self._sim_running = False
+        self._sim_mode    = 'idle'
         self._sim_timer.stop()
+        self._sim_timer.setInterval(self._DC_TICK_MS)   # restaurar intervalo DC
         self._sim_all_comps = None
-        self._sim_pin_node = None
+        self._sim_pin_node  = None
+        # Limpiar estado live
+        self._live_state          = None
+        self._live_components     = None
+        self._live_pin_node       = None
+        self._live_tick_count     = 0
+        self._live_phasor_summary = ""
         self.run_btn.setChecked(False)
-        self.run_btn.setText("▶  SIMULAR AUTO")
+        self.run_btn.setText("▶  SIMULAR")
         for sheet in self._sheets:
             for item in sheet['scene'].components:
                 if item.comp_type == 'LED':
@@ -3438,16 +3659,236 @@ class MainWindow(QMainWindow):
                     item.update()
 
     def _tick_simulation(self):
-        """Llamado por QTimer: re-corre DC silenciosamente para actualizar LEDs."""
-        if self._sim_running:
+        """Llamado por QTimer: dispatcher por modo."""
+        if not self._sim_running:
+            return
+        if self._sim_mode == 'live_transient':
+            self._tick_live_transient()
+        else:
+            # Modo DC tick: re-corre DC silenciosamente para refrescar LEDs
             all_comps, pin_node = self._get_sim_context()
             self._sim_all_comps = all_comps
-            self._sim_pin_node = pin_node
+            self._sim_pin_node  = pin_node
             self._run_simulation_dc(silent=True)
 
     def _run_simulation(self):
         """Compatibilidad: despacha al toggle."""
         self._toggle_simulation(True)
+
+    # ── Live transient (Multisim-like) ────────────────────────────────────
+    def _start_live_transient(self, flags, pin_node):
+        """
+        Arranca una simulación transient continua: el solver avanza el
+        tiempo simulado en cada tick del QTimer, manteniendo el estado
+        de capacitores, inductores y diodos entre llamadas.
+
+        Equivalente al modo "interactivo" de Multisim.
+        """
+        sim_components = self._sim_all_comps or list(self.scene.components)
+
+        # ── Construir componentes del motor analógico ─────────────────
+        analog_comps, build_errors = [], []
+        for item in sim_components:
+            if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                continue
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT', 'GND', 'NODE'):
+                continue
+            try:
+                analog_comps.extend(build_engine_components_for_item(item, pin_node))
+            except Exception as e:
+                build_errors.append(f"{item.name}: {e}")
+
+        if not analog_comps:
+            self.results_text.setPlainText(
+                "⚠  No hay componentes analógicos para simular.")
+            self._stop_simulation()
+            return
+
+        # Frecuencia más alta de las VAC (rige el dt interno)
+        freq = max((it.frequency for it in sim_components
+                    if it.comp_type == 'VAC'), default=60.0)
+
+        # ── Snapshot fasorial inicial (solo circuitos lineales) ───────
+        # El triángulo de potencia y los fasores P/Q/S solo tienen sentido
+        # si el circuito NO tiene componentes que generen armónicos.
+        # Para no-lineales (diodos, BJT, MOSFET) ocultamos el botón.
+        ac_snapshot = None
+        self._live_phasor_summary = ""   # se prepended en cada refresh del panel
+        if not flags.has_nonlinear:
+            ac_snapshot = self.solver.solve_ac_single(analog_comps, freq)
+            if ac_snapshot.get('success'):
+                self._last_ac_result = ac_snapshot
+                self.btn_power_triangle.setVisible(True)
+                self._live_phasor_summary = self._format_phasor_summary(
+                    ac_snapshot, freq)
+            else:
+                self.btn_power_triangle.setVisible(False)
+        else:
+            self.btn_power_triangle.setVisible(False)
+
+        # Estado live: None → el primer tick calcula DC OP en t=0 y arranca
+        self._live_state       = None
+        self._live_components  = analog_comps
+        self._live_pin_node    = pin_node
+        self._live_freq        = freq if freq > 0 else 60.0
+        self._live_tick_count  = 0
+        self._sim_mode         = 'live_transient'
+        self._sim_running      = True
+
+        self.run_btn.setText("■  DETENER")
+        self.run_btn.setChecked(True)
+        self._sim_timer.setInterval(self._LIVE_TICK_MS)
+        self._sim_timer.start()
+
+        msg = [
+            f"═══ SIMULACIÓN LIVE (transient continuo, ×{self._LIVE_TIME_SCALE:g}) ═══",
+            f"  {flags.summary()}",
+            f"  f_VAC = {self._live_freq:g} Hz  ·  paso real {self._LIVE_TICK_MS} ms"
+            f"  ·  paso simulado {self._LIVE_TICK_MS * self._LIVE_TIME_SCALE:.2f} ms",
+            "",
+        ]
+
+        # Si el fasorial fue válido, mostrar el resumen P/Q/S/fp arriba —
+        # es información estable que no necesita refrescarse cada tick.
+        if self._live_phasor_summary:
+            msg.append(self._live_phasor_summary)
+
+        msg.append("  Iniciando…")
+        if build_errors:
+            msg.append("")
+            msg.append("── Advertencias ──")
+            msg.extend([f"  ⚠ {e}" for e in build_errors])
+        self.results_text.setPlainText("\n".join(msg))
+
+    def _tick_live_transient(self):
+        """Avanza el solver `dt_sim` segundos y actualiza la UI."""
+        if self._live_components is None:
+            return
+
+        # Tiempo simulado a avanzar este tick (tiempo real * factor escala)
+        dt_advance = (self._LIVE_TICK_MS / 1000.0) * self._LIVE_TIME_SCALE
+
+        # Paso interno: ~200 muestras por ciclo de la VAC, pero acotado
+        # superiormente a dt_advance/4 para que tengamos al menos 4 puntos
+        # por tick (suaviza el ruido de la integración).
+        T_freq      = 1.0 / self._live_freq
+        dt_internal = max(min(T_freq / 200.0, dt_advance / 4.0), 1e-7)
+
+        t_start = float(self._live_state['t']) if self._live_state else 0.0
+
+        tr = self.solver.solve_transient(
+            self._live_components,
+            t_stop        = dt_advance,
+            dt            = dt_internal,
+            method        = 'trapezoidal',
+            adaptive      = True,
+            t_start       = t_start,
+            initial_state = self._live_state,
+            nr_tol        = 1e-5,
+            nr_max_iter   = 30,
+        )
+
+        if not tr.get('success'):
+            self.results_text.setPlainText(
+                f"✗ Live transient falló:\n  {tr.get('error', 'desconocido')}")
+            self._stop_simulation()
+            return
+
+        # Guardar estado para el próximo tick
+        self._live_state = tr['final_state']
+        self._live_tick_count += 1
+
+        # Refresco visual de los items (LEDs y voltajes instantáneos)
+        self._update_items_from_live(tr)
+
+        # Texto del panel cada N ticks (no abrumar la UI)
+        if self._live_tick_count % self._LIVE_PANEL_REFRESH_TICKS == 0:
+            self._refresh_live_panel(tr)
+
+    def _update_items_from_live(self, tr):
+        """Actualiza cada componente con el último valor instantáneo."""
+        v_dict   = tr.get('voltages', {})
+        if not v_dict:
+            return
+        sim_components = self._sim_all_comps or list(self.scene.components)
+        pin_node = self._live_pin_node or {}
+
+        vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
+                  'green':1.9,'blue':2.6,'white':2.6}
+
+        def _v(node):
+            arr = v_dict.get(node)
+            if arr is None or len(arr) == 0:
+                return 0.0
+            return float(arr[-1])
+
+        for item in sim_components:
+            if item.comp_type in ComponentItem.DIGITAL_TYPES:
+                continue
+            if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT', 'GND', 'NODE'):
+                continue
+
+            n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", "")
+            n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
+
+            v_a = _v(n1) if n1 else None
+            v_k = _v(n2) if n2 not in ('0', 'gnd', 'GND', '') else 0.0
+
+            if v_a is not None:
+                item.result_voltage = v_a
+
+            if item.comp_type == 'LED' and v_a is not None:
+                thr = vf_min.get(getattr(item, 'led_color', 'red'), 1.5)
+                item.led_on = (v_a - v_k) > thr
+
+            item.update()
+
+    def _refresh_live_panel(self, tr):
+        """Actualiza el panel de texto con voltajes instantáneos y tiempo."""
+        v_dict = tr.get('voltages', {})
+        t_arr  = tr.get('time', [])
+        if not v_dict or len(t_arr) == 0:
+            return
+
+        t_now = float(t_arr[-1])
+        out = [
+            f"═══ SIMULACIÓN LIVE (×{self._LIVE_TIME_SCALE:g}) ═══",
+            f"  t_simulado = {t_now*1000:.2f} ms"
+            f"   ·   ticks = {self._live_tick_count}"
+            f"   ·   pasos_NR = {tr.get('steps', 0)}",
+            "",
+        ]
+
+        # Fasores se mantienen visibles durante toda la corrida (snapshot fijo).
+        if getattr(self, '_live_phasor_summary', ''):
+            out.append(self._live_phasor_summary)
+
+        out.append("── Voltajes instantáneos ──")
+        for node, v_arr in sorted(v_dict.items()):
+            if len(v_arr) > 0:
+                out.append(f"  V({node}) = {float(v_arr[-1]):+.4f} V")
+
+        self.results_text.setPlainText("\n".join(out))
+
+    def _format_phasor_summary(self, ac_result: dict, freq: float) -> str:
+        """Formatea fasores nodales y triángulo de potencia en un bloque de
+        texto que se preserva mientras dura la simulación live."""
+        import cmath as _cmath
+        lines = [f"── Fasores AC ({freq:g} Hz, snapshot) ──"]
+        for node, V in sorted(ac_result.get('voltages', {}).items()):
+            lines.append(f"  V({node}) = {abs(V):.4f} V  "
+                         f"∠{_cmath.phase(V)*180/_cmath.pi:.2f}°")
+        tot = ac_result.get('total', {})
+        if tot:
+            lines += [
+                "",
+                "── Potencia total ──",
+                f"  P={tot.get('P',0):+.4f} W  Q={tot.get('Q',0):+.4f} VAR",
+                f"  S={tot.get('S',0):.4f} VA  fp={tot.get('fp',0):.4f} "
+                f"({tot.get('fp_type','')})",
+            ]
+        lines.append("")
+        return "\n".join(lines)
 
     def _run_simulation_auto(self, flags=None, pin_node=None):
         """Corre DC + AC + mixto según flags y muestra todo en un panel."""
@@ -3470,7 +3911,19 @@ class MainWindow(QMainWindow):
         sim_components = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
 
         std_name = DEFAULT_LOGIC_STANDARD
-        out = ["═══ SIMULACIÓN AUTOMÁTICA ═══", f"  {flags.summary()}", ""]
+
+        # Detectar y mostrar el modo seleccionado automáticamente
+        _modes = []
+        if flags.has_dc:      _modes.append("DC")
+        if flags.has_ac:
+            _modes.append("AC-transient" if flags.has_nonlinear else "AC-fasorial")
+        if flags.has_digital: _modes.append("Digital")
+        if flags.has_bridges or flags.implicit_boundary_nodes:
+            _modes.append("Mixto")
+        _mode_str = " + ".join(_modes) if _modes else "—"
+
+        out = [f"═══ SIMULACIÓN ({_mode_str}) ═══",
+               f"  {flags.summary()}", ""]
         if flags.warnings:
             out.extend([f"  ⚠ {w}" for w in flags.warnings]); out.append("")
 
@@ -3525,21 +3978,73 @@ class MainWindow(QMainWindow):
         if flags.has_ac and analog_comps:
             freq = next((it.frequency for it in sim_components
                          if it.comp_type == "VAC"), 60.0)
-            ac = self.solver.solve_ac_single(analog_comps, freq)
-            out.append(f"── Fasores AC ({freq} Hz) ──")
-            if ac["success"]:
-                for node, V in sorted(ac["voltages"].items()):
-                    out.append(f"  V({node}) = {abs(V):.4f} V  ∠{_cmath.phase(V)*180/_cmath.pi:.2f}°")
-                t = ac.get("total", {})
-                if t:
-                    out += ["", "── Potencia total ──",
-                            f"  P={t.get('P',0):+.4f} W  Q={t.get('Q',0):+.4f} VAR",
-                            f"  S={t.get('S',0):.4f} VA  fp={t.get('fp',0):.4f} ({t.get('fp_type','')})"]
-                self._last_ac_result = ac
-                self.btn_power_triangle.setVisible(True)
+
+            if flags.has_nonlinear:
+                # Diodos/BJT/MOSFET con AC → análisis fasorial NO es válido
+                # (el componente no-lineal genera armónicos). Corremos
+                # transient durante varios ciclos y reportamos forma de onda
+                # estabilizada (último ciclo).
+                import numpy as _np
+                T        = 1.0 / freq if freq > 0 else 1e-3
+                n_cycles = 3
+                tr = self.solver.solve_transient(
+                    analog_comps,
+                    t_stop      = n_cycles * T,
+                    dt          = T / 200.0,
+                    method      = 'trapezoidal',
+                    adaptive    = True,
+                    nr_tol      = 1e-5,
+                    nr_max_iter = 30,
+                )
+                out.append(
+                    f"── Transitorio (no-lineal + AC, f={freq:g} Hz, "
+                    f"{n_cycles} ciclos) ──")
+                if tr["success"]:
+                    t_arr      = tr["time"]
+                    v_dict     = tr["voltages"]
+                    last_cycle = t_arr >= (n_cycles - 1) * T
+                    for node, v_arr in sorted(v_dict.items()):
+                        v_last = v_arr[last_cycle]
+                        if len(v_last) == 0:
+                            continue
+                        vmax  = float(v_last.max())
+                        vmin  = float(v_last.min())
+                        vmean = float(v_last.mean())
+                        vrms  = float(_np.sqrt(_np.mean(v_last ** 2)))
+                        out.append(
+                            f"  V({node}): pk=[{vmin:+.3f}, {vmax:+.3f}] V  "
+                            f"DC={vmean:+.3f} V  RMS={vrms:.3f} V")
+                    out.append(
+                        f"  pasos={tr['steps']}  "
+                        f"dt_avg={tr['dt_stats']['mean']*1e6:.1f} µs")
+
+                    # LEDs según corriente promedio en último ciclo (si la
+                    # corriente promedio del LED supera ~0.1 mA → encendido)
+                    self._update_leds_from_transient(
+                        sim_components, tr, last_cycle, pin_node)
+
+                    self._last_transient_result = tr
+                    self.btn_power_triangle.setVisible(False)
+                else:
+                    out.append(f"  ✗ {tr['error']}")
+                out.append("")
             else:
-                out.append(f"  ✗ {ac['error']}")
-            out.append("")
+                # Circuito lineal: análisis fasorial estándar (rápido y exacto)
+                ac = self.solver.solve_ac_single(analog_comps, freq)
+                out.append(f"── Fasores AC ({freq} Hz) ──")
+                if ac["success"]:
+                    for node, V in sorted(ac["voltages"].items()):
+                        out.append(f"  V({node}) = {abs(V):.4f} V  ∠{_cmath.phase(V)*180/_cmath.pi:.2f}°")
+                    t = ac.get("total", {})
+                    if t:
+                        out += ["", "── Potencia total ──",
+                                f"  P={t.get('P',0):+.4f} W  Q={t.get('Q',0):+.4f} VAR",
+                                f"  S={t.get('S',0):.4f} VA  fp={t.get('fp',0):.4f} ({t.get('fp_type','')})"]
+                    self._last_ac_result = ac
+                    self.btn_power_triangle.setVisible(True)
+                else:
+                    out.append(f"  ✗ {ac['error']}")
+                out.append("")
 
         # ── Mixto ─────────────────────────────────────────────────────────
         if flags.needs_mixed:
@@ -3627,6 +4132,35 @@ class MainWindow(QMainWindow):
         self.results_text.setPlainText("\n".join(out))
         self.scene.update()
 
+    def _update_leds_from_transient(self, sim_components, tr, last_cycle_mask,
+                                    pin_node):
+        """Enciende LEDs cuya tensión ánodo-cátodo promedio en el último ciclo
+        del transient supera el umbral de polarización directa."""
+        v_dict = tr.get("voltages", {})
+        if not v_dict:
+            return
+        vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
+                  'green':1.9,'blue':2.6,'white':2.6}
+        for item in sim_components:
+            if item.comp_type != "LED":
+                continue
+            n_a = item.node1.strip() or pin_node.get(f"{item.name}__p1", "")
+            n_k = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
+            v_a_arr = v_dict.get(n_a)
+            v_k_arr = v_dict.get(n_k) if n_k not in ('0','gnd','GND') else None
+            if v_a_arr is None:
+                continue
+            va = v_a_arr[last_cycle_mask] if hasattr(v_a_arr, '__getitem__') else v_a_arr
+            vk = (v_k_arr[last_cycle_mask] if v_k_arr is not None
+                  else 0.0)
+            try:
+                vd_avg = float((va - vk).mean()) if hasattr(va, 'mean') else float(va - vk)
+            except Exception:
+                vd_avg = 0.0
+            thr = vf_min.get(getattr(item, 'led_color', 'red'), 1.5)
+            item.led_on = vd_avg > thr
+            item.update()
+
     def _run_simulation_dc(self, silent: bool = False):
         components = []
         errors = []
@@ -3688,24 +4222,33 @@ class MainWindow(QMainWindow):
                 _on = _item.node1.strip() or pin_node.get(f"{_item.name}__p1", "")
                 if _on and _on not in ('0','gnd','GND'):
                     _dig_out_nodes.add(_on)
-        # Reunir todos los nodos que tienen driver analógico
+        # Reunir todos los nodos que tienen driver analógico activo
+        # (fuentes de voltaje/corriente, BJT/MOSFET/OpAmp). Los pasivos
+        # como R, L, C, Diode NO se cuentan como drivers — sólo aportan
+        # caminos pasivos.
         _analog_driver_nodes = set()
         for _c in components:
+            if _c.__class__.__name__ == 'Diode':
+                continue
             for _attr in ('n_pos','n_neg','n_p','n_n','n_out','n_in',
                           'n_base','n_collector','n_emitter',
                           'n_gate','n_drain','n_source'):
                 _nd = getattr(_c, _attr, None)
                 if _nd and _nd not in ('0','gnd','GND'):
                     _analog_driver_nodes.add(_nd)
-        # Quitar del netlist analógico los LED/Diodo cuyo ánodo
-        # solo está en nodos de salida digital sin otro driver analógico
+        # Quitar del netlist analógico los LED/Diodo cuyo ánodo está en
+        # un nodo de salida sólo-digital. Diode usa n_a (ánodo).
+        # Antes este filtro buscaba `n_p`/`n_pos` que Diode no tiene,
+        # por lo que nunca excluía nada — funcionaba sólo porque los
+        # nodos del diodo tampoco entraban al node_map. Tras corregir
+        # _build_maps, los diodos sí se estampan, así que el filtro
+        # tiene que usar el atributo correcto.
         components = [
             _c for _c in components
             if not (
-                getattr(_c, '__class__', None) is not None
-                and _c.__class__.__name__ == 'Diode'
-                and getattr(_c, 'n_p', getattr(_c, 'n_pos', '')) in _dig_out_nodes
-                and getattr(_c, 'n_p', getattr(_c, 'n_pos', '')) not in _analog_driver_nodes
+                _c.__class__.__name__ == 'Diode'
+                and getattr(_c, 'n_a', '') in _dig_out_nodes
+                and getattr(_c, 'n_a', '') not in _analog_driver_nodes
             )
         ]
 
@@ -4061,16 +4604,43 @@ class MainWindow(QMainWindow):
                 if item.comp_type == 'V':
                     components.append(VoltageSource(item.name, n1, n2, 0.0))
                     continue
-                # En AC pura, los diodos del puente rectificador no tienen
-                # sentido (son no-lineales) → omitir BRIDGE.
-                if item.comp_type == 'BRIDGE':
-                    errors.append(f"{item.name}: BRIDGE requiere análisis transitorio (no AC)")
-                    continue
                 # Validación específica
                 if item.comp_type == 'R' and item.value <= 0:
                     errors.append(f"{item.name}: R debe ser > 0")
                     continue
-                # Resto: helper centralizado (POT, XFMR, VAC, C, L, Z, I…)
+                # BRIDGE en AC: los diodos linealizados a Vd=0.6V actúan
+                # como cortos (gd≈4.7e7 S) y vuelven la matriz singular
+                # cuando el lado AC del puente está ligado al secundario
+                # flotante de un transformador. Reemplazamos por 4 resistencias
+                # de la misma topología que mantienen el sistema solvable
+                # sin "shortear" entre sí los nodos AC1, AC2, DC+ y DC-.
+                # La rectificación verdadera no se puede representar en
+                # análisis fasorial; la salida DC real se reporta en
+                # post-proceso (sección "Puentes rectificadores").
+                if item.comp_type == 'BRIDGE':
+                    auto_n3 = pin_node.get(f"{item.name}__p3", f'dcp_{item.name}')
+                    auto_n4 = pin_node.get(f"{item.name}__p4", f'dcn_{item.name}')
+                    n3_b = (item.node3.strip() if hasattr(item, 'node3') and item.node3.strip()
+                            else auto_n3)
+                    n4_b = (item.node4.strip() if hasattr(item, 'node4') and item.node4.strip()
+                            else auto_n4)
+                    R_BR = 1e4   # 10 kΩ — preserva topología sin cortocircuitar
+                    components.append(Resistor(f'{item.name}_R1', n1,   n3_b, R_BR))
+                    components.append(Resistor(f'{item.name}_R2', n2,   n3_b, R_BR))
+                    components.append(Resistor(f'{item.name}_R3', n4_b, n1,   R_BR))
+                    components.append(Resistor(f'{item.name}_R4', n4_b, n2,   R_BR))
+                    continue
+                # Transformador: tie a tierra de alta impedancia en la
+                # primaria (lado −) para evitar matriz singular cuando el
+                # usuario no la conecta explícitamente a GND. 1 MΩ apenas
+                # carga al circuito (Iref ≈ V/1MΩ) pero define el modo
+                # común y permite resolver el AC.
+                if item.comp_type == 'XFMR':
+                    components.extend(build_engine_components_for_item(item, pin_node))
+                    components.append(Resistor(
+                        f'{item.name}_GREF', n2, '0', 1e6))
+                    continue
+                # Resto: helper centralizado (POT, VAC, C, L, Z, I…)
                 components.extend(build_engine_components_for_item(item, pin_node))
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
@@ -4102,6 +4672,131 @@ class MainWindow(QMainWindow):
             mag   = abs(V)
             phase = cmath.phase(V) * 180 / cmath.pi
             out.append(f"  V({node}) = {mag:.4f} V  ∠{phase:.2f}°")
+
+        # ── Rectificación: análisis híbrido AC + DC ───────────────────────
+        # El fasor AC no representa rectificación (es no-lineal). Para que
+        # el puente "funcione de verdad" tras el AC corremos una segunda
+        # solución DC en la que:
+        #   • cada VAC contribuye 0 V (componente DC de la senoide)
+        #   • cada BRIDGE se reemplaza por una VoltageSource(DC+, DC−)
+        #     cuyo valor es V_pk − 2·Vf, calculado a partir del fasor que
+        #     vio el puente en el AC. Así LEDs/resistencias/cargas en el
+        #     lado DC ven tensión DC real y el circuito “rectifica”.
+        bridges = [it for it in sim_comps if it.comp_type == 'BRIDGE']
+        bridge_vdc: Dict[str, float] = {}
+        if bridges:
+            out.append("\n── Puentes rectificadores (salida DC) ──")
+            import math as _m
+            for br in bridges:
+                a1 = br.node1.strip() or pin_node.get(f"{br.name}__p1", "")
+                a2 = br.node2.strip() or pin_node.get(f"{br.name}__p2", "")
+                d_p = br.node3.strip() or pin_node.get(f"{br.name}__p3", "")
+                d_n = (br.node4.strip()
+                       if hasattr(br, 'node4') else
+                       pin_node.get(f"{br.name}__p4", "")) \
+                      or pin_node.get(f"{br.name}__p4", "")
+                v1 = result['voltages'].get(a1, 0+0j)
+                v2 = result['voltages'].get(a2, 0+0j)
+                # Las tensiones del solver están en Vrms (fasor = Vrms·e^jφ).
+                v_rms = abs(v1 - v2)
+                v_pk  = v_rms * (2 ** 0.5)
+                vf    = float(getattr(br, 'bridge_vf', 0.7) or 0.7)
+                v_dc_peak = max(0.0, v_pk - 2 * vf)
+                v_dc_avg  = max(0.0, (2.0 / _m.pi) * v_pk - 2 * vf)
+                bridge_vdc[br.name] = v_dc_peak
+                out.append(f"  {br.name} (V_f = {vf:.2f} V por diodo):")
+                out.append(f"    V_AC entre AC1-AC2 : {v_rms:.4f} Vrms ({v_pk:.4f} Vpk)")
+                out.append(f"    V_DC con filtro    ≈ {v_dc_peak:.4f} V"
+                           f"  (pico − 2·Vf, salida {d_p} − {d_n})")
+                out.append(f"    V_DC sin filtro    ≈ {v_dc_avg:.4f} V"
+                           f"  (promedio onda completa)")
+                br.result_voltage = v_dc_peak
+
+            # ── Construir circuito DC con el puente como fuente ideal ────
+            dc_components = []
+            for it in sim_comps:
+                if it.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT', 'GND', 'NODE'):
+                    continue
+                if it.comp_type in ComponentItem.DIGITAL_TYPES:
+                    continue
+                a1 = it.node1.strip() or pin_node.get(f"{it.name}__p1", f'iso_{it.name}_p')
+                a2 = it.node2.strip() or pin_node.get(f"{it.name}__p2", '0')
+                if it.comp_type == 'V':
+                    dc_components.append(VoltageSource(it.name, a1, a2, it.value))
+                    continue
+                if it.comp_type == 'VAC':
+                    # AC source en DC = 0 V (valor medio de la senoidal)
+                    dc_components.append(VoltageSource(it.name, a1, a2, 0.0))
+                    continue
+                if it.comp_type == 'BRIDGE':
+                    d_p_b = it.node3.strip() or pin_node.get(f"{it.name}__p3", f'dcp_{it.name}')
+                    d_n_b = (it.node4.strip() if hasattr(it,'node4') and it.node4.strip()
+                             else pin_node.get(f"{it.name}__p4", f'dcn_{it.name}'))
+                    vdc = bridge_vdc.get(it.name, 0.0)
+                    # Fuente DC ideal entre DC+ y DC− equivalente al rectificado.
+                    dc_components.append(
+                        VoltageSource(f'{it.name}_DC', d_p_b, d_n_b, vdc))
+                    # Mantener AC1/AC2 referenciados a DC− vía resistencia
+                    # alta. Sin esto, el secundario del transformador queda
+                    # flotando en la etapa DC y la matriz se vuelve singular.
+                    dc_components.append(Resistor(
+                        f'{it.name}_GR1', a1, d_n_b, 1e6))
+                    dc_components.append(Resistor(
+                        f'{it.name}_GR2', a2, d_n_b, 1e6))
+                    continue
+                # XFMR en DC: cada devanado es R_winding (no acopla AC→DC),
+                # añadimos también la referencia a tierra para que no flote.
+                if it.comp_type == 'XFMR':
+                    dc_components.extend(build_engine_components_for_item(it, pin_node))
+                    dc_components.append(Resistor(
+                        f'{it.name}_GREF_DC', a2, '0', 1e6))
+                    continue
+                if it.comp_type == 'R' and it.value <= 0:
+                    continue
+                # Resto: igual que en DC normal
+                try:
+                    dc_components.extend(build_engine_components_for_item(it, pin_node))
+                except Exception:
+                    pass
+
+            if dc_components:
+                dc_solver = MNASolver()
+                dc_res = dc_solver.solve_dc(dc_components)
+                if dc_res.get('success'):
+                    out.append("")
+                    out.append("── Voltajes DC del lado rectificado ──")
+                    for node, v in sorted(dc_res['voltages'].items()):
+                        out.append(f"  V({node}) = {v:+.4f} V")
+                    if dc_res.get('branch_currents'):
+                        out.append("")
+                        out.append("── Corrientes DC ──")
+                        for name, i in dc_res['branch_currents'].items():
+                            out.append(f"  I({name}) = {i*1000:+.4f} mA")
+                    # Encender LEDs cuyos nodos quedaron polarizados con
+                    # corriente directa real. Esto refleja en pantalla que
+                    # el LED está conduciendo a la salida del puente.
+                    op = dc_res.get('operating_points', {}) or {}
+                    for it in sim_comps:
+                        if it.comp_type != 'LED':
+                            continue
+                        a1 = it.node1.strip() or pin_node.get(f"{it.name}__p1", '')
+                        a2 = it.node2.strip() or pin_node.get(f"{it.name}__p2", '0')
+                        Id_op = (op.get(it.name, {}) or {}).get('Id') \
+                                or (op.get(it.name, {}) or {}).get('id')
+                        on = False
+                        if Id_op is not None:
+                            on = float(Id_op) > 1e-4
+                        else:
+                            v_a = dc_res['voltages'].get(a1, 0.0)
+                            v_k = dc_res['voltages'].get(a2, 0.0)
+                            vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
+                                      'green':1.9,'blue':2.6,'white':2.6}
+                            thr = vf_min.get(getattr(it,'led_color','red'), 1.5)
+                            on = (v_a - v_k) > thr
+                        it.led_on = on
+                        it.update()
+                else:
+                    out.append(f"\n  ⚠ Análisis DC del lado rectificado falló: {dc_res.get('error')}")
 
         # ── Potencias por componente ──────────────────────────────────────
         out.append("\n── Potencias por componente ──")
@@ -4457,7 +5152,7 @@ class MainWindow(QMainWindow):
             "Circuito demo: divisor de voltaje\n"
             "V1=10V, R1=R2=1kΩ\n\n"
             "Esperado: V(B) = 5.0 V\n\n"
-            "Presiona ▶ SIMULAR AUTO para verificar.\n\n"
+            "Presiona ▶ SIMULAR para verificar.\n\n"
             "Tip: doble-click sobre un componente\npara editar sus nodos y valores."
         )
 
@@ -4514,6 +5209,8 @@ class MainWindow(QMainWindow):
                 'x':     item.pos().x(),
                 'y':     item.pos().y(),
                 'angle': item._angle,
+                'flip_x': item._flip_x,
+                'flip_y': item._flip_y,
             }
             if item.comp_type == 'VAC':
                 entry['frequency'] = item.frequency
@@ -4565,9 +5262,13 @@ class MainWindow(QMainWindow):
                 node3=c.get('node3', '')
             )
             angle = c.get('angle', 0)
-            if angle:
+            flip_x = bool(c.get('flip_x', False))
+            flip_y = bool(c.get('flip_y', False))
+            if angle or flip_x or flip_y:
                 item._angle = angle
-                item.setRotation(angle)
+                item._flip_x = flip_x
+                item._flip_y = flip_y
+                item._apply_transform()
             if c['type'] == 'VAC':
                 item.frequency = c.get('frequency', 60.0)
                 item.phase_deg = c.get('phase_deg', 0.0)

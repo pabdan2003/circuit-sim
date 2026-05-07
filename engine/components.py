@@ -23,6 +23,16 @@ class Component:
         """Estampa la contribución del componente en G e I."""
         raise NotImplementedError
 
+    def stamp_transient(self, G: np.ndarray, I: np.ndarray, node_map: dict,
+                        t: float, branch_idx: Optional[int] = None):
+        """Estampa la contribución en un instante `t` del análisis transitorio.
+
+        Por defecto delega a stamp() — los componentes constantes en el tiempo
+        (R, V, I, etc.) no necesitan sobreescribirlo. Solo los que varían con
+        el tiempo (VoltageSourceAC, fuentes pulsadas, etc.) lo redefinen.
+        """
+        self.stamp(G, I, node_map, branch_idx=branch_idx)
+
     def needs_branch(self) -> bool:
         """True si el componente requiere variable de rama (ej: fuente de voltaje)."""
         return False
@@ -329,6 +339,26 @@ class VoltageSourceAC(Component):
             G[nn, k] -= 1.0
             G[k, nn] -= 1.0
         I[k] += self.phasor
+
+    def stamp_transient(self, G, I, node_map, t: float, branch_idx=None):
+        """En transitorio estampa v(t) = Vpeak·sin(2π·f·t + φ) como fuente ideal."""
+        import math
+        np_ = node_map.get(self.n_pos)
+        nn  = node_map.get(self.n_neg)
+        k   = branch_idx
+        if k is None:
+            raise ValueError(f"VoltageSourceAC {self.name}: branch_idx requerido")
+        if np_ is not None:
+            G[np_, k] += 1.0
+            G[k, np_] += 1.0
+        if nn is not None:
+            G[nn, k] -= 1.0
+            G[k, nn] -= 1.0
+        v_t = self.Vpeak * math.sin(2.0 * math.pi * self.frequency * t
+                                    + math.radians(self.phase_deg))
+        I[k] += v_t
+
+
 class Diode(Component):
     """
     Diodo con modelo de Shockley: I = Is·(exp(Vd / (n·Vt)) − 1)
@@ -1017,3 +1047,44 @@ class Transformer(Component):
         if c is not None: G[k, c] -= n
         if d is not None: G[k, d] += n
         # I[k] = 0 (no excitación)
+
+    # ── Transitorio: mismas ecuaciones del transformador ideal ──────────
+    def stamp_transient(self, G, I, node_map, t: float, branch_idx=None):
+        """
+        En transitorio, el transformador ideal usa las MISMAS ecuaciones
+        que en AC (la relación V_p = n·V_s y I_s = -n·I_p es independiente
+        de la frecuencia para un transformador ideal acoplado magnéticamente).
+
+        Sin este método se cae al `stamp` DC, que NO acopla primario y
+        secundario y deja la salida en 0V — rompiendo cualquier circuito
+        rectificador en simulación live.
+
+        Además se añade una pequeña conductancia de fuga a tierra (g_leak)
+        en cada terminal de los devanados.  Físicamente representa la
+        capacitancia parásita / resistencia de aislamiento al núcleo.
+        Numéricamente, evita la singularidad cuando el secundario está
+        "flotando" antes de que los diodos del puente conduzcan.
+        """
+        if branch_idx is None:
+            return
+        n  = self.ratio
+        a  = node_map.get(self.n_p1)
+        b  = node_map.get(self.n_p2)
+        c  = node_map.get(self.n_s1)
+        d  = node_map.get(self.n_s2)
+        k  = branch_idx
+
+        if a is not None: G[a, k] += 1.0
+        if b is not None: G[b, k] -= 1.0
+        if c is not None: G[c, k] -= n
+        if d is not None: G[d, k] += n
+
+        if a is not None: G[k, a] += 1.0
+        if b is not None: G[k, b] -= 1.0
+        if c is not None: G[k, c] -= n
+        if d is not None: G[k, d] += n
+
+        g_leak = 1e-9
+        for nd in (a, b, c, d):
+            if nd is not None:
+                G[nd, nd] += g_leak
