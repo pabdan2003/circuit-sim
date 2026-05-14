@@ -1,5 +1,5 @@
 """
-CircuitSim — Simulador de circuitos open source
+PyNode — Simulador de circuitos open source
 GUI principal con canvas drag-and-drop, PyQt6
 """
 
@@ -9,6 +9,7 @@ import json
 import os
 import re
 import html
+import numpy as np
 from itertools import combinations
 from typing import Optional, List, Dict, Tuple
 
@@ -86,14 +87,31 @@ from ui.scene import CircuitScene, build_engine_components_for_item
 # ══════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
     # ── Constantes de simulación live ────────────────────────────────
-    _LIVE_TIME_SCALE         = 0.1   # 10x slow-motion (a 60 Hz: 1 ciclo cada ~167 ms reales)
+    _LIVE_TIME_SCALE         = 0.1   # 10x slow-motion deseado a baja frecuencia
     _LIVE_TICK_MS            = 50    # 20 Hz refresh visual
     _LIVE_PANEL_REFRESH_TICKS = 5    # Texto del panel cada N ticks (~250 ms)
+
+    # Tope duro de pasos del solver por tick. Limita el CPU por tick a
+    # ~80-150 ms en Python puro, lo que mantiene la UI fluida incluso en
+    # circuitos con elementos no-lineales (LED, diodos) que requieren
+    # varias iteraciones de Newton-Raphson por paso.
+    _LIVE_MAX_STEPS_PER_TICK = 600
+    # Muestras por período de la onda más rápida. 12 es suficiente para
+    # que el ojo vea una senoidal limpia; más resolución solo gasta CPU.
+    _LIVE_SAMPLES_PER_PERIOD = 12
+
+    # Tolerancias del control adaptativo de paso (LTE) en modo live.
+    # Estrictas (1e-6, 1e-3) hacen que el solver achique dt en cascada
+    # cuando un LED conmuta — relajadas dan <1% de error visual pero
+    # corren ~50x más rápido. Display en vivo prioriza fluidez.
+    _LIVE_TOL_ABS = 1e-3
+    _LIVE_TOL_REL = 5e-2
+    _LIVE_NR_TOL  = 1e-4
     _DC_TICK_MS              = 200   # Intervalo del tick DC (igual que antes)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CircuitSim — Simulador de Circuitos")
+        self.setWindowTitle("PyNode — Simulador de Circuitos")
         self.resize(1280, 800)
         self.solver = MNASolver()
         self._sim_running = False
@@ -405,6 +423,7 @@ class MainWindow(QMainWindow):
         scene.component_selected.connect(self._on_component_selected)
         scene.status_message.connect(self.statusBar().showMessage)
         scene.logic_state_toggled.connect(self._on_logic_state_toggled)
+        scene.instrument_changed.connect(self._on_instrument_changed)
 
         view = QGraphicsView(scene)
         view.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -628,13 +647,19 @@ class MainWindow(QMainWindow):
                 ('BJT_PNP', 'BJT PNP',               '━(PNP)'),
                 ('NMOS',    'MOSFET N',              '━[N]━'),
                 ('PMOS',    'MOSFET P',              '━[P]━'),
-                ('OPAMP',   'Op-Amp',                '━[▷]━'),
+                ('OPAMP',   'Op-Amp (ideal)',         '━[▷]━'),
+                ('TL082',   'TL082 (op-amp dual)',   '━[▷²]━'),
             ]),
             ("Referencia", [
                 ('GND',          'Tierra',          '⏚'),
                 ('NODE',         'Nodo',            '•'),
                 ('NET_LABEL_IN',  'Net Label Entrada', '→▷'),
                 ('NET_LABEL_OUT', 'Net Label Salida',  '◁→'),
+            ]),
+            ("Instrumentos", [
+                ('FGEN', 'Generador de funciones', '⎍'),
+                ('OSC',  'Osciloscopio (2 canales)', '∿▥'),
+                ('MULTIMETER', 'Multímetro', '[V/A]'),
             ]),
             ("Digital", [
                 ('AND',       'Puerta AND',     '&'),
@@ -923,6 +948,10 @@ class MainWindow(QMainWindow):
                 if item.comp_type == 'LED':
                     item.led_on = False
                     item.update()
+                elif item.comp_type == 'MULTIMETER':
+                    item.meter_reading = None
+                    item.update()
+        self._refresh_open_multimeter_panels()
 
     def _tick_simulation(self):
         """Llamado por QTimer: dispatcher por modo."""
@@ -970,9 +999,10 @@ class MainWindow(QMainWindow):
             self._stop_simulation()
             return
 
-        # Frecuencia más alta de las VAC (rige el dt interno)
-        freq = max((it.frequency for it in sim_components
-                    if it.comp_type == 'VAC'), default=60.0)
+        # Frecuencia más alta entre todas las fuentes periódicas (VAC y FGEN).
+        # Rige el dt interno y, junto con _LIVE_MAX_STEPS_PER_TICK, el
+        # tiempo simulado por tick.
+        freq = self._max_ac_source_frequency(sim_components) or 60.0
 
         # ── Snapshot fasorial inicial (solo circuitos lineales) ───────
         # El triángulo de potencia y los fasores P/Q/S solo tienen sentido
@@ -1000,6 +1030,14 @@ class MainWindow(QMainWindow):
         self._live_tick_count  = 0
         self._sim_mode         = 'live_transient'
         self._sim_running      = True
+        # NOTA sobre adaptive: la trapezoidal es A-estable pero NO L-estable.
+        # Para circuitos muy stiff (op-amps con A=1e5) el adaptativo es
+        # imprescindible para que la trapezoidal no oscile. No lo desactivamos.
+        #
+        # Solo el tope de iteraciones NR varía con el circuito: los diodos
+        # exponenciales pueden requerir más pasos para converger que un
+        # circuito puramente lineal.
+        self._live_nr_max = 40 if flags.has_nonlinear else 20
 
         self.run_btn.setText("■  DETENER")
         self.run_btn.setChecked(True)
@@ -1009,7 +1047,7 @@ class MainWindow(QMainWindow):
         msg = [
             f"═══ SIMULACIÓN LIVE (transient continuo, ×{self._LIVE_TIME_SCALE:g}) ═══",
             f"  {flags.summary()}",
-            f"  f_VAC = {self._live_freq:g} Hz  ·  paso real {self._LIVE_TICK_MS} ms"
+            f"  f_AC = {self._live_freq:g} Hz  ·  paso real {self._LIVE_TICK_MS} ms"
             f"  ·  paso simulado {self._LIVE_TICK_MS * self._LIVE_TIME_SCALE:.2f} ms",
             "",
         ]
@@ -1027,18 +1065,37 @@ class MainWindow(QMainWindow):
         self.results_text.setPlainText("\n".join(msg))
 
     def _tick_live_transient(self):
-        """Avanza el solver `dt_sim` segundos y actualiza la UI."""
+        """Avanza el solver `dt_sim` segundos y actualiza la UI.
+
+        Estrategia para mantener la UI fluida en cualquier frecuencia:
+          1. `dt_internal` se elige para tener ~50 muestras por período
+             de la onda más rápida (resolución suficiente para osciloscopio).
+          2. `dt_advance` arranca como `tick_ms · TIME_SCALE` (slow-motion
+             a baja frecuencia, igual que antes).
+          3. Si esa combinación produce más de MAX_STEPS pasos del solver
+             por tick, se recorta `dt_advance` para respetar el tope.
+             Esto se traduce en "menos tiempo simulado por frame" cuando
+             la frecuencia sube — la onda se ve "rápida" pero fluida.
+        """
         if self._live_components is None:
             return
 
-        # Tiempo simulado a avanzar este tick (tiempo real * factor escala)
-        dt_advance = (self._LIVE_TICK_MS / 1000.0) * self._LIVE_TIME_SCALE
+        T_freq = 1.0 / max(self._live_freq, 1e-6)
+        # dt_internal = T / SAMPLES_PER_PERIOD para evitar aliasing.
+        # Antes había un piso de 50 ns "para no exigir absurdos", pero eso
+        # provocaba aliasing salvaje para señales >1.67 MHz (T/12=50ns).
+        # El piso real lo da MAX_STEPS_PER_TICK: cuanto más alta la freq,
+        # menos tiempo simulado por tick — el CPU/tick queda acotado igual.
+        dt_internal = max(T_freq / self._LIVE_SAMPLES_PER_PERIOD, 1e-11)
 
-        # Paso interno: ~200 muestras por ciclo de la VAC, pero acotado
-        # superiormente a dt_advance/4 para que tengamos al menos 4 puntos
-        # por tick (suaviza el ruido de la integración).
-        T_freq      = 1.0 / self._live_freq
-        dt_internal = max(min(T_freq / 200.0, dt_advance / 4.0), 1e-7)
+        # Tiempo simulado deseado por tick (slow-motion a baja frecuencia)
+        dt_advance_ideal = (self._LIVE_TICK_MS / 1000.0) * self._LIVE_TIME_SCALE
+
+        # Tope por costo de CPU: nunca más de MAX_STEPS pasos del solver
+        dt_advance_cap = self._LIVE_MAX_STEPS_PER_TICK * dt_internal
+        dt_advance = min(dt_advance_ideal, dt_advance_cap)
+        # Al menos 4 pasos por tick (mantiene la integración estable)
+        dt_advance = max(dt_advance, dt_internal * 4)
 
         t_start = float(self._live_state['t']) if self._live_state else 0.0
 
@@ -1048,10 +1105,15 @@ class MainWindow(QMainWindow):
             dt            = dt_internal,
             method        = 'trapezoidal',
             adaptive      = True,
+            tol_abs       = self._LIVE_TOL_ABS,
+            tol_rel       = self._LIVE_TOL_REL,
+            # dt_min bajo: durante la conmutación de un diodo el NR puede
+            # necesitar pasos de nanosegundos para converger.
+            dt_min        = 1e-10,
             t_start       = t_start,
             initial_state = self._live_state,
-            nr_tol        = 1e-5,
-            nr_max_iter   = 30,
+            nr_tol        = self._LIVE_NR_TOL,
+            nr_max_iter   = self._live_nr_max,
         )
 
         if not tr.get('success'):
@@ -1071,22 +1133,78 @@ class MainWindow(QMainWindow):
         if self._live_tick_count % self._LIVE_PANEL_REFRESH_TICKS == 0:
             self._refresh_live_panel(tr)
 
+        # Empujar muestras a los instrumentos abiertos (osciloscopios, etc.)
+        self._push_to_open_instruments(tr)
+
+    def _push_to_open_instruments(self, tr):
+        """Notifica a cada panel de instrumento abierto que llegó un nuevo
+        bloque de muestras del solver. Sólo los OSC consumen este flujo
+        por ahora."""
+        pin_node = self._live_pin_node or {}
+        # Si hay varias hojas, recorremos sólo la escena activa para evitar
+        # alimentar OSC de otras hojas con voltajes que no corresponden.
+        for item in self.scene.components:
+            if item.comp_type != 'OSC':
+                continue
+            dlg = getattr(item, '_panel_dialog', None)
+            if dlg is None or not dlg.isVisible():
+                continue
+            try:
+                dlg.push_samples(tr, pin_node)
+            except Exception:
+                # Un fallo en un instrumento no debe matar el live transient.
+                pass
+
+    @staticmethod
+    def _estimate_led_current(vd, color: str = 'red'):
+        """Corriente directa estimada con los mismos presets del LED MNA."""
+        led_params = {
+            'red':    (1.0e-18, 2.0, 5.0),
+            'orange': (1.0e-19, 2.1, 5.0),
+            'yellow': (1.0e-20, 2.2, 5.0),
+            'green':  (1.0e-23, 2.5, 5.0),
+            'blue':   (1.0e-27, 3.0, 5.0),
+            'white':  (1.0e-27, 3.0, 5.0),
+        }
+        Is, n, vd_max = led_params.get(color, led_params['red'])
+        vd_arr = np.asarray(vd, dtype=float)
+        vd_arr = np.clip(vd_arr, -50.0, vd_max)
+        current = Is * (np.exp(vd_arr / (n * 0.02585)) - 1.0)
+        return np.maximum(current, 0.0)
+
     def _update_items_from_live(self, tr):
-        """Actualiza cada componente con el último valor instantáneo."""
+        """Actualiza cada componente con el último valor instantáneo.
+
+        Para LEDs en señales AC, decidir el on/off según `arr[-1]` no sirve
+        (cae en una fase aleatoria), y usar el pico es demasiado sensible
+        a transitorios numéricos. Usamos corriente media estimada con el
+        mismo modelo del LED; si supera ~0.1 mA, lo dibujamos encendido.
+        """
         v_dict   = tr.get('voltages', {})
         if not v_dict:
             return
         sim_components = self._sim_all_comps or list(self.scene.components)
         pin_node = self._live_pin_node or {}
 
-        vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
-                  'green':1.9,'blue':2.6,'white':2.6}
-
-        def _v(node):
+        def _last(node):
             arr = v_dict.get(node)
             if arr is None or len(arr) == 0:
                 return 0.0
             return float(arr[-1])
+
+        def _vd_array(n_a, n_k):
+            """Array de Vd = V_a - V_k sobre las muestras del bloque."""
+            arr_a = v_dict.get(n_a)
+            if arr_a is None or len(arr_a) == 0:
+                return None
+            arr_a = np.asarray(arr_a)
+            if n_k in ('0', 'gnd', 'GND', ''):
+                return arr_a
+            arr_k = v_dict.get(n_k)
+            if arr_k is None:
+                return arr_a
+            n = min(len(arr_a), len(arr_k))
+            return arr_a[-n:] - np.asarray(arr_k[-n:])
 
         for item in sim_components:
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
@@ -1097,17 +1215,110 @@ class MainWindow(QMainWindow):
             n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", "")
             n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
 
-            v_a = _v(n1) if n1 else None
-            v_k = _v(n2) if n2 not in ('0', 'gnd', 'GND', '') else 0.0
+            v_a = _last(n1) if n1 else None
+            v_k = _last(n2) if n2 not in ('0', 'gnd', 'GND', '') else 0.0
 
             if v_a is not None:
                 item.result_voltage = v_a
 
-            if item.comp_type == 'LED' and v_a is not None:
-                thr = vf_min.get(getattr(item, 'led_color', 'red'), 1.5)
-                item.led_on = (v_a - v_k) > thr
+            if item.comp_type == 'LED' and n1:
+                vd = _vd_array(n1, n2)
+                if vd is None or len(vd) == 0:
+                    item.led_on = False
+                else:
+                    # Corriente media visible (~0.1 mA como umbral visual).
+                    i_led = self._estimate_led_current(
+                        vd, getattr(item, 'led_color', 'red'))
+                    item.led_on = float(np.mean(i_led)) > 1e-4
+
+            if item.comp_type == 'MULTIMETER' and n1:
+                vd = _vd_array(n1, n2)
+                if vd is not None and len(vd) > 0:
+                    self._update_multimeter_from_array(item, vd)
 
             item.update()
+
+        self._refresh_open_multimeter_panels()
+
+    # ── Multímetro: actualización de lecturas ─────────────────────────────
+    def _multimeter_internal_R(self, item) -> float:
+        return 1e-3 if getattr(item, 'meter_quantity', 'V') == 'A' else 1e7
+
+    def _apply_meter_reading(self, item, val: float):
+        """Aplica `val` (V o A) al item según su modo, ajustando la unidad
+        del display. Para A modo, `val` ya debe ser corriente (no voltaje)."""
+        qty = getattr(item, 'meter_quantity', 'V')
+        if qty == 'V':
+            item.meter_reading = float(val)
+            item.meter_reading_unit_hint = 'V'
+        elif qty == 'A':
+            item.meter_reading = float(val)
+            item.meter_reading_unit_hint = 'A'
+        else:
+            item.meter_reading = None
+            item.meter_reading_unit_hint = 'Ω'
+
+    def _update_multimeter_from_array(self, item, vd_arr):
+        """Calcula la lectura a partir de una ventana de muestras V_p+ − V_p−.
+        DC coupling → media · AC coupling → RMS de la componente alterna."""
+        import numpy as _np
+        arr = _np.asarray(vd_arr, dtype=float)
+        cpl = getattr(item, 'meter_coupling', 'DC')
+        if cpl == 'DC':
+            val = float(_np.mean(arr))
+        else:
+            mean = float(_np.mean(arr))
+            ac_part = arr - mean
+            val = float(_np.sqrt(_np.mean(ac_part * ac_part)))
+        qty = getattr(item, 'meter_quantity', 'V')
+        if qty == 'A':
+            val = val / self._multimeter_internal_R(item)
+        self._apply_meter_reading(item, val)
+
+    def _update_multimeter_from_dc(self, item, n1, n2, dc_voltages):
+        """Lectura desde un resultado DC. En AC coupling, sólo DC → 0."""
+        v1 = float(dc_voltages.get(n1, 0.0)) if n1 not in ('0', 'gnd', 'GND') else 0.0
+        v2 = float(dc_voltages.get(n2, 0.0)) if n2 not in ('0', 'gnd', 'GND') else 0.0
+        dv = v1 - v2
+        cpl = getattr(item, 'meter_coupling', 'DC')
+        if cpl == 'AC':
+            val = 0.0
+        else:
+            val = dv
+        qty = getattr(item, 'meter_quantity', 'V')
+        if qty == 'A':
+            val = val / self._multimeter_internal_R(item)
+        self._apply_meter_reading(item, val)
+
+    def _update_multimeter_from_ac(self, item, n1, n2, ac_voltages):
+        """Lectura desde un snapshot AC (fasores RMS). En DC coupling → 0."""
+        V1 = ac_voltages.get(n1, 0.0 + 0.0j) if n1 not in ('0', 'gnd', 'GND') else 0.0 + 0.0j
+        V2 = ac_voltages.get(n2, 0.0 + 0.0j) if n2 not in ('0', 'gnd', 'GND') else 0.0 + 0.0j
+        cpl = getattr(item, 'meter_coupling', 'DC')
+        if cpl == 'DC':
+            val = 0.0
+        else:
+            val = abs(V1 - V2)
+        qty = getattr(item, 'meter_quantity', 'V')
+        if qty == 'A':
+            val = val / self._multimeter_internal_R(item)
+        self._apply_meter_reading(item, val)
+
+    def _refresh_open_multimeter_panels(self):
+        """Refresca cada panel abierto de multímetro para que muestre la lectura
+        recién calculada. Llamado desde los flujos de simulación."""
+        for sheet in self._sheets:
+            for item in sheet['scene'].components:
+                if item.comp_type != 'MULTIMETER':
+                    continue
+                dlg = getattr(item, '_panel_dialog', None)
+                if dlg is None:
+                    continue
+                try:
+                    if dlg.isVisible():
+                        dlg._refresh_display()
+                except Exception:
+                    pass
 
     def _refresh_live_panel(self, tr):
         """Actualiza el panel de texto con voltajes instantáneos y tiempo."""
@@ -1243,7 +1454,7 @@ class MainWindow(QMainWindow):
         # ── AC ────────────────────────────────────────────────────────────
         if flags.has_ac and analog_comps:
             freq = next((it.frequency for it in sim_components
-                         if it.comp_type == "VAC"), 60.0)
+                         if it.comp_type in ("VAC", "FGEN")), 60.0)
 
             if flags.has_nonlinear:
                 # Diodos/BJT/MOSFET con AC → análisis fasorial NO es válido
@@ -1400,13 +1611,10 @@ class MainWindow(QMainWindow):
 
     def _update_leds_from_transient(self, sim_components, tr, last_cycle_mask,
                                     pin_node):
-        """Enciende LEDs cuya tensión ánodo-cátodo promedio en el último ciclo
-        del transient supera el umbral de polarización directa."""
+        """Enciende LEDs cuya corriente media en el último ciclo supera ~0.1 mA."""
         v_dict = tr.get("voltages", {})
         if not v_dict:
             return
-        vf_min = {'red':1.5,'orange':1.7,'yellow':1.8,
-                  'green':1.9,'blue':2.6,'white':2.6}
         for item in sim_components:
             if item.comp_type != "LED":
                 continue
@@ -1420,11 +1628,12 @@ class MainWindow(QMainWindow):
             vk = (v_k_arr[last_cycle_mask] if v_k_arr is not None
                   else 0.0)
             try:
-                vd_avg = float((va - vk).mean()) if hasattr(va, 'mean') else float(va - vk)
+                vd = va - vk
+                i_led = self._estimate_led_current(
+                    vd, getattr(item, 'led_color', 'red'))
+                item.led_on = float(np.mean(i_led)) > 1e-4
             except Exception:
-                vd_avg = 0.0
-            thr = vf_min.get(getattr(item, 'led_color', 'red'), 1.5)
-            item.led_on = vd_avg > thr
+                item.led_on = False
             item.update()
 
     def _run_simulation_dc(self, silent: bool = False):
@@ -1615,6 +1824,9 @@ class MainWindow(QMainWindow):
                     item.result_voltage = result['voltages'][n1]
                 else:
                     item.result_voltage = None
+                if item.comp_type == 'MULTIMETER':
+                    self._update_multimeter_from_dc(
+                        item, n1, n2, result['voltages'])
                 if item.comp_type == 'LED':
                     led_on = False
                     op = result.get('operating_points', {}).get(item.name, {})
@@ -1671,6 +1883,7 @@ class MainWindow(QMainWindow):
             self.results_text.setPlainText('\n'.join(out))
         for sheet in self._sheets:
             sheet['scene'].update()
+        self._refresh_open_multimeter_panels()
 
 
     def _evaluate_digital_gates(self, pin_node, dc_voltages, silent=False, out=None, sim_comps=None):
@@ -1836,16 +2049,16 @@ class MainWindow(QMainWindow):
         sim_comps = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
         pin_node = getattr(self, '_sim_pin_node', None) or self.scene.extract_netlist()
 
-        # Buscar fuente VAC en el canvas para leer la frecuencia
-        vac_items = [it for it in sim_comps if it.comp_type == 'VAC']
-        if not vac_items:
+        # Buscar fuente AC en el canvas para leer la frecuencia
+        ac_items = [it for it in sim_comps if it.comp_type in ('VAC', 'FGEN')]
+        if not ac_items:
             self.results_text.setPlainText(
-                "⚠  No hay fuentes VAC en el circuito.\n"
-                "Agrega una fuente VAC (barra de componentes → Fuentes) para el análisis AC.")
+                "⚠  No hay fuentes AC en el circuito.\n"
+                "Agrega una fuente VAC o FGEN para el análisis AC.")
             return
 
-        # Usar la frecuencia de la primera VAC como referencia
-        freq_default = vac_items[0].frequency
+        # Usar la frecuencia de la primera fuente AC como referencia
+        freq_default = ac_items[0].frequency
         freq, ok = QInputDialog.getDouble(
             self, 'Frecuencia de análisis',
             'Frecuencia (Hz):', freq_default, 0.001, 1e9, 3)
@@ -1930,6 +2143,16 @@ class MainWindow(QMainWindow):
             self.results_text.setPlainText('\n'.join(out))
             self.btn_power_triangle.setVisible(False)
             return
+
+        # Lecturas de los multímetros con los fasores AC
+        for item in sim_comps:
+            if item.comp_type != 'MULTIMETER':
+                continue
+            n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", "")
+            n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
+            self._update_multimeter_from_ac(item, n1, n2, result['voltages'])
+            item.update()
+        self._refresh_open_multimeter_panels()
 
         # ── Voltajes nodales ──────────────────────────────────────────────
         out.append("── Voltajes nodales (Vrms / ∠°) ──")
@@ -2280,6 +2503,60 @@ class MainWindow(QMainWindow):
         dlg = PowerTriangleDialog(self._last_ac_result, COLORS, parent=self)
         dlg.exec()
 
+    def _on_instrument_changed(self, item):
+        """Un parámetro de instrumento (FGEN, …) cambió. Si el live
+        transient está corriendo, reconstruyo la lista de componentes del
+        motor con los nuevos valores. Manteniendo el estado anterior se
+        evita un “salto” brusco en la simulación."""
+        if not self._sim_running:
+            return
+        if self._live_components is None:
+            return
+        # Reconstruir componentes del motor para el item modificado.
+        # Buscamos por nombre y reemplazamos en la lista.
+        pin_node = self._live_pin_node or {}
+        new_comps = build_engine_components_for_item(item, pin_node)
+        if not new_comps:
+            return
+        new_by_name = {c.name: c for c in new_comps}
+        self._live_components = [
+            new_by_name.get(c.name, c) for c in self._live_components
+        ]
+        # CRÍTICO: si cambió la frecuencia de una fuente AC, recalcular
+        # `_live_freq`. Sin esto el `dt_internal` del tick sigue calculado
+        # para la frecuencia ANTERIOR, lo que produce aliasing severo y
+        # hace que el circuito “no responda” al cambio de frecuencia.
+        if item.comp_type in ('VAC', 'FGEN'):
+            all_items = [it for sh in self._sheets for it in sh['scene'].components]
+            new_freq = self._max_ac_source_frequency(all_items)
+            if new_freq:
+                prev_freq = self._live_freq
+                self._live_freq = new_freq
+                # Si la frecuencia cambió >2x (subió o bajó) reseteamos el
+                # estado: los capacitores del filtro tienen carga residual
+                # de la frecuencia anterior y mantenerla causa transitorios
+                # MUY largos (o falsos steady-state) en el solver trapezoidal.
+                if prev_freq > 0 and (new_freq / prev_freq > 2.0 or
+                                       prev_freq / new_freq > 2.0):
+                    self._live_state = None   # el próximo tick recalcula DC OP
+                    # Limpiar buffers de osciloscopios abiertos: las muestras
+                    # de la frecuencia anterior tienen otra escala temporal.
+                    for it in self.scene.components:
+                        if it.comp_type == 'OSC':
+                            dlg = getattr(it, '_panel_dialog', None)
+                            if dlg is not None and dlg.isVisible():
+                                try:
+                                    dlg.screen.clear()
+                                except AttributeError:
+                                    pass
+
+    @staticmethod
+    def _max_ac_source_frequency(items) -> float:
+        """Frecuencia máxima entre todas las fuentes AC del iterable.
+        Devuelve 0.0 si no hay fuentes AC."""
+        return max((it.frequency for it in items
+                    if it.comp_type in ('VAC', 'FGEN')), default=0.0)
+
     def _on_logic_state_toggled(self, item):
         """Re-ejecuta la simulación cuando un LOGIC_STATE cambia de estado."""
         if self._sim_running:
@@ -2432,7 +2709,7 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self._clear_all_sheets()
             self._current_file = None
-            self.setWindowTitle("CircuitSim — Simulador de Circuitos")
+            self.setWindowTitle("PyNode — Simulador de Circuitos")
             self._load_demo_circuit()
 
     def _clear_circuit(self):
@@ -2458,7 +2735,7 @@ class MainWindow(QMainWindow):
         self._add_sheet(name="Hoja 1")
         self.results_text.clear()
         self._current_file = None
-        self.setWindowTitle("CircuitSim — Simulador de Circuitos")
+        self.setWindowTitle("PyNode — Simulador de Circuitos")
 
     # ── Serialización de una hoja ─────────────────
     def _serialize_sheet(self, scene: CircuitScene) -> dict:
@@ -2478,10 +2755,14 @@ class MainWindow(QMainWindow):
                 'flip_x': item._flip_x,
                 'flip_y': item._flip_y,
             }
-            if item.comp_type == 'VAC':
+            if item.comp_type in ('VAC', 'FGEN'):
                 entry['frequency'] = item.frequency
                 entry['phase_deg'] = item.phase_deg
                 entry['ac_mode']   = item.ac_mode
+            if item.comp_type == 'FGEN':
+                entry['fgen_waveform'] = item.fgen_waveform
+                entry['fgen_offset']   = item.fgen_offset
+                entry['fgen_duty']     = item.fgen_duty
             if item.comp_type == 'LED':
                 entry['led_color'] = item.led_color
             if item.comp_type == 'Z':
@@ -2499,10 +2780,17 @@ class MainWindow(QMainWindow):
                 entry['bridge_vf'] = item.bridge_vf
             if item.comp_type in ComponentItem.FOUR_PIN_TYPES:
                 entry['node4'] = item.node4
+            if item.comp_type in ComponentItem.FIVE_PIN_TYPES:
+                entry['node4']     = item.node4
+                entry['node5']     = item.node5
+                entry['tl082_unit'] = item.tl082_unit
             if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
                 entry['sheet_label'] = item.sheet_label
             if item.comp_type == 'CLK':
                 entry['clk_running'] = item.clk_running
+            if item.comp_type == 'MULTIMETER':
+                entry['meter_quantity'] = item.meter_quantity
+                entry['meter_coupling'] = item.meter_coupling
             if item.comp_type in ComponentItem.DIGITAL_TYPES:
                 neg = list(getattr(item, 'dig_input_neg', []) or [])
                 if any(neg):
@@ -2539,6 +2827,13 @@ class MainWindow(QMainWindow):
                 item.frequency = c.get('frequency', 60.0)
                 item.phase_deg = c.get('phase_deg', 0.0)
                 item.ac_mode   = c.get('ac_mode', 'rms')
+            if c['type'] == 'FGEN':
+                item.frequency     = c.get('frequency', item.frequency)
+                item.phase_deg     = c.get('phase_deg', item.phase_deg)
+                item.ac_mode       = c.get('ac_mode', item.ac_mode)
+                item.fgen_waveform = c.get('fgen_waveform', item.fgen_waveform)
+                item.fgen_offset   = c.get('fgen_offset', item.fgen_offset)
+                item.fgen_duty     = c.get('fgen_duty', item.fgen_duty)
             if c['type'] == 'LED':
                 item.led_color = c.get('led_color', 'red')
             if c['type'] == 'Z':
@@ -2556,10 +2851,20 @@ class MainWindow(QMainWindow):
                 item.bridge_vf = c.get('bridge_vf', 0.7)
             if c['type'] in ComponentItem.FOUR_PIN_TYPES and 'node4' in c:
                 item.node4 = c['node4']
+            if c['type'] in ComponentItem.FIVE_PIN_TYPES:
+                if 'node4' in c: item.node4 = c['node4']
+                if 'node5' in c: item.node5 = c['node5']
+                item.tl082_unit = c.get('tl082_unit', 'A')
             if c['type'] in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
                 item.sheet_label = c.get('sheet_label', item.name)
             if c['type'] == 'CLK':
                 item.clk_running = bool(c.get('clk_running', False))
+            if c['type'] == 'MULTIMETER':
+                item.meter_quantity = c.get('meter_quantity', 'V')
+                item.meter_coupling = c.get('meter_coupling', 'DC')
+                item.meter_reading_unit_hint = {
+                    'V': 'V', 'A': 'A', 'OHM': 'Ω'
+                }.get(item.meter_quantity, 'V')
             if c['type'] in ComponentItem.DIGITAL_TYPES and 'dig_input_neg' in c:
                 item.dig_input_neg = list(c['dig_input_neg'])
 
@@ -2574,7 +2879,7 @@ class MainWindow(QMainWindow):
         if not path:
             path, _ = QFileDialog.getSaveFileName(
                 self, "Guardar circuito", "",
-                "CircuitSim (*.csin);;Todos los archivos (*)"
+                "PyNode (*.csin);;Todos los archivos (*)"
             )
         if not path:
             return
@@ -2593,14 +2898,14 @@ class MainWindow(QMainWindow):
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         self._current_file = path
-        self.setWindowTitle(f"CircuitSim — {os.path.basename(path)}")
+        self.setWindowTitle(f"PyNode — {os.path.basename(path)}")
         self.statusBar().showMessage(f"Guardado: {path}")
 
     # ── Guardar como (.csin) ─────────────────────
     def _save_circuit_as(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Guardar circuito como", "",
-            "CircuitSim (*.csin);;Todos los archivos (*)"
+            "PyNode (*.csin);;Todos los archivos (*)"
         )
         if not path:
             return
@@ -2613,7 +2918,7 @@ class MainWindow(QMainWindow):
     def _open_circuit(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Abrir circuito", "",
-            "CircuitSim (*.csin);;Todos los archivos (*)"
+            "PyNode (*.csin);;Todos los archivos (*)"
         )
         if not path:
             return
@@ -2644,7 +2949,7 @@ class MainWindow(QMainWindow):
             self._load_sheet_data(scene, sd)
 
         self._current_file = path
-        self.setWindowTitle(f"CircuitSim — {os.path.basename(path)}")
+        self.setWindowTitle(f"PyNode — {os.path.basename(path)}")
         self.statusBar().showMessage(f"Abierto: {path}")
 
     # ── Exportar netlist SPICE (.net) ────────────
@@ -2659,7 +2964,7 @@ class MainWindow(QMainWindow):
             path += '.net'
 
         lines = []
-        lines.append(f"* CircuitSim — Netlist exportado")
+        lines.append(f"* PyNode — Netlist exportado")
         lines.append(f"* Archivo: {os.path.basename(path)}")
         lines.append("")
 
@@ -2734,7 +3039,7 @@ class MainWindow(QMainWindow):
 # ══════════════════════════════════════════════════════════════
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("CircuitSim")
+    app.setApplicationName("PyNode")
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()

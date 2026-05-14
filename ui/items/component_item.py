@@ -13,7 +13,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtCore import Qt, QPointF, QRectF, QLineF
 
-from ui.style import COLORS, GRID_SIZE, COMP_W, COMP_H, PIN_RADIUS, _qfont
+from ui.style import COLORS, GRID_SIZE, COMP_W, COMP_H, PIN_RADIUS, _qfont, format_si_value
 
 
 # ══════════════════════════════════════════════════════════════
@@ -27,7 +27,10 @@ class ComponentItem(QGraphicsItem):
 
     COMP_TYPES = ['R', 'POT', 'V', 'VAC', 'I', 'C', 'L', 'Z', 'GND', 'NODE',
                   'D', 'LED', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP',
+                  'TL082',
                   'XFMR', 'BRIDGE',
+                  # ── Instrumentos ──
+                  'FGEN', 'OSC', 'MULTIMETER',
                   # ── Digital ──
                   'AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                   'DFF', 'JKFF', 'TFF', 'SRFF',
@@ -37,8 +40,14 @@ class ComponentItem(QGraphicsItem):
                   # ── Inter-hoja ──
                   'NET_LABEL_IN', 'NET_LABEL_OUT']
 
+    # Instrumentos virtuales (panel frontal independiente).
+    INSTRUMENT_TYPES = {'FGEN', 'OSC', 'MULTIMETER'}
+
     # Tipos analógicos con 4 terminales (necesitan p3 y p4)
-    FOUR_PIN_TYPES = {'XFMR', 'BRIDGE'}
+    FOUR_PIN_TYPES = {'XFMR', 'BRIDGE', 'OSC'}
+
+    # Tipos analógicos con 5 terminales (necesitan p3, p4 y p5)
+    FIVE_PIN_TYPES = {'TL082'}
 
     # Tipos de flip-flop con SET/RESET (4 inputs lógicos + Q,Qn)
     FLIPFLOP_TYPES = {'DFF', 'JKFF', 'TFF', 'SRFF'}
@@ -116,6 +125,44 @@ class ComponentItem(QGraphicsItem):
 
         # Etiqueta de net label inalámbrico
         self.sheet_label: str = ''
+
+        # ── Generador de funciones (FGEN) ───────────────────────────────────
+        # Reutiliza self.value (amplitud), self.frequency, self.phase_deg,
+        # self.ac_mode ('rms'/'peak'). Estos atributos extra controlan la
+        # forma de onda — equivalen a los del VoltageSourceAC del motor.
+        self.fgen_waveform: str   = 'sin'   # 'sin' | 'square' | 'triangle'
+        self.fgen_offset:   float = 0.0     # V DC sumados a la onda
+        self.fgen_duty:     float = 0.5     # ciclo de trabajo (solo square), 0..1
+
+        # ── Osciloscopio (OSC) ──────────────────────────────────────────────
+        # Configuración del panel. Buffers de muestras viven en el diálogo
+        # (no en el item) para mantener el item liviano.
+        self.osc_time_div:    float = 1e-3   # segundos por división (10 div totales)
+        self.osc_v_div_a:     float = 1.0    # V por división, canal A
+        self.osc_v_div_b:     float = 1.0    # V por división, canal B
+        self.osc_pos_a:       float = 0.0    # desplazamiento vertical canal A (divs)
+        self.osc_pos_b:       float = 0.0    # desplazamiento vertical canal B (divs)
+        self.osc_trig_level:  float = 0.0    # nivel de trigger (V)
+        self.osc_trig_source: str   = 'A'    # 'A' o 'B'
+        self.osc_trig_edge:   str   = 'rising'   # 'rising' | 'falling'
+        self.osc_trig_mode:   str   = 'auto'     # 'auto' | 'normal' | 'single'
+
+        # ── TL082 (op-amp dual) ─────────────────────────────────────────────
+        # Cada instancia representa UNA de las dos unidades del CI.
+        # tl082_unit indica cuál ('A' o 'B') — solo informativo/visual.
+        # node5 almacena el nodo del pin V− (quinto terminal).
+        self.tl082_unit: str = 'A'   # 'A' | 'B'
+        self.node5:      str = ''    # V− (sólo TL082)
+
+        # ── Multímetro (instrumento de medición) ─────────────────────────────
+        # meter_quantity:  'V' (voltaje), 'A' (corriente), 'OHM' (resistencia)
+        # meter_coupling:  'DC' o 'AC' (modo de acoplamiento)
+        # meter_reading:   último valor leído (None si aún no se midió)
+        # meter_reading_unit_hint: 'V' | 'A' | 'Ω' — para formatear el display
+        self.meter_quantity:         str             = 'V'
+        self.meter_coupling:         str             = 'DC'
+        self.meter_reading:          Optional[float] = None
+        self.meter_reading_unit_hint: str            = 'V'
 
         # ── CLK (reloj digital) ─────────────────────────────────────────────
         # Si está corriendo (oscilando), el timer global lo conmuta a la frecuencia
@@ -195,6 +242,14 @@ class ComponentItem(QGraphicsItem):
             return QRectF(-70, -35, 140, 80)
         if self.comp_type == 'BRIDGE':
             return QRectF(-70, -70, 140, 140)
+        if self.comp_type == 'OSC':
+            return QRectF(-50, -36, 100, 72)
+        if self.comp_type == 'MULTIMETER':
+            # Cuerpo cuadrado con display + puntas de prueba en la parte inferior
+            return QRectF(-44, -50, 88, 100)
+        if self.comp_type == 'TL082':
+            # Triángulo (−35..+35, −28..+28) + cables V+/V− (±44) + margen etiquetas
+            return QRectF(-64, -58, 128, 116)
         return QRectF(-COMP_W//2 - 10, -COMP_H//2 - 20, COMP_W + 20, COMP_H + 40)
 
     def pin_positions(self) -> Tuple[QPointF, QPointF]:
@@ -210,6 +265,9 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'OPAMP':
             hh_op = hh + 6
             return QPointF(hw + 10, 0), QPointF(-hw - 10, hh_op // 2)
+        if self.comp_type == 'TL082':
+            # p1 = OUT (derecha-centro), p2 = IN− (izquierda-abajo)
+            return QPointF(50, 0), QPointF(-50, 18)
         # ── Transformador: p1=PRI+ (sup-izq), p2=PRI- (inf-izq) ─────────
         if self.comp_type == 'XFMR':
             return QPointF(-60, -20), QPointF(-60, 20)
@@ -218,6 +276,15 @@ class ComponentItem(QGraphicsItem):
         #     p3 = DC+ (sup),  p4 = DC− (inf)
         if self.comp_type == 'BRIDGE':
             return QPointF(-60, 0), QPointF(60, 0)
+        # ── Osciloscopio:
+        #     p1 = A+ (izq-arriba), p2 = A− (izq-abajo)
+        #     p3 = B+ (der-arriba), p4 = B− (der-abajo)
+        if self.comp_type == 'OSC':
+            return QPointF(-40, -20), QPointF(-40, 20)
+        # ── Multímetro: puntas de prueba en la parte inferior ────────────
+        #     p1 = V+ (rojo, izq-abajo), p2 = V− (negro, der-abajo)
+        if self.comp_type == 'MULTIMETER':
+            return QPointF(-30, 50), QPointF(30, 50)
         # ── Puertas lógicas: usar _gate_geometry para coincidir exactamente ──
         if self.comp_type in ('AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR',
                                'COMPARATOR', 'PWM'):
@@ -269,6 +336,9 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'OPAMP':
             hh_op = hh + 6
             return QPointF(-hw - 10, -(hh_op // 2))
+        if self.comp_type == 'TL082':
+            # p3 = IN+ (izquierda-arriba)
+            return QPointF(-50, -18)
         # Puertas con 2+ entradas: segundo cable de entrada
         if self.comp_type in ('AND', 'OR', 'NAND', 'NOR', 'XOR', 'COMPARATOR'):
             gw, gh, step, n = self._gate_geometry()
@@ -292,6 +362,9 @@ class ComponentItem(QGraphicsItem):
         # Puente: p3 = DC+ (sup)
         if self.comp_type == 'BRIDGE':
             return QPointF(0, -60)
+        # Osciloscopio: p3 = B+ (der-arriba)
+        if self.comp_type == 'OSC':
+            return QPointF(40, -20)
         return QPointF(0, 0)
 
     def pin3_position_scene(self) -> QPointF:
@@ -300,14 +373,20 @@ class ComponentItem(QGraphicsItem):
     def pin4_position(self) -> QPointF:
         """Cuarto pin.
 
+          TL082       → V+   (superior-centro)
           XFMR        → SEC− (inferior derecho)
           BRIDGE      → DC−  (inferior)
           DFF/JKFF/TFF/SRFF → SET (parte superior, arriba del centro)
         """
+        if self.comp_type == 'TL082':
+            # p4 = V+ : sale por la mitad del lado superior del triángulo
+            return QPointF(0, -44)
         if self.comp_type == 'XFMR':
             return QPointF(60, 20)
         if self.comp_type == 'BRIDGE':
             return QPointF(0, 60)
+        if self.comp_type == 'OSC':
+            return QPointF(40, 20)
         if self.comp_type in self.FLIPFLOP_TYPES:
             hh_f = COMP_H // 2 + 8
             return QPointF(0, -hh_f - 10)
@@ -317,7 +396,14 @@ class ComponentItem(QGraphicsItem):
         return self.mapToScene(self.pin4_position())
 
     def pin5_position(self) -> QPointF:
-        """Quinto pin (sólo flip-flops): RESET en la parte inferior."""
+        """Quinto pin.
+
+          TL082               → V−   (inferior-centro)
+          DFF/JKFF/TFF/SRFF   → RESET (parte inferior)
+        """
+        if self.comp_type == 'TL082':
+            # p5 = V− : sale por la mitad del lado inferior del triángulo
+            return QPointF(0, 44)
         if self.comp_type in self.FLIPFLOP_TYPES:
             hh_f = COMP_H // 2 + 8
             return QPointF(0, hh_f + 10)
@@ -342,7 +428,11 @@ class ComponentItem(QGraphicsItem):
         p1, p2 = self.pin_positions_scene()
         pins = [p1, p2]
         # Pines adicionales según tipo
-        if self.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP'):
+        if self.comp_type in self.FIVE_PIN_TYPES:
+            pins.append(self.pin3_position_scene())  # IN+
+            pins.append(self.pin4_position_scene())  # V+
+            pins.append(self.pin5_position_scene())  # V−
+        elif self.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP'):
             pins.append(self.pin3_position_scene())
         elif self.comp_type in ('AND', 'OR', 'NAND', 'NOR', 'XOR', 'COMPARATOR'):
             gw, gh, step, n = self._gate_geometry()
@@ -398,12 +488,21 @@ class ComponentItem(QGraphicsItem):
             self._draw_mosfet(painter, pen_body, pen_wire)
         elif self.comp_type == 'OPAMP':
             self._draw_opamp(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'TL082':
+            self._draw_tl082(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'Z':
             self._draw_impedance(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'XFMR':
             self._draw_transformer(painter, pen_body, pen_wire, body_color)
         elif self.comp_type == 'BRIDGE':
             self._draw_bridge_rectifier(painter, pen_body, pen_wire, body_color)
+        # ── Instrumentos ─────────────────────────────────────────────────
+        elif self.comp_type == 'FGEN':
+            self._draw_fgen(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'OSC':
+            self._draw_osc(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'MULTIMETER':
+            self._draw_multimeter(painter, pen_body, pen_wire, body_color)
         # ── Digital ──────────────────────────────────────────────────────
         elif self.comp_type in ('AND', 'NAND', 'OR', 'NOR', 'XOR', 'NOT'):
             self._draw_ansi_gate(painter, pen_body, pen_wire, body_color)
@@ -439,9 +538,10 @@ class ComponentItem(QGraphicsItem):
 
         # Pines — los dispositivos de 3 terminales dibujan sus propios pines
         # internamente con etiquetas; solo dibujar pines genéricos para el resto
-        three_terminal = ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP',
+        three_terminal = ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP', 'TL082',
                           'NET_LABEL_IN', 'NET_LABEL_OUT',
-                          'DFF', 'JKFF', 'TFF', 'SRFF')
+                          'DFF', 'JKFF', 'TFF', 'SRFF',
+                          'MULTIMETER')   # _draw_multimeter pinta sus pines
         if self.comp_type not in three_terminal:
             for pin in self.pin_positions():
                 painter.setPen(pen_pin)
@@ -689,6 +789,168 @@ class ComponentItem(QGraphicsItem):
             painter.drawLine(QPointF(-8, 0), QPointF(8, 0))
             painter.drawLine(QPointF(4, -5), QPointF(8, 0))
             painter.drawLine(QPointF(4, 5), QPointF(8, 0))
+
+    def _draw_fgen(self, painter, pen_body, pen_wire, body_color):
+        """Generador de funciones: caja rectangular tipo instrumento con la
+        forma de onda actual dibujada dentro. Pines a izquierda (V+) y
+        derecha (V−)."""
+        hw = COMP_W // 2 + 4
+        hh = COMP_H // 2 + 4
+        # Cables a los pines
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-hw - 10, 0), QPointF(-hw, 0))
+        painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        # Cuerpo
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
+        # Forma de onda dentro (eje horizontal = un período)
+        painter.setPen(QPen(QColor(COLORS['component']), 1.6))
+        path = QPainterPath()
+        wf = getattr(self, 'fgen_waveform', 'sin')
+        x0, x1 = -hw + 6, hw - 6
+        y_amp = hh - 6
+        N = 48
+        duty = max(0.02, min(0.98, getattr(self, 'fgen_duty', 0.5)))
+        for i in range(N + 1):
+            frac = i / N
+            x = x0 + frac * (x1 - x0)
+            if wf == 'square':
+                y = -y_amp if frac < duty else y_amp
+            elif wf == 'triangle':
+                # +1 en frac=0.5, -1 en bordes
+                y = -y_amp * (1.0 - 4.0 * abs(frac - 0.5))
+            else:
+                y = -y_amp * math.sin(2.0 * math.pi * frac)
+            if i == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        painter.drawPath(path)
+        # Etiqueta "FGEN" arriba a la izquierda
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.setFont(_qfont('Consolas', 6, QFont.Weight.Bold))
+        painter.drawText(QRectF(-hw + 2, -hh + 1, hw * 2 - 4, 8),
+                         Qt.AlignmentFlag.AlignLeft, 'FGEN')
+
+    def _draw_osc(self, painter, pen_body, pen_wire, body_color):
+        """Osciloscopio: rectángulo con mini-pantalla que muestra una onda
+        decorativa y 4 pines etiquetados A+ A− B+ B−."""
+        hw, hh = 30, 22
+        # Cables a los 4 pines (a ±40, ±20 — múltiplos de GRID_SIZE)
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-40, -20), QPointF(-hw, -10))
+        painter.drawLine(QPointF(-40,  20), QPointF(-hw,  10))
+        painter.drawLine(QPointF( 40, -20), QPointF( hw, -10))
+        painter.drawLine(QPointF( 40,  20), QPointF( hw,  10))
+        # Cuerpo del instrumento
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
+        # Pantalla mini (verde fosforescente clásico)
+        screen = QRectF(-hw + 4, -hh + 8, hw * 2 - 8, hh * 2 - 14)
+        painter.setBrush(QBrush(QColor(20, 30, 22)))
+        painter.setPen(QPen(QColor(COLORS['panel_brd']), 1))
+        painter.drawRect(screen)
+        # Traza decorativa: un período senoidal
+        painter.setPen(QPen(QColor(80, 220, 120), 1.2))
+        path = QPainterPath()
+        N = 36
+        for i in range(N + 1):
+            frac = i / N
+            x = screen.left() + frac * screen.width()
+            y = screen.center().y() - (screen.height() * 0.35) * math.sin(2 * math.pi * frac)
+            (path.moveTo if i == 0 else path.lineTo)(x, y)
+        painter.drawPath(path)
+        # Etiqueta "XSC" arriba
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.setFont(_qfont('Consolas', 6, QFont.Weight.Bold))
+        painter.drawText(QRectF(-hw, -hh + 1, hw * 2, 8),
+                         Qt.AlignmentFlag.AlignCenter, 'XSC')
+        # Etiquetas de pines junto al cuerpo
+        painter.setFont(_qfont('Consolas', 6))
+        painter.setPen(QPen(QColor(COLORS['text']), 1))
+        painter.drawText(QRectF(-hw, -16,  8, 10), Qt.AlignmentFlag.AlignLeft,   'A+')
+        painter.drawText(QRectF(-hw,   6,  8, 10), Qt.AlignmentFlag.AlignLeft,   'A−')
+        painter.drawText(QRectF( hw-9, -16, 9, 10), Qt.AlignmentFlag.AlignRight, 'B+')
+        painter.drawText(QRectF( hw-9,   6, 9, 10), Qt.AlignmentFlag.AlignRight, 'B−')
+
+    def _draw_multimeter(self, painter, pen_body, pen_wire, body_color):
+        """Multímetro estilo Multisim: cuerpo cuadrado con display, modo
+        seleccionado y dos puntas de prueba (V+ rojo, V− negro)."""
+        body_w, body_h = 80, 60
+        x0, y0 = -body_w / 2, -body_h / 2 - 8
+
+        # ── Cables hacia las puntas de prueba ────────────────────────────
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(-30, body_h / 2 - 8), QPointF(-30, 50))
+        painter.drawLine(QPointF( 30, body_h / 2 - 8), QPointF( 30, 50))
+
+        # ── Cuerpo del instrumento ───────────────────────────────────────
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        painter.drawRoundedRect(QRectF(x0, y0, body_w, body_h), 4, 4)
+
+        # ── Display ──────────────────────────────────────────────────────
+        disp = QRectF(x0 + 6, y0 + 6, body_w - 12, 24)
+        painter.setBrush(QBrush(QColor(COLORS.get('bg', '#1a1a2e'))))
+        painter.setPen(QPen(QColor(COLORS.get('panel_brd', '#0f3460')), 1))
+        painter.drawRect(disp)
+
+        reading_text = self._format_meter_reading()
+        painter.setPen(QPen(QColor(COLORS.get('current', '#0fff50'))))
+        painter.setFont(_qfont('Consolas', 10, QFont.Weight.Bold))
+        painter.drawText(disp, Qt.AlignmentFlag.AlignCenter, reading_text)
+
+        # ── Etiqueta de modo (V/A/Ω + DC/AC) ─────────────────────────────
+        mode_lbl = self._meter_mode_label()
+        painter.setPen(QPen(QColor(COLORS.get('text_dim', '#a0a0a0'))))
+        painter.setFont(_qfont('Consolas', 8))
+        mode_rect = QRectF(x0, y0 + body_h - 22, body_w, 14)
+        painter.drawText(mode_rect, Qt.AlignmentFlag.AlignCenter, mode_lbl)
+
+        # ── Pines: V+ rojo, V− blanco/oscuro ─────────────────────────────
+        painter.setPen(QPen(QColor('#e94560'), 2))
+        painter.setBrush(QBrush(QColor('#e94560')))
+        painter.drawEllipse(QPointF(-30, 50), PIN_RADIUS + 1, PIN_RADIUS + 1)
+        painter.setPen(QPen(QColor(COLORS.get('text', '#e0e0e0')), 2))
+        painter.setBrush(QBrush(QColor(COLORS.get('text', '#e0e0e0'))))
+        painter.drawEllipse(QPointF( 30, 50), PIN_RADIUS + 1, PIN_RADIUS + 1)
+
+        # Etiquetas + y − junto a los pines
+        painter.setPen(QPen(QColor('#e94560')))
+        painter.setFont(_qfont('Consolas', 8, QFont.Weight.Bold))
+        painter.drawText(QRectF(-44, 32, 16, 14),
+                         Qt.AlignmentFlag.AlignCenter, '+')
+        painter.setPen(QPen(QColor(COLORS.get('text', '#e0e0e0'))))
+        painter.drawText(QRectF( 28, 32, 16, 14),
+                         Qt.AlignmentFlag.AlignCenter, '−')
+
+    def _meter_mode_label(self) -> str:
+        qty = getattr(self, 'meter_quantity', 'V')
+        cpl = getattr(self, 'meter_coupling', 'DC')
+        sym = {'V': 'V', 'A': 'A', 'OHM': 'Ω'}.get(qty, 'V')
+        if qty == 'OHM':
+            return sym
+        return f"{sym} {cpl}"
+
+    def _format_meter_reading(self) -> str:
+        v = getattr(self, 'meter_reading', None)
+        if v is None:
+            return '— — —'
+        unit = getattr(self, 'meter_reading_unit_hint', '')
+        av = abs(v)
+        if av >= 1e6:
+            return f"{v/1e6:.3f} M{unit}"
+        if av >= 1e3:
+            return f"{v/1e3:.3f} k{unit}"
+        if av >= 1 or av == 0:
+            return f"{v:.3f} {unit}"
+        if av >= 1e-3:
+            return f"{v*1e3:.3f} m{unit}"
+        if av >= 1e-6:
+            return f"{v*1e6:.3f} μ{unit}"
+        return f"{v:.3e} {unit}"
 
     def _draw_impedance(self, painter, pen_body, pen_wire, body_color):
         hw = COMP_W // 2
@@ -1015,6 +1277,84 @@ class ComponentItem(QGraphicsItem):
             painter.drawText(QRectF(pos.x() + ox, pos.y() + oy, 28, 10),
                              Qt.AlignmentFlag.AlignLeft, label)
 
+
+    def _draw_tl082(self, painter, pen_body, pen_wire, body_color):
+        """
+        Símbolo estándar IEC/IEEE de op-amp con 5 terminales:
+          • Triángulo apuntando a la derecha
+          • IN+ (no-inversora) — izquierda-arriba
+          • IN− (inversora)   — izquierda-abajo
+          • OUT                — derecha (ápice)
+          • V+                 — sale del punto medio del lado superior
+          • V−                 — sale del punto medio del lado inferior
+
+        Geometría del triángulo:
+            vértice izq-arriba : (−35, −28)
+            vértice izq-abajo  : (−35, +28)
+            ápice derecho      : (+35,   0)
+        """
+        # ── Cuerpo: triángulo ─────────────────────────────────────────────
+        painter.setPen(pen_body)
+        painter.setBrush(QBrush(body_color))
+        tri = QPolygonF([QPointF(-35, -28), QPointF(-35, 28), QPointF(35, 0)])
+        painter.drawPolygon(tri)
+
+        # ── Cables de señal ───────────────────────────────────────────────
+        painter.setPen(pen_wire)
+        # OUT: ápice → pin externo
+        painter.drawLine(QPointF(35, 0),   QPointF(50, 0))
+        # IN+: borde izquierdo (-35, -18) → pin externo
+        painter.drawLine(QPointF(-50, -18), QPointF(-35, -18))
+        # IN−: borde izquierdo (-35, +18) → pin externo
+        painter.drawLine(QPointF(-50,  18), QPointF(-35,  18))
+
+        # ── Cables de alimentación ────────────────────────────────────────
+        # El punto de salida sobre el triángulo es la mitad geométrica de
+        # cada lado inclinado, es decir x=0 → y=±14.
+        # V+: (0, −14) → (0, −44)
+        painter.drawLine(QPointF(0, -14), QPointF(0, -44))
+        # V−: (0, +14) → (0, +44)
+        painter.drawLine(QPointF(0,  14), QPointF(0,  44))
+
+        # ── Símbolos + / − dentro del triángulo ──────────────────────────
+        painter.setPen(QPen(QColor(COLORS['component']), 2))
+        font_sym = _qfont('Consolas', 9, QFont.Weight.Bold)
+        painter.setFont(font_sym)
+        # "+" cerca de IN+ (arriba-izq)
+        painter.drawText(QRectF(-30, -26, 16, 14),
+                         Qt.AlignmentFlag.AlignCenter, '+')
+        # "−" cerca de IN− (abajo-izq)
+        painter.drawText(QRectF(-30,  12, 16, 14),
+                         Qt.AlignmentFlag.AlignCenter, '−')
+
+        # ── Letra de unidad (A / B) centrada en el triángulo ─────────────
+        unit = getattr(self, 'tl082_unit', 'A')
+        font_unit = _qfont('Consolas', 8, QFont.Weight.Bold)
+        painter.setFont(font_unit)
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.drawText(QRectF(-8, -8, 16, 16),
+                         Qt.AlignmentFlag.AlignCenter, unit)
+
+        # ── Pines con puntos y etiquetas ──────────────────────────────────
+        font_lbl = _qfont('Consolas', 7, QFont.Weight.Bold)
+        painter.setFont(font_lbl)
+        pin_color = QColor(COLORS['pin'])
+
+        # (posición_pin, etiqueta, offset_x, offset_y)
+        pin_data = [
+            (QPointF( 50,   0), 'OUT',  5,  -5),
+            (QPointF(-50, -18), 'IN+', -26, -12),
+            (QPointF(-50,  18), 'IN−', -26,   3),
+            (QPointF(  0, -44), 'V+',   4,  -12),
+            (QPointF(  0,  44), 'V−',   4,    3),
+        ]
+        for pos, label, ox, oy in pin_data:
+            painter.setPen(QPen(pin_color, 2))
+            painter.setBrush(QBrush(pin_color))
+            painter.drawEllipse(pos, PIN_RADIUS, PIN_RADIUS)
+            painter.setPen(QPen(QColor(COLORS['text']), 1))
+            painter.drawText(QRectF(pos.x() + ox, pos.y() + oy, 26, 11),
+                             Qt.AlignmentFlag.AlignLeft, label)
 
     # ──────────────────────────────────────────────────────────────────────
     # Dibujo de componentes digitales
@@ -1544,6 +1884,19 @@ class ComponentItem(QGraphicsItem):
         painter.setFont(font)
         painter.setPen(QPen(text_color))
 
+        # TL082: etiquetas desplazadas para no solaparse con los pines de alimentación
+        if self.comp_type == 'TL082':
+            painter.drawText(QRectF(-35, -56, 70, 13),
+                             Qt.AlignmentFlag.AlignCenter, self.name)
+            return
+
+        # Multímetro: nombre arriba del cuerpo, sin "valor" abajo (el display
+        # del propio cuerpo ya muestra la lectura)
+        if self.comp_type == 'MULTIMETER':
+            name_rect = QRectF(-50, -50 - 16, 100, 14)
+            painter.drawText(name_rect, Qt.AlignmentFlag.AlignCenter, self.name)
+            return
+
         # Nombre arriba
         name_rect = QRectF(-COMP_W//2, -COMP_H//2 - 18, COMP_W, 16)
         painter.drawText(name_rect, Qt.AlignmentFlag.AlignCenter, self.name)
@@ -1565,26 +1918,15 @@ class ComponentItem(QGraphicsItem):
     def _format_value(self) -> str:
         if self.comp_type == 'Z':
             if self.z_mode == 'rect':
-                real = self.z_real
-                imag = self.z_imag
-                if abs(imag) < 1e-12:
-                    return f"{real:.3g}Ω"
-                sign = '+' if imag >= 0 else '-'
-                return f"{real:.3g}{sign}{abs(imag):.3g}jΩ"
+                if abs(self.z_imag) < 1e-12:
+                    return format_si_value(self.z_real, 'Ω')
+                r = format_si_value(self.z_real, '')
+                x = format_si_value(abs(self.z_imag), 'Ω')
+                sign = '+' if self.z_imag >= 0 else '−'
+                return f"{r}{sign}{x}j"
             else:
-                return f"{self.z_mag:.3g}∠{self.z_phase:.1f}°Ω"
-        v = self.value
-        if abs(v) >= 1e6:
-            return f"{v/1e6:.2g}M{self.unit}"
-        elif abs(v) >= 1e3:
-            return f"{v/1e3:.2g}k{self.unit}"
-        elif abs(v) >= 1:
-            return f"{v:.2g}{self.unit}"
-        elif abs(v) >= 1e-3:
-            return f"{v*1e3:.2g}m{self.unit}"
-        elif abs(v) >= 1e-6:
-            return f"{v*1e6:.2g}μ{self.unit}"
-        return f"{v:.2g}{self.unit}"
+                return f"{format_si_value(self.z_mag, 'Ω')}∠{self.z_phase:.1f}°"
+        return format_si_value(self.value, self.unit)
 
     # ── Snap a grid ──────────────────────────────
     def itemChange(self, change, value):

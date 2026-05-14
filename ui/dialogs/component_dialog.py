@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ui.style import parse_si_value, format_si_value
 from ui.component_metadata import (
     COMPONENT_NODE_LABELS,
     DEFAULT_NODE_LABELS,
@@ -14,8 +15,72 @@ from ui.component_metadata import (
     DIGITAL_FLIPFLOP_TYPES,
     DIGITAL_GATE_TYPES,
     FOUR_PIN_NODE_LABELS,
+    FIVE_PIN_NODE_LABELS,
     VALUE_LABELS,
 )
+
+
+class SIValueEdit(QLineEdit):
+    """
+    Campo de texto con soporte nativo de prefijos SI.
+
+    El usuario escribe "4.7k" → 4700 Ω,  "100n" → 100 nF,  "1.5M" → 1.5 MΩ.
+    Al perder el foco el valor se re-formatea automáticamente.
+    Si el texto no es válido, el borde se pone rojo hasta corregirlo.
+
+    Interfaz compatible con QDoubleSpinBox:
+        .value()       → float  (parsea el texto actual)
+        .setValue(v)   → muestra el valor con prefijo SI
+    """
+
+    _TOOLTIP = (
+        "Acepta prefijos SI:\n"
+        "  f=1e-15  p=1e-12  n=1e-9\n"
+        "  u/μ=1e-6  m=1e-3\n"
+        "  k=1e3  M=1e6  G=1e9  T=1e12\n\n"
+        "Ejemplos:  4.7k  100n  1.5M  22u  1e-9  -47m"
+    )
+
+    def __init__(self, initial: float = 0.0, parent=None):
+        super().__init__(parent)
+        self._last_valid: float = initial
+        self.setToolTip(self._TOOLTIP)
+        self.setValue(initial)
+        self.editingFinished.connect(self._reformat)
+
+    # ── Interfaz pública ──────────────────────────────────────────────
+    def value(self) -> float:
+        """Devuelve el valor numérico actual (parseado)."""
+        try:
+            v = parse_si_value(self.text())
+            self._last_valid = v
+            return v
+        except ValueError:
+            return self._last_valid
+
+    def setValue(self, v: float):
+        """Establece el valor y muestra la representación SI."""
+        self._last_valid = v
+        self.setText(format_si_value(v))
+        self.setStyleSheet('')   # limpia posible estado de error previo
+
+    # ── Internos ─────────────────────────────────────────────────────
+    def _reformat(self):
+        text = self.text().strip()
+        if not text:
+            self.setValue(self._last_valid)
+            return
+        try:
+            v = parse_si_value(text)
+            self._last_valid = v
+            self.setText(format_si_value(v))
+            self.setStyleSheet('')
+        except ValueError:
+            self.setStyleSheet('border: 1px solid #cc3333; border-radius: 4px;')
+
+    def focusOutEvent(self, event):
+        self._reformat()
+        super().focusOutEvent(event)
 
 
 class ComponentDialog(QDialog):
@@ -47,8 +112,7 @@ class ComponentDialog(QDialog):
         is_netlabel = self.item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT')
 
         self.name_edit = QLineEdit(self.item.name)
-        self.value_spin = QDoubleSpinBox()
-        self.value_spin.setValue(self.item.value)
+        self.value_spin = SIValueEdit(self.item.value)   # placeholder; se reemplaza abajo
         self.node1_edit = QLineEdit(self.item.node1)
         self.node2_edit = QLineEdit(self.item.node2)
         self.node3_edit = None
@@ -61,6 +125,7 @@ class ComponentDialog(QDialog):
         self._pot_wiper_spin = None
         self._xfmr_ratio_spin = self._xfmr_imax_spin = None
         self._node4_edit = None
+        self._node5_edit = None
         self._dig_inputs_spin = self._dig_bits_spin = self._dig_vref_spin = None
         self._dig_tpd_spin = self._dig_clk_edit = self._dig_anode_edit = None
 
@@ -84,10 +149,7 @@ class ComponentDialog(QDialog):
 
         layout.addRow("Nombre:", self.name_edit)
 
-        self.value_spin = QDoubleSpinBox()
-        self.value_spin.setRange(-1e12, 1e12)
-        self.value_spin.setDecimals(6)
-        self.value_spin.setValue(self.item.value)
+        self.value_spin = SIValueEdit(self.item.value)
         layout.addRow(VALUE_LABELS.get(self.item.comp_type, 'Valor:'), self.value_spin)
 
         if self.item.comp_type in DIGITAL_GATE_TYPES:
@@ -135,6 +197,19 @@ class ComponentDialog(QDialog):
             layout.addRow('Dato D / J:', self.node2_edit)
             self.node3_edit = QLineEdit(self.item.node3 if hasattr(self.item, 'node3') else '')
             layout.addRow('CLK:', self.node3_edit)
+            self._extra_node_edits = []
+        elif self.item.comp_type in FIVE_PIN_NODE_LABELS:
+            lbls = FIVE_PIN_NODE_LABELS[self.item.comp_type]
+            self.node1_edit = QLineEdit(self.item.node1)
+            self.node2_edit = QLineEdit(self.item.node2)
+            self.node3_edit = QLineEdit(self.item.node3 if hasattr(self.item, 'node3') else '')
+            self._node4_edit = QLineEdit(self.item.node4 if hasattr(self.item, 'node4') else '')
+            self._node5_edit = QLineEdit(self.item.node5 if hasattr(self.item, 'node5') else '')
+            layout.addRow(lbls[0] + ':', self.node1_edit)
+            layout.addRow(lbls[1] + ':', self.node2_edit)
+            layout.addRow(lbls[2] + ':', self.node3_edit)
+            layout.addRow(lbls[3] + ':', self._node4_edit)
+            layout.addRow(lbls[4] + ':', self._node5_edit)
             self._extra_node_edits = []
         elif self.item.comp_type in FOUR_PIN_NODE_LABELS:
             lbls = FOUR_PIN_NODE_LABELS[self.item.comp_type]
@@ -185,12 +260,8 @@ class ComponentDialog(QDialog):
             self._mode_combo.setCurrentText(self.item.ac_mode)
             layout.addRow('Modo amplitud:', self._mode_combo)
 
-            self._freq_spin = QDoubleSpinBox()
-            self._freq_spin.setRange(0.001, 1e9)
-            self._freq_spin.setDecimals(3)
-            self._freq_spin.setSuffix(' Hz')
-            self._freq_spin.setValue(self.item.frequency)
-            layout.addRow('Frecuencia:', self._freq_spin)
+            self._freq_spin = SIValueEdit(self.item.frequency)
+            layout.addRow('Frecuencia (Hz):', self._freq_spin)
 
             self._phase_spin = QDoubleSpinBox()
             self._phase_spin.setRange(-360.0, 360.0)
@@ -209,16 +280,8 @@ class ComponentDialog(QDialog):
 
             w_rect = QWidget()
             l_rect = QHBoxLayout(w_rect)
-            self._z_real = QDoubleSpinBox()
-            self._z_real.setRange(-1e12, 1e12)
-            self._z_real.setDecimals(6)
-            self._z_real.setSuffix(" Ω")
-            self._z_real.setValue(self.item.z_real)
-            self._z_imag = QDoubleSpinBox()
-            self._z_imag.setRange(-1e12, 1e12)
-            self._z_imag.setDecimals(6)
-            self._z_imag.setSuffix(" jΩ")
-            self._z_imag.setValue(self.item.z_imag)
+            self._z_real = SIValueEdit(self.item.z_real)
+            self._z_imag = SIValueEdit(self.item.z_imag)
             l_rect.addWidget(QLabel("Real:"))
             l_rect.addWidget(self._z_real)
             l_rect.addWidget(QLabel("Imag:"))
@@ -226,11 +289,7 @@ class ComponentDialog(QDialog):
 
             w_phas = QWidget()
             l_phas = QHBoxLayout(w_phas)
-            self._z_mag = QDoubleSpinBox()
-            self._z_mag.setRange(0, 1e12)
-            self._z_mag.setDecimals(6)
-            self._z_mag.setSuffix(" Ω")
-            self._z_mag.setValue(self.item.z_mag)
+            self._z_mag = SIValueEdit(self.item.z_mag)
             self._z_phase = QDoubleSpinBox()
             self._z_phase.setRange(-360, 360)
             self._z_phase.setDecimals(2)
@@ -266,12 +325,8 @@ class ComponentDialog(QDialog):
             self._xfmr_ratio_spin.setValue(self.item.xfmr_ratio)
             layout.addRow("Relación n = N1/N2:", self._xfmr_ratio_spin)
 
-            self._xfmr_imax_spin = QDoubleSpinBox()
-            self._xfmr_imax_spin.setRange(0.001, 1e6)
-            self._xfmr_imax_spin.setDecimals(3)
-            self._xfmr_imax_spin.setSuffix(' A')
-            self._xfmr_imax_spin.setValue(self.item.xfmr_imax)
-            layout.addRow("Corriente máx primaria:", self._xfmr_imax_spin)
+            self._xfmr_imax_spin = SIValueEdit(self.item.xfmr_imax)
+            layout.addRow("Corriente máx primaria (A):", self._xfmr_imax_spin)
 
         self._dig_inputs_spin = None
         self._dig_bits_spin = None
@@ -380,6 +435,8 @@ class ComponentDialog(QDialog):
                 cb.isChecked() for cb in self._dig_input_neg_checks]
         if hasattr(self, '_node4_edit') and self._node4_edit is not None:
             data['node4'] = self._node4_edit.text()
+        if hasattr(self, '_node5_edit') and self._node5_edit is not None:
+            data['node5'] = self._node5_edit.text()
         if self._pot_wiper_spin is not None:
             data['pot_wiper'] = self._pot_wiper_spin.value()
         if self._xfmr_ratio_spin is not None:

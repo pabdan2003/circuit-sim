@@ -17,10 +17,12 @@ Optimizaciones implementadas:
 Referencia: Vlach & Singhal, "Computer Methods for Circuit Analysis and Design"
 """
 
+import warnings
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from scipy.sparse import lil_matrix, csc_matrix
-from scipy.sparse.linalg import splu, spsolve
+from scipy.sparse.linalg import splu, spsolve, MatrixRankWarning
+from scipy.linalg import lu_factor, lu_solve
 
 from .components import (
     Component, VoltageSource, VoltageSourceAC, CurrentSource,
@@ -36,10 +38,37 @@ from .components import Resistor as Resistor_cls
 def _sparse_solve(G_lil, I_vec):
     """
     Convierte LIL → CSC y resuelve con SuperLU (spsolve).
-    Retorna el vector solución x.
+
+    Silencia el `MatrixRankWarning` transitorio: si la matriz queda
+    momentáneamente singular durante NR (típico al arrancar un diodo),
+    spsolve devuelve NaN y la capa superior detecta y maneja ese caso.
     """
     G_csc = csc_matrix(G_lil)
-    return spsolve(G_csc, I_vec)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', MatrixRankWarning)
+        return spsolve(G_csc, I_vec)
+
+
+# gmin: conductancia mínima a tierra añadida en cada nodo para garantizar
+# que la matriz NUNCA sea singular. Truco estándar de SPICE.
+# 1e-9 S = 1 GΩ → invisible eléctricamente (corriente de 12 V / 1 GΩ = 12 nA)
+# pero suficiente para que el condicionamiento numérico sea robusto incluso
+# con stamps del diodo de gran magnitud (op-amp + LED).
+_GMIN_DEFAULT = 1e-9
+
+
+def _apply_gmin(G, node_map, gmin: float = _GMIN_DEFAULT):
+    """Añade gmin·I a la submatriz nodal de G (in-place).
+
+    Versión vectorizada para `ndarray` (hot path de transient); cae a un
+    loop simple para `lil_matrix` que no soporta indexado avanzado.
+    """
+    if isinstance(G, np.ndarray):
+        idx = np.fromiter(node_map.values(), dtype=np.intp)
+        G[idx, idx] += gmin
+    else:
+        for i in node_map.values():
+            G[i, i] += gmin
 
 
 def _sparse_factor(G_lil):
@@ -172,6 +201,10 @@ class MNASolver:
                         c.stamp(G_dense, I_vec, node_map, branch_idx=b_idx)
                         G = lil_matrix(G_dense)
 
+                # gmin a tierra: estabiliza la matriz cuando algún nodo queda
+                # transitoriamente flotante (diodo en corte sin path alternativo).
+                _apply_gmin(G, node_map)
+
                 try:
                     x_new = _sparse_solve(G, I_vec)
                 except Exception:
@@ -251,9 +284,18 @@ class MNASolver:
                 else:
                     c.stamp(G_dense, I_vec, node_map, branch_idx=b_idx)
 
+            # gmin: protege contra matriz singular durante el rampado
+            _apply_gmin(G_dense, node_map)
+
             try:
                 G_sp = lil_matrix(G_dense)
-                x    = _sparse_solve(G_sp, I_vec)
+                x_new = _sparse_solve(G_sp, I_vec)
+                # Si el solve devolvió NaN/Inf (matriz mal condicionada),
+                # nos quedamos con el x previo en lugar de propagar basura.
+                if np.all(np.isfinite(x_new)):
+                    x = x_new
+                else:
+                    break
             except Exception:
                 break
 
@@ -690,6 +732,12 @@ class MNASolver:
             steps    = 0
             last_err = None
 
+            # Cache de factorización LU: para circuitos lineales con dt fijo,
+            # G es invariante en el tiempo y solo cambia el RHS. Factorizamos
+            # una vez y reutilizamos → O(N³) → O(N²) por paso.
+            _lu_cache = None
+            _lu_can_cache = (not has_nonlinear) and (not adaptive)
+
             while t_local < t_stop:
                 dt_cur = min(dt_cur, t_stop - t_local)
                 if dt_cur < dt_min:
@@ -713,9 +761,30 @@ class MNASolver:
                         branch_idx_map, _nonlinear_types)
 
                     try:
-                        x_new = np.linalg.solve(G, I_vec)
-                    except np.linalg.LinAlgError:
+                        if _lu_can_cache:
+                            if _lu_cache is None:
+                                _lu_cache = lu_factor(G)
+                            x_new = lu_solve(_lu_cache, I_vec)
+                        else:
+                            # np.linalg.solve emite LinAlgWarning en versiones
+                            # recientes ante matrices casi singulares; el caso
+                            # se detecta abajo vía isfinite().
+                            with warnings.catch_warnings():
+                                warnings.simplefilter('ignore')
+                                x_new = np.linalg.solve(G, I_vec)
+                    except (np.linalg.LinAlgError, ValueError):
                         singular = True
+                        break
+
+                    # ── Detección de NaN / Inf ──────────────────────────────
+                    # Si la exponencial de un diodo desborda (típico cuando
+                    # un op-amp empuja un LED sin resistencia limitadora),
+                    # x_new contiene NaN. Cualquier comparación con NaN da
+                    # False, por lo que NR nunca convergería. Forzamos el
+                    # fallback a dt más pequeño.
+                    if not np.all(np.isfinite(x_new)):
+                        singular = True       # tratado igual que matriz singular
+                        last_err = float('inf')
                         break
 
                     if not has_nonlinear:
@@ -905,6 +974,11 @@ class MNASolver:
                     integration)
             else:
                 c.stamp_transient(G, I_vec, node_map, t, branch_idx=b_idx)
+
+        # gmin a tierra en cada nodo (1 pS = 1 TΩ): garantiza que la matriz
+        # nunca sea singular si un diodo entra en corte y deja un nodo sin
+        # path resistivo a tierra durante alguna iteración.
+        _apply_gmin(G, node_map)
 
         return G, I_vec
 

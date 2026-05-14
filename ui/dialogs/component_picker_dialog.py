@@ -27,6 +27,10 @@ PREVIEW_DEFAULT_VALUES = {
     'OPAMP': 1e5,
     'GND': 0.0,
     'NODE': 0.0,
+    'FGEN': 5.0,
+    'OSC': 0.0,
+    'MULTIMETER': 0.0,
+    'TL082': 1e5,
 }
 
 

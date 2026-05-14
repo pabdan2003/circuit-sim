@@ -266,19 +266,29 @@ class Impedance(Component):
 
 class VoltageSourceAC(Component):
     """
-    Fuente de voltaje senoidal: v(t) = Vpeak * sin(2π·f·t + φ)
+    Fuente de voltaje periódica.
+
+    Por defecto es senoidal: v(t) = offset + Vpeak * sin(2π·f·t + φ).
+    Si waveform='square' o 'triangle' la forma de onda cambia
+    (esto se usa para modelar un generador de funciones tipo Multisim).
 
     Parámetros:
         n_pos, n_neg : nodos
-        amplitude    : valor ingresado por el usuario
+        amplitude    : valor ingresado por el usuario (peak o RMS según `mode`)
         frequency    : frecuencia en Hz
         phase_deg    : fase en grados (default 0)
-        mode         : 'peak' o 'rms'
-                       Si mode='rms', amplitude es Vrms → Vpeak = Vrms*√2
+        mode         : 'peak' o 'rms'. Si 'rms', amplitude es Vrms → Vpeak = Vrms·√2
+        waveform     : 'sin' | 'square' | 'triangle'  (default 'sin')
+        offset       : tensión DC sumada a la onda (V), default 0.0
+        duty         : ciclo de trabajo en [0,1] (solo aplica a 'square'), default 0.5
     """
+    _ALLOWED_WAVEFORMS = ('sin', 'square', 'triangle')
+
     def __init__(self, name: str, n_pos: str, n_neg: str,
                  amplitude: float, frequency: float,
-                 phase_deg: float = 0.0, mode: str = 'rms'):
+                 phase_deg: float = 0.0, mode: str = 'rms',
+                 waveform: str = 'sin', offset: float = 0.0,
+                 duty: float = 0.5):
         super().__init__(name)
         self.n_pos      = n_pos
         self.n_neg      = n_neg
@@ -286,6 +296,11 @@ class VoltageSourceAC(Component):
         self.frequency  = frequency
         self.phase_deg  = phase_deg
         self.mode       = mode   # 'rms' o 'peak'
+        if waveform not in self._ALLOWED_WAVEFORMS:
+            waveform = 'sin'
+        self.waveform   = waveform
+        self.offset     = float(offset)
+        self.duty       = max(0.0, min(1.0, float(duty)))
 
     @property
     def Vpeak(self) -> float:
@@ -310,8 +325,34 @@ class VoltageSourceAC(Component):
     def needs_branch(self) -> bool:
         return True
 
+    def _dc_average(self) -> float:
+        """Valor medio temporal de la onda (lo que ve un análisis DC)."""
+        if self.waveform == 'square':
+            # v promedio = offset + Vpeak·(2·duty − 1)
+            return self.offset + self.Vpeak * (2.0 * self.duty - 1.0)
+        # sin y triangle son simétricas → promedio = offset
+        return self.offset
+
+    def waveform_at(self, t: float) -> float:
+        """Valor instantáneo v(t) según la forma de onda configurada."""
+        import math
+        # Fase normalizada θ en [0, 2π)
+        theta = 2.0 * math.pi * self.frequency * t + math.radians(self.phase_deg)
+        if self.waveform == 'square':
+            # Posición dentro del período en [0,1)
+            frac = (theta / (2.0 * math.pi)) % 1.0
+            v_norm = 1.0 if frac < self.duty else -1.0
+            return self.offset + self.Vpeak * v_norm
+        if self.waveform == 'triangle':
+            # Triangular simétrica: |2·frac − 1| va de 0 a 1; escalado a [-1, +1]
+            frac = (theta / (2.0 * math.pi)) % 1.0
+            v_norm = 1.0 - 4.0 * abs(frac - 0.5)   # +1 en frac=0.5, −1 en frac=0,1
+            return self.offset + self.Vpeak * v_norm
+        # sin (default)
+        return self.offset + self.Vpeak * math.sin(theta)
+
     def stamp(self, G, I, node_map, branch_idx=None):
-        """En DC la fuente AC vale 0 V (valor medio de la senoidal)."""
+        """En DC la fuente vale su valor medio temporal."""
         np_ = node_map.get(self.n_pos)
         nn  = node_map.get(self.n_neg)
         k   = branch_idx
@@ -323,7 +364,7 @@ class VoltageSourceAC(Component):
         if nn is not None:
             G[nn, k] -= 1.0
             G[k, nn] -= 1.0
-        # I[k] = 0  (valor DC = 0)
+        I[k] += self._dc_average()
 
     def stamp_ac(self, G, I, node_map, omega: float, branch_idx=None):
         """En AC estampa el fasor de la fuente."""
@@ -341,8 +382,7 @@ class VoltageSourceAC(Component):
         I[k] += self.phasor
 
     def stamp_transient(self, G, I, node_map, t: float, branch_idx=None):
-        """En transitorio estampa v(t) = Vpeak·sin(2π·f·t + φ) como fuente ideal."""
-        import math
+        """En transitorio estampa v(t) según la forma de onda configurada."""
         np_ = node_map.get(self.n_pos)
         nn  = node_map.get(self.n_neg)
         k   = branch_idx
@@ -354,9 +394,7 @@ class VoltageSourceAC(Component):
         if nn is not None:
             G[nn, k] -= 1.0
             G[k, nn] -= 1.0
-        v_t = self.Vpeak * math.sin(2.0 * math.pi * self.frequency * t
-                                    + math.radians(self.phase_deg))
-        I[k] += v_t
+        I[k] += self.waveform_at(t)
 
 
 class Diode(Component):

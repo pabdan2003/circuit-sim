@@ -158,7 +158,10 @@ class AnalysisFlags:
 # Tipos que implican dominio analógico
 _ANALOG_TYPES: Set[str] = {
     'R', 'C', 'L', 'V', 'I', 'VAC', 'D', 'LED',
-    'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP', 'Z',
+    'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP', 'TL082', 'Z',
+    # Instrumentos analógicos
+    'FGEN',   # genera tensión (fuente)
+    'OSC',    # sólo lee — no aporta al MNA pero su presencia implica análisis temporal
 }
 
 # Tipos analógicos que actúan como drivers activos (pueden crear frontera implícita real).
@@ -166,11 +169,18 @@ _ANALOG_TYPES: Set[str] = {
 # se manejan con _evaluate_digital_gates, NO requieren co-simulación transitoria.
 _ANALOG_DRIVER_TYPES: Set[str] = {
     'R', 'C', 'L', 'V', 'I', 'VAC',
-    'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP', 'Z',
+    'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP', 'TL082', 'Z',
+    'FGEN',
 }
 
-# Tipos que son fuentes AC (disparan análisis AC)
-_AC_SOURCE_TYPES: Set[str] = {'VAC'}
+# Tipos que son fuentes AC / dependientes del tiempo (disparan live transient)
+_AC_SOURCE_TYPES: Set[str] = {'VAC', 'FGEN'}
+
+# La sola presencia de estos componentes obliga al solver a correr en
+# modo temporal (live transient) aunque no haya fuentes AC explícitas.
+# Un osciloscopio sin fuentes activas no tendría sentido, pero conectado
+# entre dos nodos DC podría querer ver la traza estática igual.
+_TIME_DOMAIN_HINT_TYPES: Set[str] = {'OSC'}
 
 # Tipos no-lineales
 _NONLINEAR_TYPES: Set[str] = {'D', 'LED', 'BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS'}
@@ -247,6 +257,11 @@ class CircuitAnalyzer:
             if ct in _ANALOG_TYPES:
                 flags.has_dc = True
                 if ct in _AC_SOURCE_TYPES:
+                    flags.has_ac = True
+                # OSC obliga a transient (queremos ver la traza temporal aunque
+                # la fuente sea DC). Reusa `has_ac` porque ese flag rutea al
+                # live transient en MainWindow._toggle_simulation.
+                if ct in _TIME_DOMAIN_HINT_TYPES:
                     flags.has_ac = True
                 if ct in _NONLINEAR_TYPES:
                     flags.has_nonlinear = True

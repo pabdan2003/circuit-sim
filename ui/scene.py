@@ -12,6 +12,7 @@ ComponentItem analógico a los objetos del motor MNA.
 Extraído de main.py.
 """
 import math
+import re
 from typing import Optional, List, Dict, Tuple
 
 from PyQt6.QtWidgets import QGraphicsScene, QMenu, QDialog
@@ -31,10 +32,26 @@ class CircuitScene(QGraphicsScene):
     component_selected   = pyqtSignal(object)
     status_message       = pyqtSignal(str)
     logic_state_toggled  = pyqtSignal(object)   # emitido cuando LOGIC_STATE cambia
+    instrument_changed   = pyqtSignal(object)   # cambió un parámetro de instrumento
 
     # Portapapeles compartido entre escenas (todas las hojas) — guarda un
     # snapshot de la selección.
     _clipboard: Optional[dict] = None
+
+    _NAME_PREFIXES = {
+        'R': 'R', 'V': 'V', 'I': 'I', 'C': 'C', 'L': 'L',
+        'GND': 'GND', 'NODE': 'N', 'LOGIC_STATE': 'LS',
+        'AND': 'AND', 'OR': 'OR', 'NOT': 'NOT', 'NAND': 'NAND',
+        'NOR': 'NOR', 'XOR': 'XOR',
+        'DFF': 'DFF', 'JKFF': 'JKFF',
+        'TFF': 'TFF', 'SRFF': 'SRFF',
+        'COUNTER': 'CNT', 'MUX2': 'MUX',
+        'CLK': 'CLK',
+        'NET_LABEL_IN': 'NL', 'NET_LABEL_OUT': 'NL',
+        'FGEN': 'FGEN', 'OSC': 'XSC',
+        'TL082': 'U',
+        'MULTIMETER': 'XMM',
+    }
 
     def __init__(self):
         super().__init__()
@@ -58,6 +75,32 @@ class CircuitScene(QGraphicsScene):
         # Stack de Ctrl+Z (undo). Cada entrada es un snapshot serializado.
         self._undo_stack: List[dict] = []
         self._undo_max: int = 50
+
+    @staticmethod
+    def _counter_key_for_type(comp_type: str) -> str:
+        return 'NET_LABEL' if comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') else comp_type
+
+    def _bump_component_counter_from_name(self, comp_type: str, name: str):
+        prefix = self._NAME_PREFIXES.get(comp_type, comp_type)
+        m = re.match(rf'^{re.escape(prefix)}(\d+)', name or '')
+        if not m:
+            return
+        key = self._counter_key_for_type(comp_type)
+        self._comp_counter[key] = max(self._comp_counter.get(key, 0), int(m.group(1)))
+
+    def _component_name_exists(self, name: str) -> bool:
+        return any(c.name == name for c in self.components)
+
+    def _next_component_name(self, comp_type: str, suffix: str = '') -> str:
+        key = self._counter_key_for_type(comp_type)
+        prefix = self._NAME_PREFIXES.get(comp_type, comp_type)
+        count = self._comp_counter.get(key, 0)
+        while True:
+            count += 1
+            candidate = f"{prefix}{count}{suffix}"
+            if not self._component_name_exists(candidate):
+                self._comp_counter[key] = count
+                return candidate
 
     # ── Grid (dibujado en drawBackground para que sea independiente del zoom) ──
     def _grid_pens(self) -> Tuple[QPen, QPen]:
@@ -197,27 +240,40 @@ class CircuitScene(QGraphicsScene):
     # ── Colocar componente ───────────────────────
     def place_component(self, comp_type: str, pos: QPointF,
                         name: str = '', value: float = 0.0, unit: str = '',
-                        node1: str = '', node2: str = '', node3: str = '') -> ComponentItem:
+                        node1: str = '', node2: str = '', node3: str = '',
+                        tl082_unit: str = '') -> 'ComponentItem | None':
+        # ── Selector de unidad para CIs duales (TL082) ──────────────────
+        _tl082_unit = 'A'
+        if comp_type == 'TL082' and not name:
+            from ui.dialogs.tl082_unit_dialog import TL082UnitDialog
+            _parent = self.views()[0].parent() if self.views() else None
+            dlg = TL082UnitDialog(_parent)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return None
+            _tl082_unit = dlg.selected_unit
+        elif tl082_unit:
+            _tl082_unit = tl082_unit
+
+        if name:
+            if self._component_name_exists(name):
+                suffix = ''
+                if comp_type == 'TL082':
+                    prefix = self._NAME_PREFIXES.get(comp_type, comp_type)
+                    m = re.match(rf'^{re.escape(prefix)}\d+(.+)$', name)
+                    suffix = m.group(1) if m else _tl082_unit
+                name = self._next_component_name(comp_type, suffix=suffix)
+            else:
+                self._bump_component_counter_from_name(comp_type, name)
+
         if not name:
-            # NET_LABEL_IN y NET_LABEL_OUT comparten prefijo "NL" → mismo contador
-            # para evitar colisiones de nombre (NL1 vs NL1) que rompen Union-Find.
-            counter_key = 'NET_LABEL' if comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') else comp_type
-            count = self._comp_counter.get(counter_key, 0) + 1
-            self._comp_counter[counter_key] = count
-            prefixes = {'R': 'R', 'V': 'V', 'I': 'I', 'C': 'C', 'L': 'L',
-                        'GND': 'GND', 'NODE': 'N', 'LOGIC_STATE': 'LS',
-                        'AND': 'AND', 'OR': 'OR', 'NOT': 'NOT', 'NAND': 'NAND',
-                        'NOR': 'NOR', 'XOR': 'XOR',
-                        'DFF': 'DFF', 'JKFF': 'JKFF',
-                        'TFF': 'TFF', 'SRFF': 'SRFF',
-                        'COUNTER': 'CNT', 'MUX2': 'MUX',
-                        'CLK': 'CLK',
-                        'NET_LABEL_IN': 'NL', 'NET_LABEL_OUT': 'NL'}
-            name = f"{prefixes.get(comp_type, comp_type)}{count}"
+            # TL082: el nombre incluye la letra de unidad (U1A / U1B).
+            suffix = _tl082_unit if comp_type == 'TL082' else ''
+            name = self._next_component_name(comp_type, suffix=suffix)
 
         units = {'R': 'Ω', 'V': 'V', 'VAC': 'V', 'I': 'A', 'C': 'F', 'L': 'H',
                  'D': 'A', 'LED': 'A', 'BJT_NPN': 'hFE', 'BJT_PNP': 'hFE',
-                 'NMOS': 'A/V²', 'PMOS': 'A/V²', 'OPAMP': 'V/V'}
+                 'NMOS': 'A/V²', 'PMOS': 'A/V²', 'OPAMP': 'V/V', 'TL082': 'V/V',
+                 'FGEN': 'V', 'MULTIMETER': ''}
         if not unit:
             unit = units.get(comp_type, '')
 
@@ -227,11 +283,13 @@ class CircuitScene(QGraphicsScene):
         defaults = {'R': 1000.0, 'POT': 10_000.0, 'V': 5.0, 'VAC': 120.0,
                     'I': 0.001, 'C': 1e-6, 'L': 1e-3,
                     'D': 1e-14, 'LED': 0.0, 'BJT_NPN': 100.0, 'BJT_PNP': 100.0,
-                    'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5,
+                    'NMOS': 1e-3, 'PMOS': 1e-3, 'OPAMP': 1e5, 'TL082': 1e5,
                     'XFMR': 1.0, 'BRIDGE': 0.7,
                     'LOGIC_STATE': 0.0, 'CLK': 0.0,
-                    'NET_LABEL_IN': 0.0, 'NET_LABEL_OUT': 0.0}
-        _stateful = ('LOGIC_STATE', 'CLK', 'NET_LABEL_IN', 'NET_LABEL_OUT')
+                    'NET_LABEL_IN': 0.0, 'NET_LABEL_OUT': 0.0,
+                    'FGEN': 5.0, 'MULTIMETER': 0.0}
+        _stateful = ('LOGIC_STATE', 'CLK', 'NET_LABEL_IN', 'NET_LABEL_OUT',
+                     'OSC', 'MULTIMETER')
         if value == 0.0 and comp_type not in _stateful:
             value = defaults.get(comp_type, 1.0)
         elif comp_type in _stateful:
@@ -240,11 +298,21 @@ class CircuitScene(QGraphicsScene):
         item = ComponentItem(comp_type, name, value, unit, node1, node2, node3)
         if comp_type == 'NOT':
             item.dig_inputs = 1
+        if comp_type == 'FGEN':
+            # Por convención del panel frontal estilo Multisim, el FGEN
+            # interpreta su amplitud como tensión de pico.
+            item.ac_mode = 'peak'
+            item.frequency = 1000.0  # 1 kHz default — más útil que 60 Hz
+            item.fgen_waveform = 'sin'
+            item.fgen_offset = 0.0
+            item.fgen_duty = 0.5
         if comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
             # El sheet_label es el nombre de red inalámbrico.
             # Por defecto 'NET' para que el usuario lo renombre a algo significativo.
             # Dos net labels con el mismo sheet_label quedan eléctricamente unidos.
             item.sheet_label = 'NET'
+        if comp_type == 'TL082':
+            item.tl082_unit = _tl082_unit
         snap_x = round(pos.x() / GRID_SIZE) * GRID_SIZE
         snap_y = round(pos.y() / GRID_SIZE) * GRID_SIZE
         item.setPos(snap_x, snap_y)
@@ -283,8 +351,10 @@ class CircuitScene(QGraphicsScene):
         if self._mode.startswith('place_'):
             comp_type = self._mode.split('_', 1)[1]
             self.push_undo()
-            self.place_component(comp_type, pos)
-            self.status_message.emit(f"Componente {comp_type} colocado en ({pos.x():.0f}, {pos.y():.0f})")
+            placed = self.place_component(comp_type, pos)
+            if placed is not None:
+                self.status_message.emit(
+                    f"Componente {comp_type} colocado en ({pos.x():.0f}, {pos.y():.0f})")
             return
 
         if self._mode == 'wire':
@@ -485,6 +555,9 @@ class CircuitScene(QGraphicsScene):
                     item.update()
                     self.logic_state_toggled.emit(item)
                     return
+                if item.comp_type in ComponentItem.INSTRUMENT_TYPES:
+                    self._open_instrument_panel(item)
+                    return
                 self._edit_component(item)
                 return
         super().mouseDoubleClickEvent(event)
@@ -556,9 +629,15 @@ class CircuitScene(QGraphicsScene):
         'frequency', 'phase_deg', 'ac_mode',
         'z_real', 'z_imag', 'z_mag', 'z_phase', 'z_mode',
         'xfmr_ratio', 'xfmr_imax', 'bridge_vf',
-        'node4', 'clk_running',
+        'node4', 'node5', 'tl082_unit', 'clk_running',
         'dig_inputs', 'dig_tpd_ns', 'dig_clk', 'dig_analog_node',
         'dig_bits', 'dig_bits_adc', 'dig_vref',
+        # Instrumentos
+        'fgen_waveform', 'fgen_offset', 'fgen_duty',
+        'osc_time_div', 'osc_v_div_a', 'osc_v_div_b',
+        'osc_pos_a', 'osc_pos_b',
+        'osc_trig_level', 'osc_trig_source', 'osc_trig_edge', 'osc_trig_mode',
+        'meter_quantity', 'meter_coupling',
     )
 
     def _serialize_component(self, c: 'ComponentItem') -> dict:
@@ -615,7 +694,12 @@ class CircuitScene(QGraphicsScene):
             unit=c.get('unit', ''),
             node1=c.get('node1', ''),
             node2=c.get('node2', ''),
-            node3=c.get('node3', ''))
+            node3=c.get('node3', ''),
+            tl082_unit=c.get('tl082_unit', 'A'))
+        if item is None:
+            # No debería ocurrir en restore/paste (tl082_unit ya se pasa),
+            # pero por seguridad devolvemos un item vacío.
+            return self.place_component('NODE', QPointF(c['x'], c['y']))
         angle = c.get('angle', 0)
         flip_x = bool(c.get('flip_x', False))
         flip_y = bool(c.get('flip_y', False))
@@ -831,6 +915,10 @@ class CircuitScene(QGraphicsScene):
                 pins[f"{comp.name}__p6"] = comp.pin6_position_scene()  # Q̄
             elif comp.comp_type == 'MUX2':
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+            elif comp.comp_type in ComponentItem.FIVE_PIN_TYPES:
+                pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+                pins[f"{comp.name}__p4"] = comp.pin4_position_scene()
+                pins[f"{comp.name}__p5"] = comp.pin5_position_scene()
             elif comp.comp_type in ComponentItem.FOUR_PIN_TYPES:
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
                 pins[f"{comp.name}__p4"] = comp.pin4_position_scene()
@@ -950,6 +1038,48 @@ class CircuitScene(QGraphicsScene):
 
         return {pid: root_to_name[find(pid)] for pid in pin_ids}
 
+    # ── Instrumentos ─────────────────────────────
+    def _open_instrument_panel(self, item: ComponentItem):
+        """Abre el panel frontal del instrumento. Import perezoso para evitar
+        cargar Qt dialogs si nunca se abren."""
+        # Si ya hay un panel abierto para este item, lo levantamos al frente
+        existing = getattr(item, '_panel_dialog', None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        if item.comp_type == 'FGEN':
+            from ui.dialogs.function_generator_dialog import FunctionGeneratorDialog
+            self.push_undo()
+            dlg = FunctionGeneratorDialog(item, parent=None)
+            item._panel_dialog = dlg
+            dlg.changed.connect(lambda i=item: self.instrument_changed.emit(i))
+            dlg.show()
+            return
+
+        if item.comp_type == 'OSC':
+            from ui.dialogs.oscilloscope_dialog import OscilloscopeDialog
+            self.push_undo()
+            dlg = OscilloscopeDialog(item, parent=None)
+            item._panel_dialog = dlg
+            # Aunque sólo cambien parámetros visuales (Time/Div, etc.),
+            # propagamos `changed` para mantener consistencia con FGEN.
+            dlg.changed.connect(lambda i=item: self.instrument_changed.emit(i))
+            dlg.show()
+            return
+
+        if item.comp_type == 'MULTIMETER':
+            from ui.dialogs.multimeter_dialog import MultimeterDialog
+            self.push_undo()
+            dlg = MultimeterDialog(item, parent=None)
+            item._panel_dialog = dlg
+            # Cambiar V↔A modifica la R interna → la topología del solver
+            # cambia y hay que reconstruir el netlist live.
+            dlg.changed.connect(lambda i=item: self.instrument_changed.emit(i))
+            dlg.show()
+            return
+
     # ── Editar propiedades ───────────────────────
     def _edit_component(self, item: ComponentItem):
         dialog = ComponentDialog(item, COLORS)
@@ -984,6 +1114,10 @@ class CircuitScene(QGraphicsScene):
             # 4º nodo
             if item.comp_type in ComponentItem.FOUR_PIN_TYPES and 'node4' in data:
                 item.node4 = data['node4']
+            # 5º nodo (TL082)
+            if item.comp_type in ComponentItem.FIVE_PIN_TYPES:
+                if 'node4' in data: item.node4 = data['node4']
+                if 'node5' in data: item.node5 = data['node5']
             # Etiqueta inter-hoja
             if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT') and 'sheet_label' in data:
                 item.sheet_label = data['sheet_label']
@@ -1031,6 +1165,20 @@ def build_engine_components_for_item(item, pin_node):
 
     if item.comp_type in ComponentItem.DIGITAL_TYPES:
         return []
+    # El osciloscopio es un instrumento ideal: lee voltajes pero NO
+    # aporta stamps al MNA. FGEN sí aporta (lo trata el case 'FGEN' abajo).
+    if item.comp_type == 'OSC':
+        return []
+    # Multímetro: modelado como una única resistencia entre las dos puntas.
+    #   V mode  → R_in = 10 MΩ   (idealmente ∞ → no perturba)
+    #   A mode  → R_in = 1 mΩ    (idealmente 0 → mide corriente)
+    #   Ω mode  → 10 MΩ          (Ω requiere análisis offline)
+    if item.comp_type == 'MULTIMETER':
+        n1m = item.node1.strip() or pin_node.get(f"{item.name}__p1", f"iso_{item.name}_p1")
+        n2m = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
+        qty = getattr(item, 'meter_quantity', 'V')
+        R_in = 1e-3 if qty == 'A' else 1e7
+        return [Resistor(item.name, n1m, n2m, R_in)]
 
     n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", f"iso_{item.name}_p1")
     n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", "0")
@@ -1038,6 +1186,8 @@ def build_engine_components_for_item(item, pin_node):
            else pin_node.get(f"{item.name}__p3", "")))
     n4 = ((item.node4.strip() if hasattr(item, "node4") and item.node4.strip()
            else pin_node.get(f"{item.name}__p4", "")))
+    n5 = ((item.node5.strip() if hasattr(item, "node5") and item.node5.strip()
+           else pin_node.get(f"{item.name}__p5", "")))
 
     ct = item.comp_type
     try:
@@ -1053,6 +1203,18 @@ def build_engine_components_for_item(item, pin_node):
             return [VoltageSourceAC(item.name, n2, n1,
                                     amplitude=item.value, frequency=item.frequency,
                                     phase_deg=item.phase_deg, mode=item.ac_mode)]
+        if ct == 'FGEN':
+            # Generador de funciones: misma fuente que VAC pero con waveform,
+            # offset y duty configurables. La amplitud (item.value) se toma
+            # como "peak" por convención del FGEN (panel frontal del Multisim).
+            return [VoltageSourceAC(
+                item.name, n2, n1,
+                amplitude=item.value, frequency=item.frequency,
+                phase_deg=item.phase_deg, mode=item.ac_mode,
+                waveform=getattr(item, 'fgen_waveform', 'sin'),
+                offset=getattr(item, 'fgen_offset', 0.0),
+                duty=getattr(item, 'fgen_duty', 0.5),
+            )]
         if ct == 'I':
             return [CurrentSource(item.name, n1, n2, item.value)]
         if ct == 'C' and item.value > 0:
@@ -1092,6 +1254,17 @@ def build_engine_components_for_item(item, pin_node):
                            type_=t, Kn=item.value if item.value > 0 else 1e-3)]
         if ct == 'OPAMP':
             return [OpAmp(item.name, n1, n3 or f'vp_{item.name}', n2,
+                          A=item.value if item.value > 0 else 1e5)]
+        if ct == 'TL082':
+            # p1=OUT, p2=IN−, p3=IN+, p4=V+, p5=V−
+            # El modelo usa tierra (0) como referencia de la VCVS; V+ y V−
+            # son nodos de circuito que el usuario conecta a sus rieles de
+            # alimentación — su presencia en el netlist es suficiente para
+            # que el solver los tenga en cuenta.
+            return [OpAmp(item.name,
+                          n1,                              # n_out = OUT
+                          n3 or f'inp_{item.name}',        # n_p   = IN+
+                          n2,                              # n_n   = IN−
                           A=item.value if item.value > 0 else 1e5)]
         if ct == 'Z':
             import math as _m

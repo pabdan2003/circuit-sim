@@ -19,6 +19,15 @@ COMPONENT_NODE_LABELS: Dict[str, Tuple[str, str, Optional[str]]] = {
     'NMOS':    ('Drain (D)',    'Source (S)',        'Gate (G)'),
     'PMOS':    ('Drain (D)',    'Source (S)',        'Gate (G)'),
     'OPAMP':   ('Salida (OUT)', 'Entrada − (V−)',    'Entrada + (V+)'),
+    # Instrumentos
+    'FGEN':    ('Salida + (V+)', 'Salida − (V−)',    None),
+    'MULTIMETER': ('Punta + (rojo)', 'Punta − (negro)', None),
+}
+
+FIVE_PIN_NODE_LABELS: Dict[str, Tuple[str, str, str, str, str]] = {
+    # TL082 dual op-amp: OUT, IN−, IN+, V+, V−
+    'TL082': ('Salida (OUT)', 'Entrada − (IN−)', 'Entrada + (IN+)',
+              'Alimentación V+', 'Alimentación V−'),
 }
 
 FOUR_PIN_NODE_LABELS: Dict[str, Tuple[str, str, str, str]] = {
@@ -26,6 +35,9 @@ FOUR_PIN_NODE_LABELS: Dict[str, Tuple[str, str, str, str]] = {
                'Secundario + (S1)', 'Secundario − (S2)'),
     'BRIDGE': ('AC1 (entrada ~)', 'AC2 (entrada ~)',
                'DC + (salida +)', 'DC − (salida −)'),
+    # Osciloscopio: 2 canales diferenciales
+    'OSC':    ('Canal A +', 'Canal A −',
+               'Canal B +', 'Canal B −'),
 }
 
 VALUE_LABELS = {
@@ -42,8 +54,10 @@ VALUE_LABELS = {
     'NMOS': 'Kn — Transconductancia (A/V²)',
     'PMOS': 'Kp — Transconductancia (A/V²)',
     'OPAMP': 'A — Ganancia lazo abierto (V/V)',
+    'TL082': 'A — Ganancia lazo abierto (V/V)',
     'XFMR': 'V_pri nominal (V) — informativo',
     'BRIDGE': 'V_f por diodo (V) — informativo',
+    'FGEN': 'Amplitud (V)',
 }
 
 DIGITAL_GATE_TYPES = {'AND', 'OR', 'NOT', 'NAND', 'NOR', 'XOR'}
