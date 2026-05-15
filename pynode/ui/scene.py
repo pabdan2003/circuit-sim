@@ -19,10 +19,10 @@ from PyQt6.QtWidgets import QGraphicsScene, QMenu, QDialog
 from PyQt6.QtGui import QPainter, QPen, QBrush, QColor
 from PyQt6.QtCore import Qt, QPointF, QRectF, QLineF, pyqtSignal
 
-from ui.style import COLORS, GRID_SIZE, PIN_RADIUS, theme_revision
-from ui.items.component_item import ComponentItem
-from ui.dialogs.component_dialog import ComponentDialog
-from ui.items.wire_item import WireItem
+from pynode.ui.style import COLORS, GRID_SIZE, PIN_RADIUS, theme_revision
+from pynode.ui.items.component_item import ComponentItem
+from pynode.ui.dialogs.component_dialog import ComponentDialog
+from pynode.ui.items.wire_item import WireItem
 
 
 # ══════════════════════════════════════════════════════════════
@@ -245,7 +245,7 @@ class CircuitScene(QGraphicsScene):
         # ── Selector de unidad para CIs duales (TL082) ──────────────────
         _tl082_unit = 'A'
         if comp_type == 'TL082' and not name:
-            from ui.dialogs.tl082_unit_dialog import TL082UnitDialog
+            from pynode.ui.dialogs.tl082_unit_dialog import TL082UnitDialog
             _parent = self.views()[0].parent() if self.views() else None
             dlg = TL082UnitDialog(_parent)
             if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -1051,7 +1051,7 @@ class CircuitScene(QGraphicsScene):
             return
 
         if item.comp_type == 'FGEN':
-            from ui.dialogs.function_generator_dialog import FunctionGeneratorDialog
+            from pynode.ui.dialogs.function_generator_dialog import FunctionGeneratorDialog
             self.push_undo()
             dlg = FunctionGeneratorDialog(item, parent=None)
             item._panel_dialog = dlg
@@ -1060,7 +1060,7 @@ class CircuitScene(QGraphicsScene):
             return
 
         if item.comp_type == 'OSC':
-            from ui.dialogs.oscilloscope_dialog import OscilloscopeDialog
+            from pynode.ui.dialogs.oscilloscope_dialog import OscilloscopeDialog
             self.push_undo()
             dlg = OscilloscopeDialog(item, parent=None)
             item._panel_dialog = dlg
@@ -1071,7 +1071,7 @@ class CircuitScene(QGraphicsScene):
             return
 
         if item.comp_type == 'MULTIMETER':
-            from ui.dialogs.multimeter_dialog import MultimeterDialog
+            from pynode.ui.dialogs.multimeter_dialog import MultimeterDialog
             self.push_undo()
             dlg = MultimeterDialog(item, parent=None)
             item._panel_dialog = dlg
@@ -1158,7 +1158,7 @@ def build_engine_components_for_item(item, pin_node):
       • XFMR    → 1 Transformer  (4 nodos).
       • BRIDGE  → 4 Diodes interconectados como puente.
     """
-    from engine import (
+    from pynode.engine import (
         Resistor, VoltageSource, VoltageSourceAC, CurrentSource,
         Capacitor, Inductor, Diode, BJT, MOSFET, OpAmp, Impedance,
         Potentiometer, Transformer,

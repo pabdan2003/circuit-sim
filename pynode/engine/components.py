@@ -1,6 +1,66 @@
 """
-Componentes del circuito.
-Cada componente sabe estampar su contribución en la matriz MNA.
+Modelos de componentes para el motor MNA.
+
+Cada componente sabe "estampar" (stamp) su contribución sobre la matriz
+del sistema y el vector de excitación. El solver no necesita conocer la
+física interna del componente; basta con que cada uno implemente las
+ecuaciones de su modelo en formato matricial.
+
+Convenciones globales del motor
+-------------------------------
+Nodos
+    Los nodos son strings arbitrarios. El nodo "0" (cero) es siempre
+    masa (GND, 0 V de referencia). Cualquier otro literal sirve como
+    nombre de nodo ("in", "out", "n1", "A", "Vcc", etc.).
+
+Unidades
+    Todas las magnitudes están en SI sin prefijos: V, A, Ω, F, H, s, Hz.
+    El parseo de "1k", "10u", "2.2n" lo hace la UI antes de instanciar.
+
+Convención de signos
+    · VoltageSource(n_pos, n_neg, V) y VoltageSourceAC: V positivo
+      significa V(n_pos) − V(n_neg) = +V.
+    · CurrentSource(n_pos, n_neg, I): convención SPICE — I positivo
+      bombea corriente internamente desde n_pos hacia n_neg, así que
+      EXTERNAMENTE la corriente sale por n_neg y entra por n_pos. Ver
+      docstring de la clase para el ejemplo numérico.
+    · Diodo / LED: ánodo a n_a, cátodo a n_k. Conducción cuando
+      V(n_a) − V(n_k) > Vf.
+    · BJT y MOSFET: la clase normaliza internamente para que las
+      ecuaciones de NMOS/NPN sigan siendo válidas en PMOS/PNP por
+      multiplicación de signo. Los `operating_point` devuelven los
+      voltajes con el signo "físico" del usuario, no el interno.
+
+Métodos que cada componente puede implementar
+---------------------------------------------
+    stamp(G, I, node_map, branch_idx)
+        Caso DC y caso por defecto del transitorio. Obligatorio.
+
+    stamp_ac(G, I, node_map, omega, branch_idx)
+        Estampado para análisis en frecuencia. Solo lo implementan los
+        componentes reactivos (C, L, Impedance) o los que tienen
+        comportamiento distinto en AC (XFMR).
+
+    stamp_transient(G, I, node_map, t, branch_idx)
+        Para fuentes que dependen del tiempo (VoltageSourceAC con
+        forma de onda) o componentes con comportamiento dinámico que
+        difieren del DC (XFMR, que en DC desacopla devanados).
+        Si no se define, se usa stamp() — válido para R, V, I, etc.
+
+    stamp_linear(G, I, node_map, V)
+        Componentes no-lineales (Diode, BJT, MOSFET). El solver llama
+        a este método dentro de cada iteración Newton-Raphson pasando
+        el vector de estado actual V; el método linealiza el modelo
+        alrededor de ese punto (equivalente de Norton) y lo estampa.
+
+    needs_branch() -> bool
+        True si el componente requiere una variable extra de rama
+        (corriente). Aplica a fuentes de voltaje, inductores en DC,
+        op-amps (VCVS interna) y transformadores.
+
+    operating_point -> dict
+        Propiedad opcional con valores físicamente relevantes tras un
+        solve_dc (voltajes de juntura, regiones de operación, etc.).
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -109,7 +169,25 @@ class VoltageSource(Component):
 # ──────────────────────────────────────────────
 class CurrentSource(Component):
     """
-    Fuente de corriente de n_neg → n_pos (convención: corriente sale de n_pos).
+    Fuente de corriente independiente — convención SPICE.
+
+    Para CurrentSource(n_pos, n_neg, I) con I positivo:
+        · La fuente bombea I amperios INTERNAMENTE desde n_pos hacia n_neg.
+        · Externamente (a través del circuito) la corriente vuelve de n_neg
+          a n_pos. Es decir: en el lado externo, la corriente SALE por n_neg
+          y ENTRA por n_pos.
+
+    Consecuencia práctica en KCL:
+        · En n_pos la fuente CONSUME I amperios   → I[n_pos] -= I_val
+        · En n_neg la fuente INYECTA I amperios   → I[n_neg] += I_val
+
+    Esto importa al interpretar resultados. Ejemplo: una fuente Is=2A entre
+    "A" y "0" con dos resistores de 4Ω en paralelo entre A y "0" (Req=2Ω)
+    da V_A = -4V, no +4V. La corriente atraviesa los resistores de "0" a
+    "A" en sentido externo, y por la ley de Ohm V_A = V_0 - I·Req = -4V.
+    Para obtener V_A = +4V hay que invertir los nodos: CurrentSource("Is", "0", "A", 2.0).
+
+    Es la misma convención que usa SPICE para la directiva "Iname n+ n-".
     """
     def __init__(self, name: str, n_pos: str, n_neg: str, current: float):
         super().__init__(name)
@@ -121,10 +199,12 @@ class CurrentSource(Component):
         np_ = node_map.get(self.n_pos)
         nn  = node_map.get(self.n_neg)
 
+        # KCL en cada nodo: la fuente consume I en n_pos y la inyecta en n_neg.
+        # Mover los signos al lado derecho de Gv = I → I[n_pos] -= I_val, I[n_neg] += I_val.
         if np_ is not None:
-            I[np_] -= self.I_val  # Sale del nodo positivo (KCL: corrientes salientes = 0)
+            I[np_] -= self.I_val
         if nn is not None:
-            I[nn] += self.I_val   # Entra al nodo negativo
+            I[nn] += self.I_val
 
 
 # ──────────────────────────────────────────────

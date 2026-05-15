@@ -310,7 +310,7 @@ class DAC:
         Retorna el componente encontrado o None.
         """
         target = source_name or self.name
-        from engine.components import VoltageSource, CurrentSource
+        from pynode.engine.components import VoltageSource, CurrentSource
         for c in mna_components:
             if c.name == target:
                 if isinstance(c, VoltageSource):

@@ -24,10 +24,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QPainter, QPen, QColor, QBrush, QPainterPath, QFont
 from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 
-from ui.style import COLORS, _qfont
+from pynode.ui.style import COLORS, _qfont
 
 if TYPE_CHECKING:
-    from ui.items.component_item import ComponentItem
+    from pynode.ui.items.component_item import ComponentItem
 
 
 # Presets razonables, en segundos por división
@@ -415,7 +415,7 @@ class OscilloscopeDialog(QDialog):
     def _on_hardware_button(self):
         """Abre el sub-diálogo de hardware. Si el usuario acepta y hay
         un hilo previo corriendo, lo desconecta primero."""
-        from ui.dialogs.hardware_source_dialog import HardwareSourceDialog
+        from pynode.ui.dialogs.hardware_source_dialog import HardwareSourceDialog
         is_connected = self._hw_thread is not None and self._hw_thread.isRunning()
         if is_connected:
             # Botón funciona como "Desconectar" cuando ya hay stream
@@ -438,7 +438,7 @@ class OscilloscopeDialog(QDialog):
         self._start_hw_thread(cfg)
 
     def _start_hw_thread(self, cfg: dict):
-        from engine.hw_stream import HardwareStreamThread
+        from pynode.engine.hw_stream import HardwareStreamThread
         self.screen.clear()
         self._hw_thread = HardwareStreamThread(cfg, parent=self)
         self._hw_thread.samples_received.connect(self._on_hw_samples)

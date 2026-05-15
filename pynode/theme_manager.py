@@ -19,7 +19,7 @@ Para crear un tema instalable por separado basta con:
 
 Uso desde código:
 
-    from themes import ThemeManager
+    from pynode.theme_manager import ThemeManager
     tm = ThemeManager()
     tm.refresh()                        # descubre temas externos
     tm.list_themes()                    # [{'id', 'name', 'source'}, …]
@@ -177,7 +177,10 @@ class ThemeManager:
 
     def __init__(self, app_dir: Optional[str] = None):
         if app_dir is None:
-            app_dir = os.path.dirname(os.path.abspath(__file__))
+            # theme_manager.py vive dentro del paquete `pynode/`. La carpeta
+            # `themes/` está al lado del paquete, en la raíz del proyecto,
+            # así que subimos un nivel.
+            app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.app_dir = app_dir
 
         self.user_dir   = os.path.join(os.path.expanduser('~'), '.pynode')

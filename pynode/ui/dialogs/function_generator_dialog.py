@@ -24,10 +24,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QPainter, QPen, QColor, QBrush, QPainterPath, QFont
 from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 
-from ui.style import COLORS, _qfont
+from pynode.ui.style import COLORS, _qfont
 
 if TYPE_CHECKING:
-    from ui.items.component_item import ComponentItem
+    from pynode.ui.items.component_item import ComponentItem
 
 
 _FREQ_MULT = {'Hz': 1.0, 'kHz': 1e3, 'MHz': 1e6}

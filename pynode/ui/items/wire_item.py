@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import QGraphicsLineItem, QGraphicsItem
 from PyQt6.QtGui import QPen, QColor
 from PyQt6.QtCore import Qt, QPointF, QLineF
 
-from ui.style import COLORS
+from pynode.ui.style import COLORS
 
 
 # ══════════════════════════════════════════════════════════════

@@ -33,25 +33,24 @@ from PyQt6.QtCore import (
 )
 
 # Motor MNA
-sys.path.insert(0, os.path.dirname(__file__))
-from engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor
-from engine import Diode, BJT, MOSFET, OpAmp, Impedance, MNASolver
-from circuit_analyzer import (
+from pynode.engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSource, Capacitor, Inductor
+from pynode.engine import Diode, BJT, MOSFET, OpAmp, Impedance, MNASolver
+from pynode.circuit_analyzer import (
     CircuitAnalyzer, ImplicitBridgeDetector,
     LOGIC_STANDARDS, DEFAULT_STANDARD, AnalysisFlags,
 )
-from ui.component_metadata import (
+from pynode.ui.component_metadata import (
     COMPONENT_NODE_LABELS,
     DEFAULT_NODE_LABELS,
     DIGITAL_FLIPFLOP_TYPES,
     DIGITAL_GATE_TYPES,
     FOUR_PIN_NODE_LABELS,
 )
-from ui.dialogs.component_dialog import ComponentDialog
-from ui.dialogs.component_picker_dialog import ComponentPickerDialog
-from ui.dialogs.power_triangle_dialog import PowerTriangleDialog
-from ui.dialogs.resistor_calc_dialog import ResistorCalcDialog
-from ui.dialogs.settings_dialog import SettingsDialog
+from pynode.ui.dialogs.component_dialog import ComponentDialog
+from pynode.ui.dialogs.component_picker_dialog import ComponentPickerDialog
+from pynode.ui.dialogs.power_triangle_dialog import PowerTriangleDialog
+from pynode.ui.dialogs.resistor_calc_dialog import ResistorCalcDialog
+from pynode.ui.dialogs.settings_dialog import SettingsDialog
 
 
 # ══════════════════════════════════════════════════════════════
@@ -60,8 +59,8 @@ from ui.dialogs.settings_dialog import SettingsDialog
 # Reexportados desde ui.style para mantener compatibilidad con el resto
 # del código de main.py (y para que el import de este módulo dispare la
 # carga del tema inicial).
-from ui import style as _style
-from ui.style import (
+from pynode.ui import style as _style
+from pynode.ui.style import (
     GRID_SIZE, COMP_W, COMP_H, PIN_RADIUS,
     DEFAULT_LOGIC_STANDARD,
     COLORS, THEME_MANAGER, apply_theme_to_colors,
@@ -73,14 +72,14 @@ from ui.style import (
 # ══════════════════════════════════════════════════════════════
 # ÍTEMS GRÁFICOS DEL CANVAS (extraídos)
 # ══════════════════════════════════════════════════════════════
-from ui.items.component_item import ComponentItem
-from ui.items.wire_item import WireItem
+from pynode.ui.items.component_item import ComponentItem
+from pynode.ui.items.wire_item import WireItem
 
         
 # ══════════════════════════════════════════════════════════════
 # ESCENA DEL CIRCUITO (extraída)
 # ══════════════════════════════════════════════════════════════
-from ui.scene import CircuitScene, build_engine_components_for_item
+from pynode.ui.scene import CircuitScene, build_engine_components_for_item
 
 # ══════════════════════════════════════════════════════════════
 # VENTANA PRINCIPAL
@@ -331,7 +330,7 @@ class MainWindow(QMainWindow):
         # Import perezoso: el diálogo importa símbolos de main.py (ComponentItem,
         # WireItem, COLORS, etc.), por eso se carga en el momento de uso para
         # evitar una importación circular en tiempo de carga del módulo.
-        from ui.dialogs.circuit_analyzer_dialog import CircuitAnalyzerDialog
+        from pynode.ui.dialogs.circuit_analyzer_dialog import CircuitAnalyzerDialog
         state = getattr(self, '_analyzer_state', None)
         dlg = CircuitAnalyzerDialog(parent=self, initial_state=state)
         dlg.exec()
@@ -345,7 +344,7 @@ class MainWindow(QMainWindow):
         """Abre el analizador de Bode (barrido AC + plots de magnitud y fase).
         No-modal: se puede dejar abierto mientras editas el circuito y
         recalcular al gusto."""
-        from ui.dialogs.bode_dialog import BodeDialog
+        from pynode.ui.dialogs.bode_dialog import BodeDialog
         dlg = BodeDialog(self.scene, COLORS, parent=self)
         dlg.show()
 
@@ -1381,11 +1380,11 @@ class MainWindow(QMainWindow):
     def _run_simulation_auto(self, flags=None, pin_node=None):
         """Corre DC + AC + mixto según flags y muestra todo en un panel."""
         from PyQt6.QtWidgets import QApplication
-        from engine.digital_engine import (
+        from pynode.engine.digital_engine import (
             DigitalSimulator, Gate, DFF, JKFF, TFF, SRFF, BinaryCounter, MUX,
         )
-        from engine.bridges import ADC, DAC, ComparatorBridge, PWMBridge
-        from engine.mixed_signal import MixedSignalInterface
+        from pynode.engine.bridges import ADC, DAC, ComparatorBridge, PWMBridge
+        from pynode.engine.mixed_signal import MixedSignalInterface
         import cmath as _cmath
 
         if pin_node is None:
@@ -2334,12 +2333,12 @@ class MainWindow(QMainWindow):
           - Puentes ADC/DAC desde los bloques ADC_BRIDGE / DAC_BRIDGE
         Luego lanza MixedSignalInterface.run_iterative() y muestra resultados.
         """
-        from engine.digital_engine import (
+        from pynode.engine.digital_engine import (
             DigitalSimulator, Gate, DFF, JKFF, TFF, SRFF,
             BinaryCounter, MUX,
         )
-        from engine.bridges import ADC, DAC, ComparatorBridge, PWMBridge
-        from engine.mixed_signal import MixedSignalInterface
+        from pynode.engine.bridges import ADC, DAC, ComparatorBridge, PWMBridge
+        from pynode.engine.mixed_signal import MixedSignalInterface
 
         # ── Parámetros de simulación ─────────────────────────────────────
         t_stop = 1e-3      # 1 ms por defecto

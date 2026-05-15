@@ -22,10 +22,10 @@ Clases:
     TimingAnalyzer        — analiza skew, setup/hold violations post-sim
 
 Uso básico:
-    from engine import MNASolver, Resistor, VoltageSource, Capacitor
-    from engine.digital_engine import DigitalSimulator, DFF, Gate
-    from engine.bridges import ADC, DAC, ComparatorBridge
-    from engine.mixed_signal import MixedSignalInterface
+    from pynode.engine import MNASolver, Resistor, VoltageSource, Capacitor
+    from pynode.engine.digital_engine import DigitalSimulator, DFF, Gate
+    from pynode.engine.bridges import ADC, DAC, ComparatorBridge
+    from pynode.engine.mixed_signal import MixedSignalInterface
 
     mna  = MNASolver()
     dsim = DigitalSimulator()
