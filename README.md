@@ -15,7 +15,7 @@ PyNode es un entorno de captura de esquemáticos y simulación construido en Pyt
 - **Análisis DC** — lineal y no-lineal (Newton-Raphson) con continuación de fuente para circuitos con diodos, LEDs, BJT, MOSFET y op-amps.
 - **Análisis AC** — barrido en frecuencia con factorización LU cacheada por punto de frecuencia.
 - **Análisis transitorio** — paso adaptativo con control de error LTE y refinamiento automático ante conmutaciones (LED, diodos, comparadores).
-- **Motor digital** — simulación a eventos con propagación de niveles lógicos, estados X/Z y estándares configurables (TTL, CMOS 3.3/5V).
+- **Motor digital** — simulación a eventos con propagación de niveles lógicos y estados X/Z.
 - **Señal mixta** — puentes ADC, DAC, comparador, PWM y sample-and-hold acoplan el dominio analógico con el digital sobre un mismo timestep.
 
 ### Componentes soportados
@@ -42,7 +42,7 @@ PyNode es un entorno de captura de esquemáticos y simulación construido en Pyt
 - **Analizador de circuito** — detección de puentes implícitos y validación topológica previa a la simulación.
 - **Calculadora de resistencias** — código de colores ↔ valor, serie E12/E24/E96.
 - **Triángulo de potencia** — P, Q, S y factor de potencia para análisis AC.
-- **Temas** — soporte para temas JSON (incluidos: UMG, Solarized Dark).
+- **Temas** — soporte para temas JSON personalizables.
 
 ---
 
@@ -51,7 +51,7 @@ PyNode es un entorno de captura de esquemáticos y simulación construido en Pyt
 **Requisitos:** Python 3.10 o superior, Windows / Linux / macOS.
 
 ```bash
-git clone https://github.com/<usuario>/PyNode.git
+git clone https://github.com/pabdan2003/PyNode.git
 cd PyNode
 python -m venv .venv
 # Windows
@@ -66,11 +66,11 @@ python main.py
 
 ## Uso rápido
 
-1. Abrí PyNode con `python main.py`.
-2. Arrastrá componentes desde el panel lateral al canvas.
-3. Conectá pines haciendo clic en un pin y luego en otro (cables ortogonales).
-4. Doble clic en un componente para editar su valor.
-5. Apretá **Simular DC** para el punto de operación, o **Simular en vivo** para ver evolución temporal con instrumentos conectados.
+1. Abre PyNode con `python main.py`.
+2. Arrastra componentes desde el panel lateral al canvas.
+3. Conecta pines haciendo clic en un pin y luego en otro (cables ortogonales).
+4. Haz doble clic en un componente para editar su valor.
+5. Pulsa **Simular DC** para el punto de operación, o **Simular en vivo** para ver la evolución temporal con instrumentos conectados.
 
 ![Demo de simulación en vivo](docs/img/demo-live.gif)
 
@@ -124,7 +124,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-Cada push y pull request corre la suite contra Python 3.10, 3.11 y 3.12 en GitHub Actions (ver `.github/workflows/ci.yml`).
+Cada push y pull request ejecuta la suite contra Python 3.10, 3.11 y 3.12 en GitHub Actions (ver `.github/workflows/ci.yml`).
 
 ---
 
@@ -145,10 +145,10 @@ Cada push y pull request corre la suite contra Python 3.10, 3.11 y 3.12 en GitHu
 
 Las contribuciones son bienvenidas. Antes de abrir un PR:
 
-1. Leé [`docs/architecture.md`](docs/architecture.md) para entender la separación entre motores y las convenciones globales (signos, unidades, nombres de nodos).
-2. Ejecutá los tests existentes y agregá los que correspondan al cambio.
-3. Para cambios en el motor, incluí un caso de validación contra una solución analítica conocida.
-4. Para cambios visuales, adjuntá captura antes/después.
+1. Lee [`docs/architecture.md`](docs/architecture.md) para entender la separación entre motores y las convenciones globales (signos, unidades, nombres de nodos).
+2. Ejecuta los tests existentes y añade los que correspondan al cambio.
+3. Para cambios en el motor, incluye un caso de validación contra una solución analítica conocida.
+4. Para cambios visuales, adjunta una captura antes/después.
 
 Mapas rápidos por paquete:
 

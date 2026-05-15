@@ -37,7 +37,7 @@ from pynode.engine import Resistor, VoltageSource, VoltageSourceAC, CurrentSourc
 from pynode.engine import Diode, BJT, MOSFET, OpAmp, Impedance, MNASolver
 from pynode.circuit_analyzer import (
     CircuitAnalyzer, ImplicitBridgeDetector,
-    LOGIC_STANDARDS, DEFAULT_STANDARD, AnalysisFlags,
+    DEFAULT_STANDARD, AnalysisFlags,
 )
 from pynode.ui.component_metadata import (
     COMPONENT_NODE_LABELS,
@@ -62,7 +62,6 @@ from pynode.ui.dialogs.settings_dialog import SettingsDialog
 from pynode.ui import style as _style
 from pynode.ui.style import (
     GRID_SIZE, COMP_W, COMP_H, PIN_RADIUS,
-    DEFAULT_LOGIC_STANDARD,
     COLORS, THEME_MANAGER, apply_theme_to_colors,
     _qfont, theme_revision,
     _INITIAL_THEME_ID,
@@ -901,8 +900,7 @@ class MainWindow(QMainWindow):
         self._sim_all_comps = all_comps
         self._sim_pin_node = pin_node
 
-        std_name = DEFAULT_LOGIC_STANDARD
-        analyzer = CircuitAnalyzer(logic_standard=std_name)
+        analyzer = CircuitAnalyzer()
         flags = analyzer.analyze(all_comps, pin_node)
 
         self.results_text.setPlainText(flags.summary() + "\n\nAnalizando...")
@@ -1391,13 +1389,10 @@ class MainWindow(QMainWindow):
             pin_node = getattr(self, '_sim_pin_node', None) or self.scene.extract_netlist()
         if flags is None:
             sim_comps_for_flags = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
-            std_name = DEFAULT_LOGIC_STANDARD
-            analyzer = CircuitAnalyzer(logic_standard=std_name)
+            analyzer = CircuitAnalyzer()
             flags = analyzer.analyze(sim_comps_for_flags, pin_node)
 
         sim_components = getattr(self, '_sim_all_comps', None) or list(self.scene.components)
-
-        std_name = DEFAULT_LOGIC_STANDARD
 
         # Detectar y mostrar el modo seleccionado automáticamente
         _modes = []
@@ -1587,8 +1582,8 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     build_errors.append(f"{item.name}: {e}")
             if flags.implicit_boundary_nodes:
-                std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
-                out.append(f"── Fronteras implícitas ({std_name}) ──")
+                std = DEFAULT_STANDARD
+                out.append(f"── Fronteras implícitas ({std.name}) ──")
                 for node in flags.implicit_boundary_nodes:
                     out.append(f"  Nodo '{node}'")
                     adc_list.append(ADC(f"__impl_{node}", node=node, bits=1, vref=std.Vdd))
@@ -1673,8 +1668,7 @@ class MainWindow(QMainWindow):
                 if item.comp_type in ComponentItem.DIGITAL_TYPES:
                     # LOGIC_STATE / CLK: modelar como fuente de voltaje ideal
                     if item.comp_type in ('LOGIC_STATE', 'CLK'):
-                        std_name = DEFAULT_LOGIC_STANDARD
-                        std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+                        std = DEFAULT_STANDARD
                         v_out = std.Voh if item.value else std.Vol
                         out_node = item.node1.strip() or pin_node.get(f"{item.name}__p1", f"ls_{item.name}")
                         if out_node and out_node not in ('0', 'gnd', 'GND'):
@@ -1742,8 +1736,7 @@ class MainWindow(QMainWindow):
             # FIX: construir dc_voltages desde los LOGIC_STATE antes de
             # llamar a _evaluate_digital_gates. Sin esto, el diccionario
             # llega vacío y todas las entradas se leen como 0 V (LOW).
-            std_name = DEFAULT_LOGIC_STANDARD
-            std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+            std = DEFAULT_STANDARD
             _dig_voltages = {}
             for _it in sim_comps:
                 if _it.comp_type in ('LOGIC_STATE', 'CLK'):
@@ -1897,8 +1890,7 @@ class MainWindow(QMainWindow):
 
 
     def _evaluate_digital_gates(self, pin_node, dc_voltages, silent=False, out=None, sim_comps=None):
-        std_name = DEFAULT_LOGIC_STANDARD
-        std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+        std = DEFAULT_STANDARD
         _gmap = {'AND':'AND','OR':'OR','NOT':'NOT','NAND':'NAND','NOR':'NOR','XOR':'XOR'}
         _funcs = {
             'AND':  lambda vals: all(vals),
@@ -2574,8 +2566,7 @@ class MainWindow(QMainWindow):
         else:
             # Aunque no esté en modo continuo, actualizar igual (one-shot silencioso)
             pin_node = self.scene.extract_netlist()
-            std_name = DEFAULT_LOGIC_STANDARD
-            std = LOGIC_STANDARDS.get(std_name, DEFAULT_STANDARD)
+            std = DEFAULT_STANDARD
             # Calcular voltaje del estado y actualizar display del prop_table
             v = std.Voh if item.value else std.Vol
             self._on_component_selected(item)

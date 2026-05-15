@@ -18,9 +18,6 @@ COMP_W      = 60
 COMP_H      = 30
 PIN_RADIUS  = 4
 
-# Estándar lógico digital usado en TODA la app (no es configurable por UI).
-DEFAULT_LOGIC_STANDARD = 'CMOS_5V'
-
 
 # ── Paleta de colores (mutable, compartida en toda la app) ───────────────
 # Diccionario MUTABLE: todos los módulos leen la misma instancia, así

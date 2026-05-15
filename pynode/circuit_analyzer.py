@@ -8,12 +8,19 @@ Antes de correr cualquier solver, el motor inspecciona el netlist y decide:
 Filosofía de frontera implícita (como Multisim internamente):
     El usuario conecta un cable entre la salida de un op-amp y la entrada
     de un DFF. El motor detecta que ese nodo es "frontera" y aplica la
-    conversión usando los umbrales lógicos del estándar configurado
-    (CMOS 3.3V, CMOS 5V, TTL, etc.) — sin requerir un bloque ADC/DAC
-    explícito en el canvas.
+    conversión usando los umbrales lógicos de CMOS 5 V (DEFAULT_STANDARD),
+    sin requerir un bloque ADC/DAC explícito en el canvas.
+
+Nota sobre estándares lógicos:
+    El motor trabaja únicamente con CMOS 5 V. En versiones previas existía
+    soporte para múltiples estándares (CMOS 3V3, TTL, LVTTL, LVDS), pero
+    se retiraron porque su comportamiento en frontera no quedó suficientemente
+    validado y el selector nunca llegó a la UI. Si en el futuro hace falta
+    reintroducir otros estándares, basta con añadirlos como instancias de
+    `LogicStandard` y exponer la selección en `SettingsDialog`.
 
 Clases:
-    LogicStandard      — umbrales Vil/Vih/Vol/Voh por estándar
+    LogicStandard      — umbrales Vil/Vih/Vol/Voh de un estándar lógico
     AnalysisFlags      — resultado del análisis estático
     CircuitAnalyzer    — analiza un netlist y produce AnalysisFlags
     ImplicitBridgeDetector  — detecta y aplica conversiones implícitas
@@ -69,16 +76,10 @@ class LogicStandard:
         return self.Voh if level else self.Vol
 
 
-# Tabla de estándares predefinidos
-LOGIC_STANDARDS: Dict[str, LogicStandard] = {
-    'CMOS_3V3': LogicStandard('CMOS_3V3', Vdd=3.3,  Vil=1.0,  Vih=2.3,  Vol=0.1,  Voh=3.2),
-    'CMOS_5V':  LogicStandard('CMOS_5V',  Vdd=5.0,  Vil=1.5,  Vih=3.5,  Vol=0.1,  Voh=4.9),
-    'TTL':      LogicStandard('TTL',       Vdd=5.0,  Vil=0.8,  Vih=2.0,  Vol=0.4,  Voh=2.4),
-    'LVTTL':    LogicStandard('LVTTL',     Vdd=3.3,  Vil=0.8,  Vih=2.0,  Vol=0.4,  Voh=2.4),
-    'LVDS':     LogicStandard('LVDS',      Vdd=2.5,  Vil=0.9,  Vih=1.1,  Vol=0.9,  Voh=1.1),
-}
-
-DEFAULT_STANDARD = LOGIC_STANDARDS['CMOS_3V3']
+# Único estándar lógico soportado actualmente (CMOS 5 V).
+DEFAULT_STANDARD = LogicStandard(
+    name='CMOS_5V', Vdd=5.0, Vil=1.5, Vih=3.5, Vol=0.1, Voh=4.9,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -209,14 +210,14 @@ class CircuitAnalyzer:
     y produce AnalysisFlags.
 
     Uso:
-        analyzer = CircuitAnalyzer(logic_standard='CMOS_3V3')
+        analyzer = CircuitAnalyzer()
         flags = analyzer.analyze(scene_components, pin_node_map)
         print(flags.summary())
         # → Análisis detectado: DC + AC
     """
 
-    def __init__(self, logic_standard: str = 'CMOS_3V3'):
-        self.std = LOGIC_STANDARDS.get(logic_standard, DEFAULT_STANDARD)
+    def __init__(self):
+        self.std = DEFAULT_STANDARD
 
     def analyze(self,
                 scene_components: list,
@@ -328,11 +329,11 @@ class ImplicitBridgeDetector:
         - Al extraer el netlist, busca nodos compartidos entre componentes
           analógicos y digitales.
         - En esos nodos aplica la conversión usando los umbrales lógicos
-          del estándar configurado (Vdd, Vil, Vih...).
+          de CMOS 5 V (Vdd, Vil, Vih...).
         - El "puente" existe solo durante la simulación, no en el netlist.
 
     Uso en co-simulación:
-        detector = ImplicitBridgeDetector(flags, standard='CMOS_3V3')
+        detector = ImplicitBridgeDetector(flags)
 
         # En cada paso analógico → digital:
         d_updates = detector.analog_to_digital(v_snap)
@@ -343,11 +344,9 @@ class ImplicitBridgeDetector:
         # v_updates: {nodo_analógico: voltaje} para fuentes controladas
     """
 
-    def __init__(self,
-                 flags: AnalysisFlags,
-                 standard: str = 'CMOS_3V3'):
+    def __init__(self, flags: AnalysisFlags):
         self.flags = flags
-        self.std   = LOGIC_STANDARDS.get(standard, DEFAULT_STANDARD)
+        self.std   = DEFAULT_STANDARD
         # Cache del último nivel lógico por nodo
         self._last_logic: Dict[str, Optional[int]] = {}
 
