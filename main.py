@@ -341,6 +341,14 @@ class MainWindow(QMainWindow):
         dlg = ResistorCalcDialog(colors=COLORS, parent=self)
         dlg.exec()
 
+    def _open_bode_analyzer(self):
+        """Abre el analizador de Bode (barrido AC + plots de magnitud y fase).
+        No-modal: se puede dejar abierto mientras editas el circuito y
+        recalcular al gusto."""
+        from ui.dialogs.bode_dialog import BodeDialog
+        dlg = BodeDialog(self.scene, COLORS, parent=self)
+        dlg.show()
+
     def _build_tools_button(self):
         """Construye el QToolButton 'Herramientas' con menú desplegable.
         Aparece justo después del botón '+ Hoja' en la toolbar principal.
@@ -357,6 +365,9 @@ class MainWindow(QMainWindow):
         act_analyze = QAction("Analizar Circuito…", self)
         act_analyze.triggered.connect(self._open_circuit_analyzer)
         menu.addAction(act_analyze)
+        act_bode = QAction("Análisis de Bode / Transferencia…", self)
+        act_bode.triggered.connect(self._open_bode_analyzer)
+        menu.addAction(act_bode)
         act_resistor_calc = QAction("Código de colores…", self)
         act_resistor_calc.triggered.connect(self._open_resistor_calculator)
         menu.addAction(act_resistor_calc)

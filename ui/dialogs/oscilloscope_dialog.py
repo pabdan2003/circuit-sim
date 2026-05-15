@@ -215,6 +215,10 @@ class OscilloscopeDialog(QDialog):
         # Tamaño cómodo por defecto, redimensionable
         self.resize(820, 460)
 
+        # Hardware: hilo + configuración persistida en el item.
+        self._hw_thread = None
+        self._hw_cfg = dict(getattr(item, 'osc_hw_config', {}) or {})
+
         self._build_ui()
         self._load_from_item()
         self._sync_screen()   # llevar config al widget pantalla
@@ -290,8 +294,19 @@ class OscilloscopeDialog(QDialog):
         self.btn_clear = QPushButton("Limpiar")
         self.btn_clear.clicked.connect(self._on_clear)
         btn_row.addWidget(self.btn_clear)
+        self.btn_hw = QPushButton("Hardware…")
+        self.btn_hw.setToolTip(
+            "Conecta el osciloscopio a un micro (RP2040 / STM32 / …) "
+            "vía USB-CDC, o usa Mock device para probar sin hardware.")
+        self.btn_hw.clicked.connect(self._on_hardware_button)
+        btn_row.addWidget(self.btn_hw)
         btn_row.addStretch(1)
         right.addLayout(btn_row)
+
+        # Etiqueta de estado del HW (cambia de color según conexión)
+        self.lbl_hw_status = QLabel('HW desconectado')
+        self.lbl_hw_status.setStyleSheet('color: #888888;')
+        right.addWidget(self.lbl_hw_status)
         right.addStretch(1)
 
         root.addLayout(right)
@@ -396,8 +411,79 @@ class OscilloscopeDialog(QDialog):
         v_b = diff(n_bp, n_bm)
         self.screen.push(t_arr, v_a, v_b)
 
+    # ── Hardware ────────────────────────────────────────────────────────
+    def _on_hardware_button(self):
+        """Abre el sub-diálogo de hardware. Si el usuario acepta y hay
+        un hilo previo corriendo, lo desconecta primero."""
+        from ui.dialogs.hardware_source_dialog import HardwareSourceDialog
+        is_connected = self._hw_thread is not None and self._hw_thread.isRunning()
+        if is_connected:
+            # Botón funciona como "Desconectar" cuando ya hay stream
+            self._stop_hw_thread()
+            self._set_hw_status(False, msg='HW desconectado')
+            self.btn_hw.setText('Hardware…')
+            return
+        dlg = HardwareSourceDialog(self._hw_cfg, COLORS, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cfg = dlg.get_result()
+        if not cfg:
+            return
+        self._hw_cfg = cfg
+        # Persistir en el item para que sobreviva save/load y reopen del panel.
+        try:
+            self.item.osc_hw_config = dict(cfg)
+        except Exception:
+            pass
+        self._start_hw_thread(cfg)
+
+    def _start_hw_thread(self, cfg: dict):
+        from engine.hw_stream import HardwareStreamThread
+        self.screen.clear()
+        self._hw_thread = HardwareStreamThread(cfg, parent=self)
+        self._hw_thread.samples_received.connect(self._on_hw_samples)
+        self._hw_thread.error_occurred.connect(self._on_hw_error)
+        self._hw_thread.connection_state.connect(self._on_hw_state)
+        self._hw_thread.start()
+        self.btn_hw.setText('Desconectar HW')
+
+    def _stop_hw_thread(self):
+        if self._hw_thread is None:
+            return
+        try:
+            self._hw_thread.stop()
+        except Exception:
+            pass
+        self._hw_thread = None
+
+    def _on_hw_samples(self, ts: list, va: list, vb: list):
+        """Empuja a la pantalla las muestras del HW como si vinieran del sim."""
+        self.screen.push(ts, va, vb)
+
+    def _on_hw_state(self, connected: bool):
+        if connected:
+            self._set_hw_status(True, msg='HW conectado')
+        else:
+            self._set_hw_status(False, msg='HW desconectado')
+            self.btn_hw.setText('Hardware…')
+
+    def _on_hw_error(self, msg: str):
+        self._set_hw_status(False, msg=f'Error HW: {msg}')
+        self.btn_hw.setText('Hardware…')
+
+    def _set_hw_status(self, connected: bool, msg: str):
+        color = '#27ae60' if connected else '#888888'
+        if msg.startswith('Error'):
+            color = '#e94560'
+        self.lbl_hw_status.setStyleSheet(f'color: {color};')
+        self.lbl_hw_status.setText(msg)
+
     # ── Cierre ──────────────────────────────────────────────────────────
     def closeEvent(self, event):
+        # Importante: parar el hilo HW antes de soltar el diálogo para no
+        # dejar el puerto serie abierto ni que un sample llegue a un Qt
+        # widget ya destruido (crash).
+        self._stop_hw_thread()
         if getattr(self.item, '_panel_dialog', None) is self:
             self.item._panel_dialog = None
         super().closeEvent(event)

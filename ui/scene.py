@@ -637,6 +637,7 @@ class CircuitScene(QGraphicsScene):
         'osc_time_div', 'osc_v_div_a', 'osc_v_div_b',
         'osc_pos_a', 'osc_pos_b',
         'osc_trig_level', 'osc_trig_source', 'osc_trig_edge', 'osc_trig_mode',
+        'osc_hw_config',
         'meter_quantity', 'meter_coupling',
     )
 

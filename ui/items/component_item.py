@@ -146,6 +146,11 @@ class ComponentItem(QGraphicsItem):
         self.osc_trig_source: str   = 'A'    # 'A' o 'B'
         self.osc_trig_edge:   str   = 'rising'   # 'rising' | 'falling'
         self.osc_trig_mode:   str   = 'auto'     # 'auto' | 'normal' | 'single'
+        # Última config de hardware (puerto, baud, ganancia, etc.) — vacía
+        # mientras no se haya conectado nunca. Se guarda en el .csin para
+        # que al reabrir el archivo el panel recuerde el puerto y la
+        # calibración del usuario.
+        self.osc_hw_config:   dict  = {}
 
         # ── TL082 (op-amp dual) ─────────────────────────────────────────────
         # Cada instancia representa UNA de las dos unidades del CI.
