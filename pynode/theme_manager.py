@@ -74,6 +74,28 @@ THEME_DARK: Dict[str, str] = {
     'current':    '#4ecca3',
 }
 
+#: Tema Python  — azul y amarillo característicos del logo de Python.
+THEME_PYTHON: Dict[str, str] = {
+    'bg':         '#1e2a3a',   # azul medianoche Python
+    'grid':       '#26344a',
+    'grid_line':  '#306998',   # azul Python oscuro
+    'component':  '#ffd43b',   # amarillo Python
+    'comp_body':  '#26344a',
+    'comp_sel':   '#ffe873',   # amarillo claro para selección
+    'wire':       '#4b8bbe',   # azul Python claro
+    'wire_sel':   '#ffd43b',
+    'node_dot':   '#4b8bbe',
+    'text':       '#e8eef5',
+    'text_dim':   '#7a8aa0',
+    'pin':        '#ffd43b',
+    'gnd':        '#4b8bbe',
+    'toolbar':    '#306998',   # azul Python
+    'panel':      '#26344a',
+    'panel_brd':  '#306998',
+    'voltage':    '#ffd43b',
+    'current':    '#4b8bbe',
+}
+
 #: Tema claro  — fondo blanco, líneas oscuras.
 THEME_LIGHT: Dict[str, str] = {
     'bg':         '#ffffff',   # papel blanco
@@ -98,8 +120,13 @@ THEME_LIGHT: Dict[str, str] = {
 
 
 BUILTIN_THEMES: Dict[str, Dict] = {
+    'python': {
+        'name':        'Python (predeterminado)',
+        'description': 'Azul y amarillo característicos de Python.',
+        'colors':      THEME_PYTHON,
+    },
     'dark': {
-        'name':        'Oscuro (predeterminado)',
+        'name':        'Oscuro',
         'description': 'Paleta azul-medianoche, contraste alto.',
         'colors':      THEME_DARK,
     },
@@ -111,7 +138,7 @@ BUILTIN_THEMES: Dict[str, Dict] = {
 }
 
 #: Id del tema que se usa cuando no hay configuración previa.
-DEFAULT_THEME_ID = 'dark'
+DEFAULT_THEME_ID = 'python'
 
 
 # ──────────────────────────────────────────────────────────────────────────────
