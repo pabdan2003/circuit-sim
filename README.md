@@ -42,7 +42,7 @@ PyNode es un entorno de captura de esquemáticos y simulación construido en Pyt
 - **Analizador de circuito** — detección de puentes implícitos y validación topológica previa a la simulación.
 - **Calculadora de resistencias** — código de colores ↔ valor, serie E12/E24/E96.
 - **Triángulo de potencia** — P, Q, S y factor de potencia para análisis AC.
-- **Temas** — soporte para temas JSON personalizables.
+- **Temas** — soporte para temas JSON personalizables. Ver [`themes/README.md`](themes/README.md) para crear el tuyo propio.
 
 ---
 
@@ -154,6 +154,8 @@ Mapas rápidos por paquete:
 
 - [`pynode/engine/README.md`](pynode/engine/README.md) — qué hace cada archivo del motor.
 - [`pynode/ui/README.md`](pynode/ui/README.md) — qué hace cada archivo de la UI.
+- [`themes/README.md`](themes/README.md) — formato JSON de los temas y cómo crear el tuyo.
+- [`firmware/README.md`](firmware/README.md) — protocolo binario para la sonda física del osciloscopio.
 
 ---
 
