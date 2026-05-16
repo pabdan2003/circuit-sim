@@ -38,7 +38,9 @@ class ComponentItem(QGraphicsItem):
                   'ADC_BRIDGE', 'DAC_BRIDGE', 'COMPARATOR', 'PWM',
                   'CLK',
                   # ── Inter-hoja ──
-                  'NET_LABEL_IN', 'NET_LABEL_OUT']
+                  'NET_LABEL_IN', 'NET_LABEL_OUT',
+                  # ── Subcircuitos ──
+                  'PORT', 'SUBCKT']
 
     # Instrumentos virtuales (panel frontal independiente).
     INSTRUMENT_TYPES = {'FGEN', 'OSC', 'MULTIMETER'}
@@ -179,6 +181,22 @@ class ComponentItem(QGraphicsItem):
         # con un círculo en el centro durante la simulación.
         self.dig_q_state: int = 0
 
+        # ── Puerto de subcircuito (PORT) ────────────────────────────────────
+        # Marca un nodo interno que se expone como pin del IC.
+        self.port_name: str = 'IN'
+        self.port_dir:  str = 'in'    # 'in' | 'out' | 'bidir' (cosmético)
+
+        # ── Instancia de subcircuito (SUBCKT) ───────────────────────────────
+        # subckt_name → nombre de la definición en la biblioteca.
+        # ic_pins     → lista [{'name': str, 'side': 'left|right|top|bottom'}]
+        #               alineada con el orden de los puertos de la definición;
+        #               el pin i corresponde al pin de netlist p{i+1}.
+        self.subckt_name:    str  = ''
+        self.ic_label:       str  = ''     # texto en el cuerpo (vacío → subckt_name)
+        self.ic_body_color:  str  = ''     # override (vacío → tema)
+        self.ic_text_color:  str  = ''
+        self.ic_pins:        list = []     # [{'name','side'}, ...]
+
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -230,6 +248,14 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
             # Tamaño similar a GND. Flecha de 30 px y etiqueta encima.
             return QRectF(-18, -16, 36, 28)
+        if self.comp_type == 'PORT':
+            # Banderín pequeño + etiqueta encima.
+            return QRectF(-26, -20, 52, 34)
+        if self.comp_type == 'SUBCKT':
+            w, h, _ = self._subckt_geometry()
+            m = 22
+            return QRectF(-w / 2 - 12 - m, -h / 2 - m,
+                          w + 24 + 2 * m, h + 2 * m)
         # Flip-flops: cuerpo + cables horizontales + pines SET/RESET arriba/abajo
         if self.comp_type in self.FLIPFLOP_TYPES:
             hw_f = COMP_W // 2
@@ -323,7 +349,61 @@ class ComponentItem(QGraphicsItem):
         if self.comp_type == 'NET_LABEL_OUT':
             # Pin en la COLA de la flecha (lado izquierdo): ●─►
             return QPointF(-15, 0), QPointF(-15, 0)
+        if self.comp_type == 'PORT':
+            # Único pin a la derecha del banderín.
+            return QPointF(16, 0), QPointF(16, 0)
+        if self.comp_type == 'SUBCKT':
+            pts = self._subckt_pin_points()
+            p1 = pts[0] if pts else QPointF(0, 0)
+            p2 = pts[1] if len(pts) > 1 else p1
+            return p1, p2
         return QPointF(-hw - 10, 0), QPointF(hw + 10, 0)
+
+    # ── Geometría de subcircuitos (SUBCKT) ──────────────────────────────────
+    def _subckt_geometry(self):
+        """Devuelve (ancho, alto, dist_por_lado) del cuerpo del IC en función
+        del número de pines colocados en cada lado."""
+        sides = {'left': 0, 'right': 0, 'top': 0, 'bottom': 0}
+        for p in (self.ic_pins or []):
+            sides[p.get('side', 'left')] = sides.get(p.get('side', 'left'), 0) + 1
+        v_max = max(sides['left'], sides['right'], 1)
+        h_max = max(sides['top'], sides['bottom'], 1)
+        h = max(50, v_max * 24 + 20)
+        w = max(70, h_max * 24 + 20, 60)
+        return float(w), float(h), 24.0
+
+    def _subckt_pin_points(self):
+        """Lista de QPointF (coordenadas locales) alineada con self.ic_pins."""
+        w, h, step = self._subckt_geometry()
+        pins = self.ic_pins or []
+        # contador por lado para repartir uniformemente
+        per_side = {'left': [], 'right': [], 'top': [], 'bottom': []}
+        for i, p in enumerate(pins):
+            per_side.setdefault(p.get('side', 'left'), []).append(i)
+        result = [QPointF(0, 0)] * len(pins)
+        ext = 12  # longitud del cable que sale del cuerpo
+
+        def spread(n, length):
+            if n <= 0:
+                return []
+            gap = length / (n + 1)
+            return [-length / 2 + gap * (k + 1) for k in range(n)]
+
+        for side, idxs in per_side.items():
+            if side in ('left', 'right'):
+                ys = spread(len(idxs), h)
+                x = (-w / 2 - ext) if side == 'left' else (w / 2 + ext)
+                for k, gi in enumerate(idxs):
+                    result[gi] = QPointF(x, ys[k])
+            else:
+                xs = spread(len(idxs), w)
+                y = (-h / 2 - ext) if side == 'top' else (h / 2 + ext)
+                for k, gi in enumerate(idxs):
+                    result[gi] = QPointF(xs[k], y)
+        return result
+
+    def subckt_pin_positions_scene(self) -> list:
+        return [self.mapToScene(p) for p in self._subckt_pin_points()]
 
     def pin3_position(self) -> QPointF:
         """
@@ -392,6 +472,10 @@ class ComponentItem(QGraphicsItem):
             return QPointF(0, 60)
         if self.comp_type == 'OSC':
             return QPointF(40, 20)
+        if self.comp_type == 'MUX2':
+            # p4 = línea de selección (abajo-centro)
+            _, hh, _, _ = self._gate_geometry()
+            return QPointF(0, hh + 10)
         if self.comp_type in self.FLIPFLOP_TYPES:
             hh_f = COMP_H // 2 + 8
             return QPointF(0, -hh_f - 10)
@@ -430,6 +514,12 @@ class ComponentItem(QGraphicsItem):
 
     def all_pin_positions_scene(self) -> list:
         """Retorna todos los pines activos del componente en coordenadas de escena."""
+        if self.comp_type == 'SUBCKT':
+            pts = self.subckt_pin_positions_scene()
+            return pts if pts else [self.mapToScene(QPointF(0, 0))]
+        if self.comp_type == 'PORT':
+            p1, _ = self.pin_positions_scene()
+            return [p1]
         p1, p2 = self.pin_positions_scene()
         pins = [p1, p2]
         # Pines adicionales según tipo
@@ -450,7 +540,8 @@ class ComponentItem(QGraphicsItem):
             pins.append(self.pin5_position_scene())  # RESET
             pins.append(self.pin6_position_scene())  # Q̄
         elif self.comp_type == 'MUX2':
-            pins.append(self.pin3_position_scene())
+            pins.append(self.pin3_position_scene())  # I1
+            pins.append(self.pin4_position_scene())  # SEL
         elif self.comp_type in self.FOUR_PIN_TYPES:
             pins.append(self.pin3_position_scene())
             pins.append(self.pin4_position_scene())
@@ -537,6 +628,10 @@ class ComponentItem(QGraphicsItem):
             self._draw_logic_state(painter, pen_body, pen_wire, body_color)
         elif self.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
             self._draw_sheet_connector(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'PORT':
+            self._draw_port(painter, pen_body, pen_wire, body_color)
+        elif self.comp_type == 'SUBCKT':
+            self._draw_subcircuit(painter, pen_body, pen_wire, body_color)
 
         # Nombre y valor
         self._draw_labels(painter, text_color)
@@ -546,6 +641,7 @@ class ComponentItem(QGraphicsItem):
         three_terminal = ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP', 'TL082',
                           'NET_LABEL_IN', 'NET_LABEL_OUT',
                           'DFF', 'JKFF', 'TFF', 'SRFF',
+                          'PORT', 'SUBCKT',   # dibujan sus propios pines
                           'MULTIMETER')   # _draw_multimeter pinta sus pines
         if self.comp_type not in three_terminal:
             for pin in self.pin_positions():
@@ -1812,8 +1908,10 @@ class ComponentItem(QGraphicsItem):
             painter.drawEllipse(QPointF(px, 0), PIN_RADIUS, PIN_RADIUS)
 
     def _draw_mux(self, painter, pen_body, pen_wire, body_color):
-        """MUX 2:1."""
-        hw, hh = COMP_W // 2, COMP_H // 2 + 4
+        """MUX 2:1 — geometría consistente con pin_positions/pin3/pin4."""
+        hw = COMP_W // 2
+        _, hh, _, _ = self._gate_geometry()
+        ys = self._gate_pin_ys()           # [y_I0, y_I1]
         painter.setPen(pen_body)
         painter.setBrush(QBrush(body_color))
         painter.drawRect(QRectF(-hw, -hh, hw * 2, hh * 2))
@@ -1822,16 +1920,26 @@ class ComponentItem(QGraphicsItem):
         painter.setPen(QPen(QColor(COLORS['component']), 2))
         painter.drawText(QRectF(-hw, -hh, hw * 2, hh * 2),
                          Qt.AlignmentFlag.AlignCenter, 'MUX 2:1')
+        # Cables: I0/I1 a la izquierda, salida a la derecha, SEL abajo-centro
         painter.setPen(pen_wire)
-        for y in [-hh // 2, hh // 2]:
+        for y in ys:
             painter.drawLine(QPointF(-hw - 10, y), QPointF(-hw, y))
-        painter.drawLine(QPointF(-hw // 2, hh + 4), QPointF(-hw // 2, hh + 10))  # sel
+        painter.drawLine(QPointF(0, hh), QPointF(0, hh + 10))        # sel
         painter.drawLine(QPointF(hw, 0), QPointF(hw + 10, 0))
+        # Etiquetas de pin
+        painter.setFont(_qfont('Consolas', 6))
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.drawText(QRectF(-hw + 2, ys[0] - 6, 16, 12),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, '0')
+        painter.drawText(QRectF(-hw + 2, ys[1] - 6, 16, 12),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, '1')
+        painter.drawText(QRectF(-12, hh - 14, 24, 12),
+                         Qt.AlignmentFlag.AlignCenter, 'S')
         pin_color = QColor(COLORS['pin'])
-        for px, py in [(-hw - 10, -hh // 2), (-hw - 10, hh // 2),
-                       (-hw // 2, hh + 10), (hw + 10, 0)]:
-            painter.setPen(QPen(pin_color, 2))
-            painter.setBrush(QBrush(pin_color))
+        painter.setPen(QPen(pin_color, 2))
+        painter.setBrush(QBrush(pin_color))
+        for px, py in [(-hw - 10, ys[0]), (-hw - 10, ys[1]),
+                       (0, hh + 10), (hw + 10, 0)]:
             painter.drawEllipse(QPointF(px, py), PIN_RADIUS, PIN_RADIUS)
 
     def _draw_sheet_connector(self, painter, pen_body, pen_wire, body_color):
@@ -1882,8 +1990,102 @@ class ComponentItem(QGraphicsItem):
         painter.setBrush(QBrush(pin_color))
         painter.drawEllipse(QPointF(pin_x, 0), PIN_RADIUS, PIN_RADIUS)
 
+    def _draw_port(self, painter, pen_body, pen_wire, body_color):
+        """Puerto de subcircuito: banderín con un único pin a la derecha."""
+        col = QColor(COLORS['comp_sel'] if self.isSelected() else COLORS['component'])
+        painter.setPen(QPen(col, 2))
+        painter.setBrush(QBrush(QColor(COLORS['comp_body'])))
+        # Banderín hexagonal apuntando a la derecha hacia el pin
+        flag = QPolygonF([
+            QPointF(-22, -8), QPointF(4, -8), QPointF(12, 0),
+            QPointF(4, 8), QPointF(-22, 8),
+        ])
+        painter.drawPolygon(flag)
+        # Cable al pin
+        painter.setPen(pen_wire)
+        painter.drawLine(QPointF(12, 0), QPointF(16, 0))
+        # Etiqueta (port_name) dentro / encima
+        painter.setFont(_qfont('Consolas', 7, QFont.Weight.Bold))
+        painter.setPen(QPen(QColor(COLORS['text']), 1))
+        painter.drawText(QRectF(-22, -8, 30, 16),
+                         Qt.AlignmentFlag.AlignCenter,
+                         self.port_name or self.name)
+        # Dirección encima
+        painter.setFont(_qfont('Consolas', 6))
+        painter.setPen(QPen(QColor(COLORS['text_dim']), 1))
+        painter.drawText(QRectF(-26, -20, 52, 10),
+                         Qt.AlignmentFlag.AlignCenter,
+                         (self.port_dir or 'in').upper())
+        # Pin
+        painter.setPen(QPen(QColor(COLORS['pin']), 2))
+        painter.setBrush(QBrush(QColor(COLORS['pin'])))
+        painter.drawEllipse(QPointF(16, 0), PIN_RADIUS, PIN_RADIUS)
+
+    def _draw_subcircuit(self, painter, pen_body, pen_wire, body_color):
+        """Bloque tipo circuito integrado con pines configurables."""
+        w, h, _ = self._subckt_geometry()
+        sel = self.isSelected()
+        body = QColor(self.ic_body_color) if self.ic_body_color else None
+        if body is None or not body.isValid():
+            body = QColor(COLORS['comp_sel'] if sel else COLORS['comp_body'])
+        edge = QColor(COLORS['comp_sel'] if sel else COLORS['component'])
+        txt = QColor(self.ic_text_color) if self.ic_text_color else None
+        if txt is None or not txt.isValid():
+            txt = QColor(COLORS['text'])
+
+        rect = QRectF(-w / 2, -h / 2, w, h)
+        painter.setPen(QPen(edge, 2))
+        painter.setBrush(QBrush(body))
+        painter.drawRoundedRect(rect, 4, 4)
+        # Muesca superior (orientación del IC)
+        painter.setPen(QPen(edge, 1.5))
+        painter.drawArc(QRectF(-6, -h / 2 - 6, 12, 12), 180 * 16, 180 * 16)
+
+        pts = self._subckt_pin_points()
+        painter.setFont(_qfont('Consolas', 6))
+        for i, p in enumerate(pts):
+            side = (self.ic_pins[i].get('side', 'left')
+                    if i < len(self.ic_pins) else 'left')
+            # Cable cuerpo→pin
+            painter.setPen(pen_wire)
+            if side == 'left':
+                painter.drawLine(QPointF(-w / 2, p.y()), p)
+                tr = QRectF(-w / 2 + 3, p.y() - 7, w / 2 - 6, 14)
+                al = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            elif side == 'right':
+                painter.drawLine(QPointF(w / 2, p.y()), p)
+                tr = QRectF(3, p.y() - 7, w / 2 - 6, 14)
+                al = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            elif side == 'top':
+                painter.drawLine(QPointF(p.x(), -h / 2), p)
+                tr = QRectF(p.x() - 16, -h / 2 + 2, 32, 12)
+                al = Qt.AlignmentFlag.AlignCenter
+            else:
+                painter.drawLine(QPointF(p.x(), h / 2), p)
+                tr = QRectF(p.x() - 16, h / 2 - 14, 32, 12)
+                al = Qt.AlignmentFlag.AlignCenter
+            painter.setPen(QPen(QColor(COLORS['pin']), 2))
+            painter.setBrush(QBrush(QColor(COLORS['pin'])))
+            painter.drawEllipse(p, PIN_RADIUS, PIN_RADIUS)
+            name = (self.ic_pins[i].get('name', '')
+                    if i < len(self.ic_pins) else '')
+            painter.setPen(QPen(txt, 1))
+            painter.drawText(tr, al, name)
+
+        # Label central
+        label = self.ic_label or self.subckt_name or 'SUB'
+        painter.setPen(QPen(txt, 1))
+        painter.setFont(_qfont('Consolas', 9, QFont.Weight.Bold))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+        # Nombre de instancia encima del cuerpo
+        painter.setFont(_qfont('Consolas', 8))
+        painter.setPen(QPen(QColor(COLORS['text']), 1))
+        painter.drawText(QRectF(-w / 2, -h / 2 - 18, w, 16),
+                         Qt.AlignmentFlag.AlignCenter, self.name)
+
     def _draw_labels(self, painter, text_color):
-        if self.comp_type in ('GND', 'NODE', 'NET_LABEL_IN', 'NET_LABEL_OUT'):
+        if self.comp_type in ('GND', 'NODE', 'NET_LABEL_IN', 'NET_LABEL_OUT',
+                               'PORT', 'SUBCKT'):
             return
         font = _qfont('Consolas', 8)
         painter.setFont(font)

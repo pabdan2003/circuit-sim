@@ -1197,10 +1197,16 @@ class CircuitAnalyzerDialog(QDialog):
 
         # ── Bloques de salida: AND de términos + OR + NET_LABEL_OUT ────────
         first_output_y = max(len(self.var_inputs) * y_step + 80, 120)
+        # Cursor acumulativo: cada bloque avanza según SU PROPIA altura real
+        # (nº de términos), no out_index × tamaño-del-bloque-actual. Evita que
+        # bloques con distinto nº de términos se solapen y que dos compuertas
+        # OR caigan en la misma coordenada.
+        block_y_cursor = first_output_y
         for out_index, (output, info) in enumerate(results.items()):
             safe_out = self._safe_generated_name(output)
             cover = info.get('sop_cover', [])
-            block_y = first_output_y + out_index * max(180, (len(cover) + 1) * y_step)
+            block_y = block_y_cursor
+            block_y_cursor += max(180, (len(cover) + 2) * y_step)
 
             # NET_LABEL_OUT: consumidor del net 'output'
             out_label = scene.place_component(
@@ -1491,10 +1497,14 @@ class CircuitAnalyzerDialog(QDialog):
 
         # ── Bloques por salida ────────────────────────────────────────
         first_output_y = max(len(self.var_inputs) * y_step + 80, 120)
+        # Cursor acumulativo (ver explicación en _auto_build_sop_circuit):
+        # evita el solape de bloques y de compuertas entre salidas.
+        block_y_cursor = first_output_y
         for out_index, (output, info) in enumerate(results.items()):
             safe_out = self._safe_generated_name(output)
             cover = info.get('sop_cover', [])
-            block_y = first_output_y + out_index * max(180, (len(cover) + 1) * y_step)
+            block_y = block_y_cursor
+            block_y_cursor += max(180, (len(cover) + 2) * y_step)
 
             out_label = scene.place_component(
                 'NET_LABEL_OUT', QPointF(label_x, block_y),

@@ -78,7 +78,9 @@ from pynode.ui.items.wire_item import WireItem
 # ══════════════════════════════════════════════════════════════
 # ESCENA DEL CIRCUITO (extraída)
 # ══════════════════════════════════════════════════════════════
-from pynode.ui.scene import CircuitScene, build_engine_components_for_item
+from pynode.ui.scene import (
+    CircuitScene, build_engine_components_for_item, expand_subcircuits,
+)
 
 # ══════════════════════════════════════════════════════════════
 # VENTANA PRINCIPAL
@@ -686,7 +688,6 @@ class MainWindow(QMainWindow):
                 ('ADC_BRIDGE','Puente ADC',     'A→D'),
                 ('DAC_BRIDGE','Puente DAC',     'D→A'),
                 ('COMPARATOR','Comparador',     'CMP'),
-                ('PWM',       'Salida PWM',     '⊓⊓'),
                 ('LOGIC_STATE','Estado Lógico',  '0/1'),
                 ('CLK',       'Reloj (CLK)',    '⏲'),
             ]),
@@ -699,6 +700,25 @@ class MainWindow(QMainWindow):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda checked, c=cat_name, it=items: self._show_picker(c, it))
             tb.addWidget(btn)
+
+        tb.addSeparator()
+
+        # ── Subcircuitos ─────────────────────────────────────────────────
+        btn_sub = QPushButton("⊞ Subcircuitos")
+        btn_sub.setFont(_qfont('Consolas', 9))
+        btn_sub.setFixedHeight(28)
+        btn_sub.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_sub.clicked.connect(self._show_subcircuit_picker)
+        tb.addWidget(btn_sub)
+
+        btn_mksub = QPushButton("＋ Crear Subckt")
+        btn_mksub.setFont(_qfont('Consolas', 9))
+        btn_mksub.setFixedHeight(28)
+        btn_mksub.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_mksub.setToolTip("Empaqueta la hoja actual como un subcircuito "
+                             "reutilizable (sus Net Labels serán los pines)")
+        btn_mksub.clicked.connect(self._create_subcircuit_from_sheet)
+        tb.addWidget(btn_mksub)
 
         tb.addSeparator()
 
@@ -806,6 +826,137 @@ class MainWindow(QMainWindow):
             if ctype:
                 self._set_place_mode(ctype)
 
+    def _show_subcircuit_picker(self):
+        """Lista los subcircuitos de la biblioteca y activa colocación."""
+        from pynode.subcircuit_manager import SUBCIRCUIT_MANAGER
+        SUBCIRCUIT_MANAGER.refresh()
+        subs = SUBCIRCUIT_MANAGER.list_subcircuits()
+        if not subs:
+            QMessageBox.information(
+                self, "Subcircuitos",
+                "No hay subcircuitos en la biblioteca.\n\n"
+                "Crea uno: pon Net Labels (entrada/salida) en una hoja y "
+                "pulsa «＋ Crear Subckt».")
+            return
+        items = [(f"SUBCKT:{s['name']}", s['name'],
+                  f"⊞ {len(s.get('ports', []))} pines") for s in subs]
+        dialog = ComponentPickerDialog("Subcircuitos", items,
+                                       ComponentItem, COLORS, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            ctype = dialog.get_selected_type()
+            if ctype:
+                self._set_place_mode(ctype)
+
+    def _create_subcircuit_from_sheet(self):
+        """Empaqueta la hoja activa como un subcircuito .sub.json.
+
+        Los pines del IC se derivan de los NET LABELS de la hoja: cada
+        `sheet_label` único se convierte en un pin (NET_LABEL_IN → entrada,
+        NET_LABEL_OUT → salida, ambos → bidireccional).
+        """
+        from pynode.subcircuit_manager import SUBCIRCUIT_MANAGER
+        scene = self.scene
+        _LBL = ('NET_LABEL_IN', 'NET_LABEL_OUT')
+        label_items = [c for c in scene.components if c.comp_type in _LBL
+                       and (c.sheet_label or '').strip()]
+        if not label_items:
+            QMessageBox.warning(
+                self, "Crear subcircuito",
+                "La hoja no tiene Net Labels.\n\n"
+                "Coloca un «Net Label Entrada/Salida» por cada pin que "
+                "quieras exponer; su nombre será el nombre del pin del IC.")
+            return
+        nested = [c for c in scene.components if c.comp_type == 'SUBCKT']
+        body = [c for c in scene.components if c.comp_type not in _LBL
+                and c.comp_type not in ('PORT',)]
+        if not body:
+            QMessageBox.warning(self, "Crear subcircuito",
+                                "La hoja no tiene componentes que empaquetar.")
+            return
+
+        name, ok = QInputDialog.getText(self, "Crear subcircuito",
+                                        "Nombre del subcircuito:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        nested_used = {c.subckt_name for c in nested}
+        if name in nested_used:
+            QMessageBox.warning(self, "Crear subcircuito",
+                                "Un subcircuito no puede contenerse a sí mismo "
+                                f"(hay una instancia de «{name}» en la hoja).")
+            return
+        if SUBCIRCUIT_MANAGER.exists(name):
+            r = QMessageBox.question(
+                self, "Crear subcircuito",
+                f"Ya existe «{name}». ¿Sobrescribir?")
+            if r != QMessageBox.StandardButton.Yes:
+                return
+
+        pin_node = scene.extract_netlist()
+        full = self._serialize_sheet(scene)
+        # Los net labels y PORT no se empaquetan como componentes: su
+        # conectividad ya quedó resuelta en internal_nets (extract_netlist).
+        comp_entries = [e for e in full['components']
+                        if e['type'] not in _LBL and e['type'] != 'PORT']
+
+        # ── Agrupar net labels por sheet_label → un pin único por etiqueta ──
+        # Dirección: solo IN → 'in', solo OUT → 'out', ambos → 'bidir'.
+        # Orden estable: por posición del primer label de cada etiqueta
+        # (arriba→abajo, izq→der).
+        groups: dict = {}
+        for it in label_items:
+            lbl = it.sheet_label.strip()
+            g = groups.setdefault(lbl, {'in': False, 'out': False,
+                                        'y': it.pos().y(), 'x': it.pos().x(),
+                                        'item': it})
+            if it.comp_type == 'NET_LABEL_IN':
+                g['in'] = True
+            else:
+                g['out'] = True
+            if (round(it.pos().y()), round(it.pos().x())) < (round(g['y']),
+                                                             round(g['x'])):
+                g['y'], g['x'], g['item'] = it.pos().y(), it.pos().x(), it
+
+        ordered = sorted(groups.items(),
+                         key=lambda kv: (round(kv[1]['y']), round(kv[1]['x'])))
+        ports_def, port_nets, appearance_pins = [], {}, []
+        for lbl, g in ordered:
+            if g['in'] and g['out']:
+                d = 'bidir'
+            elif g['out']:
+                d = 'out'
+            else:
+                d = 'in'
+            ports_def.append({'name': lbl, 'dir': d})
+            # El net canónico de un grupo etiquetado en extract_netlist es la
+            # propia etiqueta; usamos el pin del label como respaldo robusto.
+            ref = g['item']
+            port_nets[lbl] = pin_node.get(f"{ref.name}__p1", lbl)
+            side = 'left' if d == 'in' else ('right' if d == 'out' else 'left')
+            appearance_pins.append({'name': lbl, 'side': side})
+
+        definition = {
+            'name': name,
+            'ports': ports_def,
+            'components': comp_entries,
+            'wires': full['wires'],
+            'port_nets': port_nets,
+            'internal_nets': pin_node,
+            'appearance': {
+                'label': name, 'body_color': '', 'text_color': '',
+                'pins': appearance_pins,
+            },
+        }
+        path = SUBCIRCUIT_MANAGER.save(definition, overwrite=True)
+        if path:
+            QMessageBox.information(
+                self, "Crear subcircuito",
+                f"Subcircuito «{name}» guardado en:\n{path}\n\n"
+                f"Disponible en «⊞ Subcircuitos».")
+        else:
+            QMessageBox.critical(self, "Crear subcircuito",
+                                 "No se pudo guardar el subcircuito.")
+
     def _set_place_mode(self, comp_type: str):
         self.scene.set_mode(f'place_{comp_type}')
         self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
@@ -887,8 +1038,13 @@ class MainWindow(QMainWindow):
             for comp in sheet['scene'].components
         )
         if has_net_labels or len(self._sheets) > 1:
-            return self._merge_all_sheets()
-        return list(self.scene.components), self.scene.extract_netlist()
+            comps, pin_node = self._merge_all_sheets()
+        else:
+            comps = list(self.scene.components)
+            pin_node = self.scene.extract_netlist()
+        # Aplanar subcircuitos (SUBCKT) → componentes reales para TODOS los
+        # motores (DC/AC/digital/mixto). No-op si no hay subcircuitos.
+        return expand_subcircuits(comps, pin_node)
 
     def _toggle_simulation(self, checked: bool):
         """Analiza el circuito y despacha automáticamente al solver correcto."""
@@ -1547,7 +1703,8 @@ class MainWindow(QMainWindow):
                          for c in analog_comps])
                     if _dc_res.get("success"):
                         _dc_voltages = _dc_res["voltages"]
-                self._evaluate_digital_gates(pin_node, _dc_voltages, out=out)
+                self._evaluate_digital_gates(pin_node, _dc_voltages, out=out,
+                                             sim_comps=sim_components)
                 out.append("")
                 self.results_text.setPlainText("\n".join(out))
                 self.scene.update()
@@ -1881,6 +2038,16 @@ class MainWindow(QMainWindow):
         # Evaluar puertas digitales y actualizar LEDs en su salida
         if result.get('success'):
             self._evaluate_digital_gates(pin_node, result['voltages'], silent=silent, out=out, sim_comps=sim_comps)
+            # _evaluate_digital_gates ya escribió los voltajes de las salidas
+            # digitales en result['voltages']; re-leer los multímetros para
+            # que también midan nodos digitales (no sólo los analógicos).
+            for item in sim_comps:
+                if item.comp_type != 'MULTIMETER':
+                    continue
+                m_n1 = item.node1.strip() or pin_node.get(f"{item.name}__p1", '')
+                m_n2 = item.node2.strip() or pin_node.get(f"{item.name}__p2", '0')
+                self._update_multimeter_from_dc(
+                    item, m_n1, m_n2, result['voltages'])
 
         if not silent:
             self.results_text.setPlainText('\n'.join(out))
@@ -1944,6 +2111,36 @@ class MainWindow(QMainWindow):
                         led.update()
             if out is not None and not silent:
                 out.append(f"  {item.name}_Y = {y}  ({'HIGH' if y else 'LOW'})")
+
+        # ── Multiplexores 2:1 ────────────────────────────────────────────
+        # p1=salida, p2=I0, p3=I1, p4=SEL.  Y = I1 si SEL=1, si no I0.
+        mux_items = [it for it in _all if it.comp_type == 'MUX2']
+        if mux_items and out is not None and not silent:
+            out.append('\n── Multiplexores ──')
+        for item in mux_items:
+            def _v(node):
+                if not node or node in ('0', 'gnd', 'GND'):
+                    return 0.0
+                return dc_voltages.get(node, 0.0)
+            n_i0  = item.node2.strip() or pin_node.get(f'{item.name}__p2', '')
+            n_i1  = (item.node3.strip() if hasattr(item, 'node3') else '') \
+                    or pin_node.get(f'{item.name}__p3', '')
+            n_sel = pin_node.get(f'{item.name}__p4', '')
+            n_out = item.node1.strip() or pin_node.get(f'{item.name}__p1', '')
+            sel = 1 if _v(n_sel) >= std.Vih else 0
+            chosen = n_i1 if sel else n_i0
+            y = 1 if _v(chosen) >= std.Vih else 0
+            v_out = std.Voh if y else std.Vol
+            if n_out and n_out not in ('0', 'gnd', 'GND'):
+                dc_voltages[n_out] = v_out
+            for led in _all:
+                if led.comp_type == 'LED':
+                    la = led.node1.strip() or pin_node.get(f'{led.name}__p1', '')
+                    if la == n_out:
+                        led.led_on = (v_out > 0.3)
+                        led.update()
+            if out is not None and not silent:
+                out.append(f"  {item.name}: SEL={sel} → Y={y}")
 
         # ── Evaluación de flip-flops (DFF/JKFF/TFF/SRFF) ─────────────────
         # Lectura de niveles desde dc_voltages, prioridad SET/RESET asíncronos,
@@ -2438,11 +2635,6 @@ class MainWindow(QMainWindow):
                     node = item.dig_analog_node or pin_node.get(f"{item.name}__p1", '')
                     cmp  = ComparatorBridge(item.name, node_pos=node)
                     adc_bridges.append(cmp)
-                elif ct == 'PWM':
-                    pwm  = PWMBridge(item.name,
-                                     pwm_net=f'{item.name}_IN',
-                                     vmax=item.dig_vref)
-                    dac_bridges.append(pwm)
             except Exception as e:
                 errors.append(f"{item.name} (digital): {e}")
 
@@ -2787,6 +2979,15 @@ class MainWindow(QMainWindow):
                 entry['tl082_unit'] = item.tl082_unit
             if item.comp_type in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
                 entry['sheet_label'] = item.sheet_label
+            if item.comp_type == 'PORT':
+                entry['port_name'] = item.port_name
+                entry['port_dir']  = item.port_dir
+            if item.comp_type == 'SUBCKT':
+                entry['subckt_name']   = item.subckt_name
+                entry['ic_label']      = item.ic_label
+                entry['ic_body_color'] = item.ic_body_color
+                entry['ic_text_color'] = item.ic_text_color
+                entry['ic_pins']       = [dict(p) for p in (item.ic_pins or [])]
             if item.comp_type == 'CLK':
                 entry['clk_running'] = item.clk_running
             if item.comp_type == 'MULTIMETER':
@@ -2796,6 +2997,17 @@ class MainWindow(QMainWindow):
                 neg = list(getattr(item, 'dig_input_neg', []) or [])
                 if any(neg):
                     entry['dig_input_neg'] = neg
+                # Configuración digital (necesaria para subcircuitos y para
+                # restaurar fielmente puertas/FF/contadores/puentes).
+                entry['dig_inputs']      = item.dig_inputs
+                entry['dig_bits']        = item.dig_bits
+                entry['dig_bits_adc']    = item.dig_bits_adc
+                entry['dig_vref']        = item.dig_vref
+                entry['dig_clk']         = item.dig_clk
+                entry['dig_tpd_ns']      = item.dig_tpd_ns
+                entry['dig_analog_node'] = item.dig_analog_node
+                entry['dig_input_nodes'] = list(
+                    getattr(item, 'dig_input_nodes', []) or [])
             sheet_data['components'].append(entry)
 
         for wire in scene.wires:
@@ -2858,6 +3070,19 @@ class MainWindow(QMainWindow):
                 item.tl082_unit = c.get('tl082_unit', 'A')
             if c['type'] in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
                 item.sheet_label = c.get('sheet_label', item.name)
+            if c['type'] == 'PORT':
+                item.port_name = c.get('port_name', item.name)
+                item.port_dir  = c.get('port_dir', 'in')
+            if c['type'] == 'SUBCKT':
+                item.subckt_name   = c.get('subckt_name', '')
+                item.ic_label      = c.get('ic_label', '')
+                item.ic_body_color = c.get('ic_body_color', '')
+                item.ic_text_color = c.get('ic_text_color', '')
+                item.ic_pins       = [dict(p) for p in c.get('ic_pins', [])]
+                if not item.ic_pins:
+                    scene._init_subckt_appearance(item)
+                item.prepareGeometryChange()
+                item.update()
             if c['type'] == 'CLK':
                 item.clk_running = bool(c.get('clk_running', False))
             if c['type'] == 'MULTIMETER':

@@ -51,6 +51,7 @@ class CircuitScene(QGraphicsScene):
         'FGEN': 'FGEN', 'OSC': 'XSC',
         'TL082': 'U',
         'MULTIMETER': 'XMM',
+        'PORT': 'P', 'SUBCKT': 'X',
     }
 
     def __init__(self):
@@ -242,6 +243,12 @@ class CircuitScene(QGraphicsScene):
                         name: str = '', value: float = 0.0, unit: str = '',
                         node1: str = '', node2: str = '', node3: str = '',
                         tl082_unit: str = '') -> 'ComponentItem | None':
+        # ── Instancia de subcircuito: comp_type viene como "SUBCKT:Nombre" ──
+        _subckt_name = ''
+        if comp_type.startswith('SUBCKT:'):
+            _subckt_name = comp_type.split(':', 1)[1]
+            comp_type = 'SUBCKT'
+
         # ── Selector de unidad para CIs duales (TL082) ──────────────────
         _tl082_unit = 'A'
         if comp_type == 'TL082' and not name:
@@ -289,7 +296,7 @@ class CircuitScene(QGraphicsScene):
                     'NET_LABEL_IN': 0.0, 'NET_LABEL_OUT': 0.0,
                     'FGEN': 5.0, 'MULTIMETER': 0.0}
         _stateful = ('LOGIC_STATE', 'CLK', 'NET_LABEL_IN', 'NET_LABEL_OUT',
-                     'OSC', 'MULTIMETER')
+                     'OSC', 'MULTIMETER', 'PORT', 'SUBCKT')
         if value == 0.0 and comp_type not in _stateful:
             value = defaults.get(comp_type, 1.0)
         elif comp_type in _stateful:
@@ -298,6 +305,8 @@ class CircuitScene(QGraphicsScene):
         item = ComponentItem(comp_type, name, value, unit, node1, node2, node3)
         if comp_type == 'NOT':
             item.dig_inputs = 1
+        if comp_type == 'MUX2':
+            item.dig_inputs = 2   # 2 datos (I0,I1); SEL es p4 aparte
         if comp_type == 'FGEN':
             # Por convención del panel frontal estilo Multisim, el FGEN
             # interpreta su amplitud como tensión de pico.
@@ -313,12 +322,48 @@ class CircuitScene(QGraphicsScene):
             item.sheet_label = 'NET'
         if comp_type == 'TL082':
             item.tl082_unit = _tl082_unit
+        if comp_type == 'PORT':
+            item.port_name = 'IN'
+            item.port_dir = 'in'
+        if comp_type == 'SUBCKT':
+            item.subckt_name = _subckt_name
+            self._init_subckt_appearance(item)
         snap_x = round(pos.x() / GRID_SIZE) * GRID_SIZE
         snap_y = round(pos.y() / GRID_SIZE) * GRID_SIZE
         item.setPos(snap_x, snap_y)
         self.addItem(item)
         self.components.append(item)
         return item
+
+    def _init_subckt_appearance(self, item):
+        """Rellena ic_pins / ic_label de una instancia SUBCKT desde su
+        definición en la biblioteca (si los overrides aún no existen)."""
+        from pynode.subcircuit_manager import SUBCIRCUIT_MANAGER
+        defn = SUBCIRCUIT_MANAGER.get(item.subckt_name)
+        if not defn:
+            return
+        if not item.ic_label:
+            app = defn.get('appearance', {})
+            item.ic_label = app.get('label', item.subckt_name)
+            if not item.ic_body_color:
+                item.ic_body_color = app.get('body_color', '')
+            if not item.ic_text_color:
+                item.ic_text_color = app.get('text_color', '')
+        if not item.ic_pins:
+            app = defn.get('appearance', {})
+            ap_pins = app.get('pins')
+            ports = defn.get('ports', [])
+            if ap_pins and len(ap_pins) == len(ports):
+                item.ic_pins = [dict(p) for p in ap_pins]
+            else:
+                # Reparto por defecto: in→izq, out→der, resto alterna.
+                item.ic_pins = []
+                for p in ports:
+                    d = p.get('dir', 'in')
+                    side = 'left' if d == 'in' else ('right' if d == 'out'
+                                                     else 'left')
+                    item.ic_pins.append({'name': p.get('name', '?'),
+                                         'side': side})
 
     # ── Eventos de mouse ────────────────────────
 
@@ -557,6 +602,20 @@ class CircuitScene(QGraphicsScene):
                     return
                 if item.comp_type in ComponentItem.INSTRUMENT_TYPES:
                     self._open_instrument_panel(item)
+                    return
+                if item.comp_type == 'PORT':
+                    from pynode.ui.dialogs.subcircuit_edit_dialog import PortEditDialog
+                    dlg = PortEditDialog(item, self.views()[0] if self.views() else None)
+                    if dlg.exec() == QDialog.DialogCode.Accepted:
+                        self.push_undo()
+                        dlg.apply()
+                    return
+                if item.comp_type == 'SUBCKT':
+                    from pynode.ui.dialogs.subcircuit_edit_dialog import SubcircuitAppearanceDialog
+                    dlg = SubcircuitAppearanceDialog(item, self.views()[0] if self.views() else None)
+                    if dlg.exec() == QDialog.DialogCode.Accepted:
+                        self.push_undo()
+                        dlg.apply()
                     return
                 self._edit_component(item)
                 return
@@ -906,6 +965,11 @@ class CircuitScene(QGraphicsScene):
             p1, p2 = comp.pin_positions_scene()
             pins[f"{comp.name}__p1"] = p1
             pins[f"{comp.name}__p2"] = p2
+            # SUBCKT: registrar TODOS los pines dinámicos p1..pN
+            if comp.comp_type == 'SUBCKT':
+                for i, pt in enumerate(comp.subckt_pin_positions_scene()):
+                    pins[f"{comp.name}__p{i + 1}"] = pt
+                continue
             # Registrar pin3 para dispositivos de 3 terminales
             if comp.comp_type in ('BJT_NPN', 'BJT_PNP', 'NMOS', 'PMOS', 'OPAMP'):
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
@@ -915,7 +979,8 @@ class CircuitScene(QGraphicsScene):
                 pins[f"{comp.name}__p5"] = comp.pin5_position_scene()  # RESET
                 pins[f"{comp.name}__p6"] = comp.pin6_position_scene()  # Q̄
             elif comp.comp_type == 'MUX2':
-                pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
+                pins[f"{comp.name}__p3"] = comp.pin3_position_scene()  # I1
+                pins[f"{comp.name}__p4"] = comp.pin4_position_scene()  # SEL
             elif comp.comp_type in ComponentItem.FIVE_PIN_TYPES:
                 pins[f"{comp.name}__p3"] = comp.pin3_position_scene()
                 pins[f"{comp.name}__p4"] = comp.pin4_position_scene()
@@ -1146,6 +1211,241 @@ class CircuitScene(QGraphicsScene):
 # ══════════════════════════════════════════════════════════════
 # Helper: convertir un ComponentItem analógico a objetos del engine
 # ══════════════════════════════════════════════════════════════
+def _rebuild_item_from_data(c: dict):
+    """Reconstruye un ComponentItem (sin escena) desde una entrada
+    serializada. Sólo restaura los atributos que afectan a la simulación."""
+    item = ComponentItem(c['type'], c.get('name', '?'),
+                          float(c.get('value', 0.0) or 0.0),
+                          c.get('unit', ''),
+                          c.get('node1', ''), c.get('node2', ''),
+                          c.get('node3', ''))
+    t = c['type']
+    if t in ('VAC', 'FGEN'):
+        item.frequency = c.get('frequency', 60.0)
+        item.phase_deg = c.get('phase_deg', 0.0)
+        item.ac_mode = c.get('ac_mode', 'rms')
+    if t == 'FGEN':
+        item.fgen_waveform = c.get('fgen_waveform', 'sin')
+        item.fgen_offset = c.get('fgen_offset', 0.0)
+        item.fgen_duty = c.get('fgen_duty', 0.5)
+    if t == 'LED':
+        item.led_color = c.get('led_color', 'red')
+    if t == 'Z':
+        item.z_real = c.get('z_real', 100.0)
+        item.z_imag = c.get('z_imag', 0.0)
+        item.z_mag = c.get('z_mag', 100.0)
+        item.z_phase = c.get('z_phase', 0.0)
+        item.z_mode = c.get('z_mode', 'rect')
+    if t == 'POT':
+        item.pot_wiper = max(0.0, min(1.0, float(c.get('pot_wiper', 0.5))))
+    if t == 'XFMR':
+        item.xfmr_ratio = c.get('xfmr_ratio', 2.0)
+        item.xfmr_imax = c.get('xfmr_imax', 1.0)
+    if t == 'BRIDGE':
+        item.bridge_vf = c.get('bridge_vf', 0.7)
+    if t in ('NET_LABEL_IN', 'NET_LABEL_OUT'):
+        item.sheet_label = c.get('sheet_label', item.name)
+    if t == 'SUBCKT':
+        item.subckt_name = c.get('subckt_name', '')
+        item.ic_pins = [dict(p) for p in c.get('ic_pins', [])]
+    if t in ComponentItem.DIGITAL_TYPES:
+        item.dig_inputs      = int(c.get('dig_inputs', item.dig_inputs))
+        item.dig_bits        = int(c.get('dig_bits', item.dig_bits))
+        item.dig_bits_adc    = int(c.get('dig_bits_adc', item.dig_bits_adc))
+        item.dig_vref        = float(c.get('dig_vref', item.dig_vref))
+        item.dig_clk         = c.get('dig_clk', item.dig_clk)
+        item.dig_tpd_ns      = float(c.get('dig_tpd_ns', item.dig_tpd_ns))
+        item.dig_analog_node = c.get('dig_analog_node', item.dig_analog_node)
+        item.dig_input_nodes = list(c.get('dig_input_nodes', []) or [])
+        item.dig_input_neg   = list(c.get('dig_input_neg', []) or [])
+    item.node4 = c.get('node4', '')
+    item.node5 = c.get('node5', '')
+    return item
+
+
+def _flatten_subckt(item, pin_node, _depth: int = 0) -> list:
+    """Aplana recursivamente una instancia SUBCKT en componentes del motor.
+
+    Usa la netlist resuelta al crear el subcircuito (internal_nets/port_nets),
+    renombrando cada nodo interno con un prefijo por instancia y mapeando los
+    nodos de puerto a la red externa conectada a cada pin del IC.
+    """
+    from pynode.subcircuit_manager import SUBCIRCUIT_MANAGER
+    if _depth > 16:
+        return []  # protección anti-recursión infinita
+    defn = SUBCIRCUIT_MANAGER.get(getattr(item, 'subckt_name', ''))
+    if not defn:
+        return []  # definición ausente → instancia no resuelta (placeholder)
+
+    ports = defn.get('ports', [])
+    port_nets = defn.get('port_nets', {})       # port_name -> net interno
+    internal = defn.get('internal_nets', {})    # comp__pK -> net interno
+    prefix = f"{item.name}/"
+
+    ext_nodes = getattr(item, '_ext_nodes', None)
+    ext = {}
+    for i, p in enumerate(ports):
+        pname = p.get('name', f'P{i + 1}')
+        if ext_nodes and i < len(ext_nodes) and ext_nodes[i]:
+            ext[pname] = ext_nodes[i]
+        else:
+            ext[pname] = pin_node.get(f"{item.name}__p{i + 1}",
+                                      f"iso_{item.name}_p{i + 1}")
+
+    net_to_port = {}
+    for pname, pnet in port_nets.items():
+        if pnet not in net_to_port:
+            net_to_port[pnet] = pname
+
+    def rename(net: str) -> str:
+        if not net:
+            return ''
+        if net == '0':
+            return '0'
+        if net in net_to_port:
+            return ext.get(net_to_port[net], prefix + net)
+        return prefix + net
+
+    out = []
+    for c in defn.get('components', []):
+        if c.get('type') == 'PORT':
+            continue
+        cn = c.get('name', '?')
+        child = _rebuild_item_from_data(c)
+        child.name = prefix + cn
+        child.node1 = rename(internal.get(f"{cn}__p1", ''))
+        child.node2 = rename(internal.get(f"{cn}__p2", ''))
+        child.node3 = rename(internal.get(f"{cn}__p3", ''))
+        child.node4 = rename(internal.get(f"{cn}__p4", ''))
+        child.node5 = rename(internal.get(f"{cn}__p5", ''))
+        orig_extra = list(getattr(child, 'dig_input_nodes', []) or [])
+        if orig_extra:
+            child.dig_input_nodes = [
+                rename(internal.get(f"{cn}__p{4 + j}", '')) or rename(ex)
+                for j, ex in enumerate(orig_extra)
+            ]
+        if child.comp_type == 'SUBCKT':
+            ndef = SUBCIRCUIT_MANAGER.get(child.subckt_name)
+            n_ports = len(ndef.get('ports', [])) if ndef else 0
+            child._ext_nodes = [rename(internal.get(f"{cn}__p{k + 1}", ''))
+                                for k in range(n_ports)]
+            out.extend(_flatten_subckt(child, {}, _depth + 1))
+        else:
+            out.extend(build_engine_components_for_item(child, {}))
+    return out
+
+
+def _expand_subckt_instance(item, pin_node: dict, _depth: int = 0):
+    """Expande UNA instancia SUBCKT en ítems reales (no analógicos solamente).
+
+    Devuelve (lista_de_ComponentItem, pin_node_parcial) con nombres y nets
+    espaciados por instancia. Sirve para AMBOS motores (analógico y digital)
+    porque produce ComponentItem normales con node1..5 y entradas en pin_node.
+    """
+    from pynode.subcircuit_manager import SUBCIRCUIT_MANAGER
+    if _depth > 16:
+        return [], {}
+    defn = SUBCIRCUIT_MANAGER.get(getattr(item, 'subckt_name', ''))
+    if not defn:
+        return [], {}   # definición ausente → placeholder, no se simula
+
+    ports = defn.get('ports', [])
+    port_nets = defn.get('port_nets', {})
+    internal = defn.get('internal_nets', {})
+    prefix = f"{item.name}/"
+
+    ext_nodes = getattr(item, '_ext_nodes', None)
+    ext = {}
+    for i, p in enumerate(ports):
+        pname = p.get('name', f'P{i + 1}')
+        if ext_nodes and i < len(ext_nodes) and ext_nodes[i]:
+            ext[pname] = ext_nodes[i]
+        else:
+            ext[pname] = pin_node.get(f"{item.name}__p{i + 1}",
+                                      f"iso_{item.name}_p{i + 1}")
+
+    net_to_port = {}
+    for pname, pnet in port_nets.items():
+        if pnet not in net_to_port:
+            net_to_port[pnet] = pname
+
+    def rename(net: str) -> str:
+        if not net:
+            return ''
+        if net == '0':
+            return '0'
+        if net in net_to_port:
+            return ext.get(net_to_port[net], prefix + net)
+        return prefix + net
+
+    out_items, out_pn = [], {}
+    for c in defn.get('components', []):
+        if c.get('type') == 'PORT':
+            continue
+        cn = c.get('name', '?')
+        child = _rebuild_item_from_data(c)
+        child.name = prefix + cn
+        child.node1 = rename(internal.get(f"{cn}__p1", ''))
+        child.node2 = rename(internal.get(f"{cn}__p2", ''))
+        child.node3 = rename(internal.get(f"{cn}__p3", ''))
+        child.node4 = rename(internal.get(f"{cn}__p4", ''))
+        child.node5 = rename(internal.get(f"{cn}__p5", ''))
+        # Entradas extra de puertas multi-entrada (≥3 entradas): el net de
+        # cada una vive en dig_input_nodes y DEBE re-espaciarse igual que
+        # node1..5. La entrada lógica j (j≥0 sobre las extra) corresponde al
+        # pin p(4+j) (input0=p2, input1=p3, input2=p4, ...). Sin esto el
+        # OR/AND final de una salida con ≥3 términos pierde esas entradas.
+        orig_extra = list(getattr(child, 'dig_input_nodes', []) or [])
+        if orig_extra:
+            child.dig_input_nodes = [
+                rename(internal.get(f"{cn}__p{4 + j}", '')) or rename(ex)
+                for j, ex in enumerate(orig_extra)
+            ]
+        # Reexponer TODOS los pines en el pin_node aplanado (las puertas
+        # multi-entrada y los FF usan p2..p8 vía pin_node).
+        for k in range(1, 9):
+            key = f"{cn}__p{k}"
+            if key in internal:
+                out_pn[f"{child.name}__p{k}"] = rename(internal[key])
+        if child.comp_type == 'SUBCKT':
+            ndef = SUBCIRCUIT_MANAGER.get(child.subckt_name)
+            n_ports = len(ndef.get('ports', [])) if ndef else 0
+            child._ext_nodes = [rename(internal.get(f"{cn}__p{j + 1}", ''))
+                                for j in range(n_ports)]
+            gc, gpn = _expand_subckt_instance(child, {}, _depth + 1)
+            out_items.extend(gc)
+            out_pn.update(gpn)
+        else:
+            out_items.append(child)
+    return out_items, out_pn
+
+
+def expand_subcircuits(components, pin_node: dict):
+    """Aplana TODAS las instancias SUBCKT de una lista de componentes.
+
+    Devuelve (componentes_planos, pin_node_plano) listos para cualquier
+    motor (DC, AC, digital, mixto). Los SUBCKT y PORT se sustituyen por los
+    componentes internos reales con nombres/nets espaciados por instancia.
+    """
+    flat = []
+    pn = dict(pin_node)
+    has_subckt = any(getattr(c, 'comp_type', '') == 'SUBCKT'
+                     for c in components)
+    if not has_subckt:
+        return list(components), pn
+    for item in components:
+        ct = getattr(item, 'comp_type', '')
+        if ct == 'SUBCKT':
+            children, child_pn = _expand_subckt_instance(item, pn)
+            flat.extend(children)
+            pn.update(child_pn)
+        elif ct == 'PORT':
+            continue  # los PORT sólo definen interfaz, no se simulan
+        else:
+            flat.append(item)
+    return flat, pn
+
+
 def build_engine_components_for_item(item, pin_node):
     """
     Devuelve la lista de componentes del motor MNA que representan a `item`.
@@ -1164,6 +1464,10 @@ def build_engine_components_for_item(item, pin_node):
         Potentiometer, Transformer,
     )
 
+    if item.comp_type == 'SUBCKT':
+        return _flatten_subckt(item, pin_node)
+    if item.comp_type == 'PORT':
+        return []  # marcador de puerto, sin aporte eléctrico propio
     if item.comp_type in ComponentItem.DIGITAL_TYPES:
         return []
     # El osciloscopio es un instrumento ideal: lee voltajes pero NO
